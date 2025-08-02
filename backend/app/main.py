@@ -4,15 +4,15 @@ Sets up FastAPI app, includes routers, configures middleware, and starts backgro
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.app.config import settings
-from backend.app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments
-from backend.app.routers import categories as categories_router
-from backend.app.routers import products as products_router
-from backend.app.routers import services as services_router
-from backend.app.routers import orders as orders_router
-from backend.app.routers import appointments as appointments_router
-from backend.app.routers import comments as comments_router
-from backend.app.integrations.shipping_provider import update_tracking_statuses
+from app.config import settings
+from app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments
+from app.routers import categories as categories_router
+from app.routers import products as products_router
+from app.routers import services as services_router
+from app.routers import orders as orders_router
+from app.routers import appointments as appointments_router
+from app.routers import comments as comments_router
+from app.integrations.shipping_provider import update_tracking_statuses
 from firebase_admin import firestore
 
 # Initialize FastAPI app

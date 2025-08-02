@@ -3,9 +3,9 @@ app/routers/categories.py - Routes for category retrieval (public) and managemen
 """
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional, List
-from backend.app.config import db
-from backend.app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut
-from backend.app.core.security import get_current_admin
+from app.config import db
+from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut
+from app.core.security import get_current_admin
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
 

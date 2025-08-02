@@ -5,9 +5,10 @@ This module defines a Pydantic BaseSettings class to load configuration from env
 and initializes Firebase Admin SDK (Firestore DB, Storage) using the provided credentials.
 All other modules can import from config to access the `settings` and `db` (Firestore client).
 """
-from pydantic import BaseSettings, Field
+from pydantic import Field
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
+from pydantic_settings import BaseSettings   # ✅ BaseSettings buraya taşındı
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""

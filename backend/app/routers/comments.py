@@ -3,9 +3,9 @@ app/routers/comments.py - Routes for user comments (reviews) and admin moderatio
 """
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
-from backend.app.core.security import get_current_user, get_current_admin
-from backend.app.config import db
-from backend.app.schemas.comment import CommentCreate, CommentOut
+from app.core.security import get_current_user, get_current_admin
+from app.config import db
+from app.schemas.comment import CommentCreate, CommentOut
 
 router = APIRouter(tags=["Comments"])
 

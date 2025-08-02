@@ -4,8 +4,8 @@ Uses Firebase Auth for creating accounts and verifying credentials.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from firebase_admin import auth as firebase_auth
-from backend.app.schemas.user import UserCreate, UserProfile
-from backend.app.core.security import (get_current_user)
+from app.schemas.user import UserCreate, UserProfile
+from app.core.security import (get_current_user)
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 

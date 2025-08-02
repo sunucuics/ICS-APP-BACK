@@ -4,9 +4,9 @@ Includes endpoints to get current user profile, add/update/delete addresses, etc
 """
 from fastapi import APIRouter, Depends, HTTPException
 from uuid import uuid4
-from backend.app.core.security import get_current_user
-from backend.app.config import db
-from backend.app.schemas.user import UserProfile, AddressCreate, AddressUpdate
+from app.core.security import get_current_user
+from app.config import db
+from app.schemas.user import UserProfile, AddressCreate, AddressUpdate
 
 router = APIRouter(prefix="/users", tags=["Users"])
 

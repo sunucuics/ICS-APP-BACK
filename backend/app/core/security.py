@@ -7,8 +7,8 @@ Also includes role-checking for admin access and any other security-related help
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth as firebase_auth
-from backend.app import config
-from backend.app.config import settings, db
+from app import config
+from app.config import settings, db
 
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)

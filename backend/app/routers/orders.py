@@ -5,10 +5,10 @@ Handles payment process, order creation, and providing tracking info.
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import List
 from datetime import datetime
-from backend.app.core.security import get_current_user, get_current_admin
-from backend.app.config import db
-from backend.app.integrations import payment as payment_integration, shipping_provider
-from backend.app.schemas.order import OrderCreate, OrderOut
+from app.core.security import get_current_user, get_current_admin
+from app.config import db
+from app.integrations import payment as payment_integration, shipping_provider
+from app.schemas.order import OrderCreate, OrderOut
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 

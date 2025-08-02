@@ -4,9 +4,9 @@ app/routers/services.py - Routes for service listing (public) and management (ad
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, status
 from typing import List
 from uuid import uuid4
-from backend.app.config import db, bucket
-from backend.app.core.security import get_current_admin
-from backend.app.schemas.service import ServiceOut
+from app.config import db, bucket
+from app.core.security import get_current_admin
+from app.schemas.service import ServiceOut
 
 router = APIRouter(prefix="/services", tags=["Services"])
 

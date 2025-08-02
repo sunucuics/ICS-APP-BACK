@@ -3,9 +3,9 @@ app/routers/discounts.py - Routes for managing discounts (admin).
 """
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
-from backend.app.config import db
-from backend.app.core.security import get_current_admin
-from backend.app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountOut
+from app.config import db
+from app.core.security import get_current_admin
+from app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountOut
 
 router = APIRouter(prefix="/discounts", tags=["Discounts"], dependencies=[Depends(get_current_admin)])
 

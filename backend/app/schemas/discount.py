@@ -1,32 +1,42 @@
 """
 app/schemas/discount.py - Pydantic models for Discounts.
 """
-from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
+
+from pydantic import BaseModel, Field, PositiveFloat
+
 
 class DiscountCreate(BaseModel):
-    target_type: str = Field(..., regex='^(product|service|category)$', description="Target type that discount applies to")
-    target_id: str = Field(..., description="ID of the target (product ID, service ID or category ID)")
-    percent: float = Field(..., gt=0, description="Discount percentage (e.g., 20 for 20% off)")
-    active: bool = Field(True, description="Whether the discount is active")
-    start_at: Optional[datetime] = Field(None, description="Optional start time for the discount")
-    end_at: Optional[datetime] = Field(None, description="Optional end time for the discount")
+    target_type: Literal["product", "service", "category"] = Field(
+        ...,
+        description="Target entity type that the discount applies to",
+    )
+    target_id: str = Field(
+        ..., description="ID of the target (product, service, or category)"
+    )
+    percent: PositiveFloat = Field(
+        ..., description="Discount percentage (e.g. 20 for 20 % off)"
+    )
+    active: bool = True
+    start_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+
 
 class DiscountUpdate(BaseModel):
-    percent: Optional[float] = None
+    percent: Optional[PositiveFloat] = None
     active: Optional[bool] = None
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
 
+
 class DiscountOut(BaseModel):
     id: str
-    target_type: str
+    target_type: Literal["product", "service", "category"]
     target_id: str
-    percent: float
+    percent: PositiveFloat
     active: bool
     start_at: Optional[datetime]
     end_at: Optional[datetime]
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

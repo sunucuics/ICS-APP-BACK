@@ -4,9 +4,9 @@ app/routers/appointments.py - Routes for appointment booking (user) and manageme
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 from datetime import timedelta, datetime
-from backend.app.core.security import get_current_user, get_current_admin
-from backend.app.config import db
-from backend.app.schemas.appointment import AppointmentRequest, AppointmentAdminCreate, AppointmentUpdate, AppointmentOut
+from app.core.security import get_current_user, get_current_admin
+from app.config import db
+from app.schemas.appointment import AppointmentRequest, AppointmentAdminCreate, AppointmentUpdate, AppointmentOut
 
 router = APIRouter(prefix="/appointments", tags=["Appointments"])
 

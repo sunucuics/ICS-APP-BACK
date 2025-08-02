@@ -3,9 +3,9 @@ app/routers/carts.py - Routes for shopping cart operations (for logged-in users)
 Allows adding, removing, and viewing cart items.
 """
 from fastapi import APIRouter, Depends, HTTPException
-from backend.app.core.security import get_current_user
-from backend.app.config import db
-from backend.app.schemas.cart import Cart, CartItem
+from app.core.security import get_current_user
+from app.config import db
+from app.schemas.cart import Cart, CartItem
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
 

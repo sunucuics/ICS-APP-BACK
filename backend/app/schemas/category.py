@@ -1,32 +1,32 @@
 """
 app/schemas/category.py - Pydantic models for Category.
 """
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
 class CategoryBase(BaseModel):
-    """Common fields for category creation/updation."""
+    """Common fields for category creation/update."""
     name: str = Field(..., description="Name of the category")
-    description: str = Field('', description="Description of this category")
-    parent_id: str = Field('', description="Optional parent category ID (for subcategories)")
-    is_upcoming: bool = Field(False, description="If true, category is marked as 'coming soon'")
+    description: str = Field("", description="Description of this category")
+    parent_id: str = Field("", description="Optional parent category ID")
+    is_upcoming: bool = False
 
 
 class CategoryCreate(CategoryBase):
-    type: str = Field(..., regex='^(product|service)$', description="Type of category: 'product' or 'service'")
+    type: Literal["product", "service"]
 
 
 class CategoryUpdate(BaseModel):
-    """Fields allowed to update in a category."""
-    name: str = Field(None, description="New name of the category")
-    description: str = Field(None, description="New description")
-    parent_id: str = Field(None, description="Change parent category")
-    is_upcoming: bool = Field(None, description="Update upcoming status")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parent_id: Optional[str] = None
+    is_upcoming: Optional[bool] = None
 
 
 class CategoryOut(CategoryBase):
-    id: str = Field(..., description="Category ID")
-    type: str = Field(..., description="Type of category")
+    id: str
+    type: Literal["product", "service"]
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
