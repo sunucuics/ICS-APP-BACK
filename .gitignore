@@ -3,4 +3,4 @@
 .env
 *.env
 **/firebase_*key*.json
-
+firebase_service_account.json

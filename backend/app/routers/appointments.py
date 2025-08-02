@@ -151,3 +151,31 @@ def delete_appointment(appointment_id: str):
         raise HTTPException(status_code=404, detail="Appointment not found")
     appt_ref.delete()
     return {"detail": "Appointment deleted"}
+
+
+@router.get("/calendar/{service_id}")
+def get_service_calendar(
+    service_id: str,
+    date_from: datetime,
+    date_to: datetime
+):
+    """
+    Dolu randevu aralıklarını döndürür.
+    - date_from / date_to: ISO8601 (2025-08-05T00:00:00Z) veya ‘YYYY-MM-DD’.
+    - Yanıt: [{start:<ISO>, end:<ISO>, status:'pending'|'approved'}]
+    """
+    # Firestore’da ilgili service_id ve zaman aralığında çakışan pending/approved kayıtları çek
+    q = (db.collection("appointments")
+            .where("service_id", "==", service_id)
+            .where("status", "in", ["pending", "approved"])
+            .where("start", ">=", date_from)
+            .where("start", "<=", date_to))
+    slots = []
+    for doc in q.stream():
+        appt = doc.to_dict()
+        slots.append({
+            "start": appt["start"],
+            "end": appt["end"],
+            "status": appt["status"]
+        })
+    return {"service_id": service_id, "busy": slots}
