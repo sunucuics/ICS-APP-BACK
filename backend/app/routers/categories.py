@@ -1,11 +1,12 @@
 """
 app/routers/categories.py - Routes for category retrieval (public) and management (admin).
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException , status, Form
 from typing import Optional, List
 from app.config import db
-from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut
+from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut , CategoryRead, CategoryType
 from app.core.security import get_current_admin
+
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
 
@@ -35,18 +36,29 @@ def list_categories(type: Optional[str] = None):
 # Admin sub-router for category management
 admin_router = APIRouter(prefix="/categories", dependencies=[Depends(get_current_admin)])
 
-@admin_router.post("/", response_model=CategoryOut)
-def create_category(category: CategoryCreate):
+# app/routers/categories.py  (admin_router kısmı)
+@admin_router.post(
+    "",
+    response_model=CategoryOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Category",
+)
+def create_category(
+    category_in: CategoryCreate = Depends(CategoryCreate.as_form)  # <— form veya JSON
+):
     """
-    Admin endpoint to create a new category.
+    Yeni kategori oluşturur (yalnızca admin).
+    - Gönderilmeyen isteğe bağlı alanlar Firestore dokümanına yazılmaz.
     """
     doc_ref = db.collection("categories").document()
-    data = category.dict()
-    data['created_at'] = None  # Firestore will set server timestamp if needed
-    # is_deleted field can be implicitly false if not present
-    doc_ref.set(data)
-    data['id'] = doc_ref.id
-    return data
+    payload = {k: v for k, v in category_in.model_dump().items() if v not in (None, "", False)}
+
+    # Sunucu zaman damgası eklemek isterseniz:
+    # payload["created_at"] = firestore.SERVER_TIMESTAMP
+
+    doc_ref.set(payload | {"id": doc_ref.id})
+    return CategoryOut(id=doc_ref.id, **payload)
+
 
 @admin_router.put("/{category_id}", response_model=CategoryOut)
 def update_category(category_id: str, updates: CategoryUpdate):

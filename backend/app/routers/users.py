@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from uuid import uuid4
 from app.core.security import get_current_user
 from app.config import db
-from app.schemas.user import UserProfile, AddressCreate, AddressUpdate
+from app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -18,37 +18,45 @@ def get_my_profile(current_user: dict = Depends(get_current_user)):
     # current_user is retrieved from Firestore in the security dependency
     return current_user
 
-@router.post("/me/addresses", response_model=UserProfile)
-def add_address(address: AddressCreate, current_user: dict = Depends(get_current_user)):
+@router.post("/me/addresses", response_model=AddressOut)
+def add_address(
+    address: AddressCreate = Depends(AddressCreate.as_form),
+    current_user: dict     = Depends(get_current_user),
+):
     """
-    Add a new address to the current user's address list.
-    Returns the updated user profile.
+    Add a new address to the current user's address list and
+    return the created address info.
     """
-    user_id = current_user['id']
-    # Generate a unique ID for the new address
+    user_id = current_user["id"]
+
+    # Firestore için yeni belge verisi
     addr_id = str(uuid4())
     new_addr = {
-        "id": addr_id,
-        "label": address.label or "",
-        "name": address.name or current_user.get('name', ""),
-        "address": address.address,
-        "city": address.city,
-        "country": address.country,
-        "zipCode": address.zipCode,
-        "phone": address.phone or current_user.get('phone', "")
+        "id":         addr_id,
+        "label":      address.label or "",
+        "name":       address.name or current_user.get("name", ""),
+        "city":       address.city,
+        "district":   address.district,
+        "zipCode":    address.zipCode,
+        "neighborhood": address.neighborhood,
+        "street":       address.street,
+        "buildingNo":   address.buildingNo,
+        "floor":        address.floor,
+        "apartment":    address.apartment,
+        "note":         address.note,
     }
+
     user_ref = db.collection("users").document(user_id)
-    # Atomically add the address to the addresses array (could use arrayUnion, but merging might be simpler to avoid dup)
-    user_doc = user_ref.get()
-    if not user_doc.exists:
+    snap = user_ref.get()
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="User profile not found")
-    profile = user_doc.to_dict()
-    addresses = profile.get('addresses', [])
+
+    # adresi listeye ekle
+    addresses = snap.to_dict().get("addresses", [])
     addresses.append(new_addr)
     user_ref.update({"addresses": addresses})
-    profile['addresses'] = addresses
-    profile['id'] = user_id
-    return profile
+
+    return AddressOut(**new_addr)
 
 @router.put("/me/addresses/{addr_id}", response_model=UserProfile)
 def update_address(addr_id: str, addr_update: AddressUpdate, current_user: dict = Depends(get_current_user)):
@@ -69,9 +77,7 @@ def update_address(addr_id: str, addr_update: AddressUpdate, current_user: dict 
             # Update provided fields
             if addr_update.label is not None: addr['label'] = addr_update.label
             if addr_update.name is not None: addr['name'] = addr_update.name
-            if addr_update.address is not None: addr['address'] = addr_update.address
             if addr_update.city is not None: addr['city'] = addr_update.city
-            if addr_update.country is not None: addr['country'] = addr_update.country
             if addr_update.zipCode is not None: addr['zipCode'] = addr_update.zipCode
             if addr_update.phone is not None: addr['phone'] = addr_update.phone
             updated = True
@@ -104,3 +110,13 @@ def delete_address(addr_id: str, current_user: dict = Depends(get_current_user))
     profile['addresses'] = new_addresses
     profile['id'] = user_id
     return profile
+
+@router.get("/me/addresses", response_model=list[AddressOut])
+def list_addresses(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    snap = db.collection("users").document(user_id).get()
+    if not snap.exists:
+        raise HTTPException(404, "User profile not found")
+
+    addresses = snap.to_dict().get("addresses", [])
+    return [AddressOut(**addr) for addr in addresses]

@@ -48,14 +48,12 @@ def create_payment(order_id: str, user: dict, cart_items: list, card_info: dict,
         "registrationAddress": shipping_address.get('address', ""),
         "ip": "0.0.0.0",  # IP is ideally the user's IP; could be passed from request context
         "city": shipping_address.get('city', ""),
-        "country": shipping_address.get('country', "Turkey"),
         "zipCode": shipping_address.get('zipCode', "")
     }
     address = {
         "contactName": shipping_address.get('contactName', user.get('name', "")),
         "address": shipping_address.get('address', ""),
         "city": shipping_address.get('city', ""),
-        "country": shipping_address.get('country', "Turkey"),
         "zipCode": shipping_address.get('zipCode', "")
     }
     if billing_address is None:
@@ -106,7 +104,6 @@ def create_payment(order_id: str, user: dict, cart_items: list, card_info: dict,
             "contactName": billing_address.get('contactName', ""),
             "address": billing_address.get('address', ""),
             "city": billing_address.get('city', ""),
-            "country": billing_address.get('country', ""),
             "zipCode": billing_address.get('zipCode', "")
         },
         "basketItems": basket_items

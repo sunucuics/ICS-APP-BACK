@@ -9,6 +9,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth as firebase_auth
 from app import config
 from app.config import settings, db
+from firebase_admin import firestore
 
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)

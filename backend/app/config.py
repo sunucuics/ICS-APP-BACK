@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     tracking_api_key: str = Field('', env='TRACKING_API_KEY')
     debug: bool = Field(False, env='DEBUG')
     allowed_origins: str = Field('*', env='ALLOWED_ORIGINS')  # Comma-separated list or '*' for all
+    firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
 
     class Config:
         env_file = ".env"

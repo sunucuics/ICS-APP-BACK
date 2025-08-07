@@ -7,6 +7,8 @@ from uuid import uuid4
 from app.config import db, bucket
 from app.core.security import get_current_admin
 from app.schemas.service import ServiceOut
+from firebase_admin import firestore
+from app.utils.categories import resolve_category_name
 
 router = APIRouter(prefix="/services", tags=["Services"])
 
@@ -37,40 +39,34 @@ admin_router = APIRouter(prefix="/services", dependencies=[Depends(get_current_a
 async def create_service(
     title: str = Form(...),
     description: str = Form(""),
-    category_id: str = Form(...),
     is_upcoming: bool = Form(False),
-    image: UploadFile = File(None)
+    category_name: str = Form(...),
+    image: UploadFile = File(...),
+    _admin=Depends(get_current_admin),
 ):
-    """
-    Admin endpoint to create a new service entry with an optional image.
-    """
-    service_ref = db.collection("services").document()
-    service_id = service_ref.id
-    image_url = None
-    if image:
-        filename = image.filename or f"{uuid4()}.jpg"
-        blob = bucket.blob(f"services/{service_id}/{filename}")
-        try:
-            blob.upload_from_file(image.file, content_type=image.content_type)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Image upload failed: {e}")
-        try:
-            blob.make_public()
-            image_url = blob.public_url
-        except Exception:
-            image_url = blob.generate_signed_url(expiration=3600*24*365*10)
-    data = {
+    # 1) kategori id’yi çöz
+    cat_id, cat_data = resolve_category_name(category_name, "service")
+
+    # 2) görsel yükle
+    svc_ref = db.collection("services").document()
+    filename = image.filename or f"{uuid4()}.jpg"
+    blob = bucket.blob(f"services/{svc_ref.id}/{filename}")
+    blob.upload_from_file(image.file, content_type=image.content_type)
+    blob.make_public()
+
+    # 3) Firestore kaydı (flat path: services/{id})
+    payload = {
+        "id": svc_ref.id,
         "title": title,
         "description": description,
-        "image": image_url,
-        "category_id": category_id,
         "is_upcoming": is_upcoming,
+        "category_name": category_name,   # ← UI’de de bu görünecek
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "image": blob.public_url,
         "is_deleted": False,
-        "created_at": None
     }
-    service_ref.set(data)
-    data['id'] = service_id
-    return data
+    svc_ref.set(payload)
+    return payload
 
 @admin_router.put("/{service_id}", response_model=ServiceOut)
 async def update_service(

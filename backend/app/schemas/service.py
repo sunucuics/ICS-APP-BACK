@@ -11,9 +11,6 @@ class ServiceBase(BaseModel):
     category_id: str = Field(..., description="Category ID for this service")
     is_upcoming: bool = Field(False, description="If true, service is marked as coming soon")
 
-class ServiceCreate(ServiceBase):
-    """Schema for creating a new service (admin)."""
-    # Image will be uploaded via file, not included in JSON schema.
 
 class ServiceUpdate(BaseModel):
     """Schema for updating a service (admin)."""
@@ -34,3 +31,10 @@ class ServiceOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+
+class ServiceCreate(BaseModel):
+    title: str
+    description: str = ""
+    is_upcoming: bool = False
+    category_name: str

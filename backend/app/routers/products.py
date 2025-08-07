@@ -3,60 +3,64 @@ app/routers/products.py - Routes for product listing (public) and product manage
 Handles image uploads to Firebase Storage on create.
 """
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, status
-from typing import List
+from typing import List , Optional , Union
 from uuid import uuid4
 from app.config import db, bucket
 from app.core.security import get_current_user, get_current_admin
-from app.schemas.product import ProductOut
+from app.schemas.product import ProductOut , ProductCreate
+from firebase_admin import firestore
+from datetime import datetime
+from google.cloud.firestore_v1.field_path import FieldPath
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
 @router.get("/", response_model=List[ProductOut])
-def list_products(category_id: str = None):
+def list_products(category_name: Optional[str] = None):
     """
-    Get list of all active products, optionally filtered by category.
-    Upcoming products are included (with flag) but not purchasable.
-    Soft-deleted products are excluded.
+    Aktif (is_deleted==False) tüm ürünleri döndürür.
+    - Ürünler kategori slug altındaki  `products/{slug}/items`  alt-koleksiyonlarında
+      tutulduğu için **collection_group('items')** kullanıyoruz.
+    - `category_name` verilirse filtre uygulanır.
+    - İndirim (discounts) kontrolü yapılarak `final_price` hesaplanır.
     """
-    products_ref = db.collection("products")
-    query = products_ref.where("is_deleted", "==", False) if products_ref is not None else None
-    if category_id:
-        query = query.where("category_id", "==", category_id) if query else products_ref.where("category_id", "==", category_id)
-    docs = (query or products_ref).stream()
-    product_list = []
-    # We may also fetch discount info to compute final_price
-    # For simplicity, we will compute final_price by checking discount collection for each product.
-    discounts = []
-    for doc in docs:
+    # ➊  Koleksiyon-grup sorgusu
+    base_q = (
+        db.collection_group("items")
+        .where("is_deleted", "==", False)
+    )
+    if category_name:
+        base_q = base_q.where("category_name", "==", category_name)
+
+    product_list: List[dict] = []
+    now = datetime.utcnow()
+
+    for doc in base_q.stream():
         data = doc.to_dict()
-        if data.get('is_deleted'):
-            continue  # skip any soft-deleted (should already be filtered by query)
-        data['id'] = doc.id
-        # Determine final price after discount
-        final_price = data['price']
-        # Check if a discount applies (either directly or via category)
-        disc_query = db.collection("discounts").where("active", "==", True).where("target_id", "in", [doc.id, data.get('category_id')]).stream()
-        # We query discounts where target_id matches this product or its category
+        data["id"] = doc.id
+
+        # ➋  Aktif indirim (ürüne veya kategorisine) varsa final_price hesapla
+        disc_q = (
+            db.collection("discounts")
+            .where("active", "==", True)
+            .where("target_id", "in", [data["id"], data.get("category_id")])
+            .stream()
+        )
+
         best_percent = 0
-        for d in disc_query:
+        for d in disc_q:
             disc = d.to_dict()
-            # Ensure discount is currently valid (time-based)
-            import datetime
-            now = datetime.datetime.utcnow()
-            start_at = disc.get('start_at')
-            end_at = disc.get('end_at')
+            start_at, end_at = disc.get("start_at"), disc.get("end_at")
             if start_at and now < start_at:
-                continue  # not started yet
+                continue
             if end_at and now > end_at:
-                continue  # expired
-            if disc['target_type'] == 'product' and disc['target_id'] == doc.id:
-                best_percent = max(best_percent, disc['percent'])
-            elif disc['target_type'] == 'category' and disc['target_id'] == data.get('category_id'):
-                best_percent = max(best_percent, disc['percent'])
-        if best_percent > 0:
-            final_price = round(final_price * (100 - best_percent) / 100, 2)
-        data['final_price'] = final_price
+                continue
+            best_percent = max(best_percent, disc["percent"])
+
+        final_price = round(data["price"] * (100 - best_percent) / 100, 2)
+        data["final_price"] = final_price
+
         product_list.append(data)
+
     return product_list
 
 @router.get("/{product_id}", response_model=ProductOut)
@@ -97,59 +101,88 @@ admin_router = APIRouter(prefix="/products", dependencies=[Depends(get_current_a
 
 @admin_router.post("/", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
 async def create_product(
-    title: str = Form(...),
-    description: str = Form(""),
-    price: float = Form(...),
-    stock: int = Form(...),
-    category_id: str = Form(...),
-    is_upcoming: bool = Form(False),
-    images: List[UploadFile] = File(None)
+    # ───────────── product fields ─────────────
+    product_in: ProductCreate = Depends(ProductCreate.as_form),
+    # ───────────── photos ─────────────────────
+    photo_main: UploadFile = File(
+        ..., description="Zorunlu ana fotoğraf"
+    ),
+    photo1: UploadFile = File(
+        ..., description="İsteğe bağlı foto 1 (boş bırakılabilir)"
+    ),
+    photo2: UploadFile = File(
+        ..., description="İsteğe bağlı foto 2 (boş bırakılabilir)"
+    ),
+    photo3: UploadFile = File(
+        ..., description="İsteğe bağlı foto 3 (boş bırakılabilir)"
+    ),
+    photo4: UploadFile = File(
+        ..., description="İsteğe bağlı foto 4 (boş bırakılabilir)"
+    ),
 ):
     """
-    Admin endpoint to create a new product with optional image uploads.
-    Accepts form data: title, description, price, stock, category_id, is_upcoming, and up to 5 image files.
+    Zorunlu **bir** ana foto + en çok **4** isteğe bağlı ek foto.
+    Swagger'da hepsi *Choose File* olarak görünür; kullanıcı boş bıraktıklarını yüklemez.
     """
-    # Create product document in Firestore
-    product_ref = db.collection("products").document()
-    product_id = product_ref.id
-    product_data = {
-        "title": title,
-        "description": description,
-        "price": price,
-        "stock": stock,
-        "category_id": category_id,
-        "is_upcoming": is_upcoming,
-        "is_deleted": False,
-        "created_at": None  # use server timestamp if desired
-    }
-    # Handle images upload
-    image_urls = []
-    if images:
-        if len(images) > 5:
-            raise HTTPException(status_code=400, detail="Maximum 5 images allowed")
-        for img in images:
-            # Only process if it's an image
-            filename = img.filename
-            # Construct storage path: e.g., products/<product_id>/<filename>
-            blob = bucket.blob(f"products/{product_id}/{filename}")
-            try:
-                blob.upload_from_file(img.file, content_type=img.content_type)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Image upload failed: {e}")
-            # Make the blob publicly accessible (or we could generate a tokened URL)
-            try:
-                blob.make_public()
-                public_url = blob.public_url
-            except Exception:
-                # If make_public is not allowed due to security rules, use signed URL as fallback
-                public_url = blob.generate_signed_url(expiration=3600*24*365*10)  # 10-year URL
-            image_urls.append(public_url)
-    product_data["images"] = image_urls
-    product_ref.set(product_data)
-    product_data["id"] = product_id
-    # Compute final_price (no discount initially on brand new product)
-    product_data["final_price"] = product_data["price"]
-    return product_data
+
+    # 1️⃣  Boş bırakılan (Choose File yapılmamış) dosyaları ayıkla
+    uploads: list[UploadFile] = [
+        up for up in (photo_main, photo1, photo2, photo3, photo4) if up.filename
+    ]
+
+    if not uploads or uploads[0] is not photo_main:
+        raise HTTPException(400, "photo_main zorunlu ve seçilmelidir")
+
+    if len(uploads) > 5:
+        raise HTTPException(400, "En fazla 5 foto yükleyebilirsiniz")
+
+    # 2️⃣  Kategori dokümanı
+    cat_q = (
+        db.collection("categories")
+        .where("name", "==", product_in.category_name)
+        .where("type", "==", "product")
+        .limit(1)
+        .stream()
+    )
+    cat_doc = next(cat_q, None)
+    if not cat_doc:
+        raise HTTPException(404, "Kategori bulunamadı")
+
+    cat_id = cat_doc.id
+    slug = product_in.category_name.lower().replace(" ", "_")
+
+    # 3️⃣  Ürün dokümanı
+    prod_ref = db.collection(f"products/{slug}/items").document()
+
+    # 4️⃣  Fotoğrafları Firebase Storage’a yükle
+    def upload(img: UploadFile) -> str:
+        fname = img.filename or f"{uuid4()}.jpg"
+        blob = bucket.blob(f"products/{prod_ref.id}/{fname}")
+        blob.upload_from_file(img.file, content_type=img.content_type)
+        try:
+            blob.make_public()
+            return blob.public_url
+        except Exception:
+            # fallback: signed URL (10 y)
+            return blob.generate_signed_url(expiration=3600 * 24 * 365 * 10)
+
+    image_urls: List[str] = [upload(up) for up in uploads]
+
+    # 5️⃣  Firestore’a kaydet
+    data = product_in.model_dump()
+    data.update(
+        id=prod_ref.id,
+        title=product_in.name,
+        category_id=cat_id,
+        images=image_urls,
+        final_price=product_in.price,
+        is_deleted=False,
+        created_at=firestore.SERVER_TIMESTAMP,
+    )
+    prod_ref.set(data)
+    return data
+
+
 
 @admin_router.put("/{product_id}", response_model=ProductOut)
 async def update_product(product_id: str,
@@ -225,19 +258,30 @@ async def update_product(product_id: str,
 @admin_router.delete("/{product_id}")
 def delete_product(product_id: str, hard: bool = False):
     """
-    Admin endpoint to delete a product.
-    If hard=true, permanently deletes the product from Firestore (and optionally its images from storage).
-    If hard=false, performs a soft delete (sets is_deleted=true).
+    Admin product deletion
+    • hard=true  → tamamen siler ve (isterseniz) görselleri de kaldırabilirsiniz
+    • hard=false → is_deleted = True
     """
-    doc_ref = db.collection("products").document(product_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Product not found")
+    # 1️⃣ ID’yi alt koleksiyonlar arasında ara
+    q = (
+        db.collection_group("items")
+        .where("id", "==", product_id)          # id alanı ile eşleş
+        .limit(1)
+        .stream()
+    )
+    doc_snap = next(q, None)
+    if not doc_snap:
+        raise HTTPException(404, "Product not found")
+
+    doc_ref = doc_snap.reference  # tam DocumentReference artık var
+
+    # 2️⃣ İşlem
     if hard:
-        # Delete storage files (optional; not doing automatically to avoid accidental deletion)
-        # Actually perform Firestore delete:
+        # Storage’daki görseller opsiyonel olarak silinebilir
+        # for blob in bucket.list_blobs(prefix=f"products/{product_id}/"):
+        #     blob.delete()
         doc_ref.delete()
-        # (Optionally, we might also delete all comments related to this product, etc., if needed.)
+        return {"detail": "Product hard-deleted"}
     else:
         doc_ref.update({"is_deleted": True})
-    return {"detail": f"Product {'hard ' if hard else ''}deleted"}
+        return {"detail": "Product soft-deleted"}

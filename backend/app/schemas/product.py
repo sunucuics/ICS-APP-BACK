@@ -3,6 +3,7 @@ app/schemas/product.py - Pydantic models for Product.
 """
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from fastapi import Form
 
 class ProductBase(BaseModel):
     """Common product fields for creation/update."""
@@ -13,9 +14,40 @@ class ProductBase(BaseModel):
     category_id: str = Field(..., description="Category ID this product belongs to")
     is_upcoming: bool = Field(False, description="If true, product is coming soon (not purchasable)")
 
-class ProductCreate(ProductBase):
-    """Schema for product creation (admin)."""
-    # Images will be handled via file uploads, so not included as Base64 or URLs here.
+
+from pydantic import BaseModel
+from typing import Optional
+from fastapi import Form
+
+class ProductCreate(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    price: float
+    stock: int
+    is_upcoming: bool = False
+    category_name: str
+
+    @classmethod
+    def as_form(
+        cls,
+        name: str = Form(...),
+        description: Optional[str] = Form(""),
+        price: float = Form(...),
+        stock: int = Form(...),
+        is_upcoming: bool = Form(False),
+        category_name: str = Form(...),
+    ):
+        return cls(
+            name=name,
+            description=description,
+            price=price,
+            stock=stock,
+            is_upcoming=is_upcoming,
+            category_name=category_name,
+        )
+
+
+
 
 class ProductUpdate(BaseModel):
     """Schema for updating product fields (admin)."""
@@ -28,33 +60,16 @@ class ProductUpdate(BaseModel):
     # Not handling image updates here, might be separate endpoint or form in create.
 
 class ProductOut(BaseModel):
-    """Schema for product information delivered to clients."""
     id: str
     title: str
-    description: str
+    description: Optional[str] = ""
     price: float
-    final_price: float = Field(..., description="Price after any discount (or same as price if no discount)")
+    final_price: float
     stock: int
-    images: List[str] = Field(default_factory=list, description="List of image URLs")
-    category_id: str
     is_upcoming: bool
-    is_deleted: bool
+    category_name: str
+    images: List[str] = []
 
     class Config:
         orm_mode = True
-        schema_extra = {
-            "example": {
-                "id": "prod123",
-                "title": "Wireless Mouse",
-                "description": "A high-precision wireless mouse",
-                "price": 100.0,
-                "final_price": 80.0,
-                "stock": 50,
-                "images": [
-                    "https://storage.googleapis.com/your-bucket/products/prod123/img1.jpg"
-                ],
-                "category_id": "electronics",
-                "is_upcoming": False,
-                "is_deleted": False
-            }
-        }
+

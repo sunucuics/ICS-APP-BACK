@@ -3,7 +3,8 @@ app/schemas/appointment.py - Pydantic models for Appointments.
 """
 from datetime import datetime
 from typing import Optional, Literal
-
+from enum import Enum
+from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
@@ -30,6 +31,11 @@ class AppointmentUpdate(BaseModel):
     status: Literal["approved", "cancelled"]
 
 
+class AppointmentStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    cancelled = "cancelled"
+
 class AppointmentOut(BaseModel):
     id: str
     service_id: str
@@ -39,3 +45,24 @@ class AppointmentOut(BaseModel):
     status: Literal["pending", "approved", "cancelled"]
 
     model_config = {"from_attributes": True}
+
+class UserBrief(BaseModel):
+    id: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    addresses: Optional[List[dict]] = None
+
+class ServiceBrief(BaseModel):
+    id: str
+    title: Optional[str] = None
+    price: Optional[float] = None
+
+class AppointmentAdminOut(BaseModel):
+    id: str
+    start: datetime
+    end: datetime
+    status: str
+    user: UserBrief
+    service: ServiceBrief
+
