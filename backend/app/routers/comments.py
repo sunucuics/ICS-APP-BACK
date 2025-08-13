@@ -1,125 +1,104 @@
-"""
-app/routers/comments.py - Routes for user comments (reviews) and admin moderation.
-"""
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List
-from app.core.security import get_current_user, get_current_admin
+from typing import List, Optional, Literal
+from fastapi import APIRouter, Depends, HTTPException, Form, Query
+from pydantic import conint, constr
+from firebase_admin import firestore
+from google.cloud.firestore_v1 import FieldFilter
+from google.cloud import firestore as gcf
+
 from app.config import db
-from app.schemas.comment import CommentCreate, CommentOut
+from app.core.security import get_current_user, get_current_admin
+from app.schemas.comment import CommentOut
 
-router = APIRouter(tags=["Comments"])
+router = APIRouter(prefix="/comments", tags=["Comments"])
 
-@router.post("/products/{product_id}/comments", response_model=CommentOut)
-def add_product_comment(product_id: str, comment: CommentCreate, current_user: dict = Depends(get_current_user)):
+# 1) 3 kutucukla yorum ekle (GENEL yorum)
+@router.post("/", response_model=CommentOut, response_model_exclude_none=True, summary="Yorum ekle (3 kutu)")
+def create_comment_simple(
+    target_type: Literal["product", "service"] = Form(..., description='Ürünlere mi, hizmetlere mi?'),
+    rating: conint(ge=1, le=5) = Form(..., description='Puan (1..5)'),
+    content: constr(min_length=1, max_length=500) = Form(..., description='Yorum (max 500)'),
+    current_user: dict = Depends(get_current_user),
+):
     """
-    Add a comment/review for a product by a user. User must have purchased the product.
+    *Tam 3 alan:* **target_type**, **rating**, **content**.
+    Bu uç **genel** yorum içindir; belirli ürün/hizmete bağlı değildir.
     """
-    user_id = current_user['id']
-    # Simple check: user must have an order containing this product_id
-    orders = db.collection("orders").where("user_id", "==", user_id).stream()
-    purchased = False
-    for order in orders:
-        order_data = order.to_dict()
-        for item in order_data.get('items', []):
-            if item.get('product_id') == product_id:
-                purchased = True
-                break
-        if purchased:
-            break
-    if not purchased:
-        raise HTTPException(status_code=400, detail="Cannot review a product not purchased")
-    # Profanity filter
-    profanity_doc = db.collection("settings").document("profanity").get()
-    blocked_words = []
-    if profanity_doc.exists:
-        blocked_words = profanity_doc.to_dict().get('blocked_words', [])
-    for bad_word in blocked_words:
-        if bad_word.lower() in comment.content.lower():
-            raise HTTPException(status_code=400, detail="Comment contains inappropriate language")
-    # Create comment
-    comm_ref = db.collection("comments").document()
-    comm_data = {
-        "target_type": "product",
-        "target_id": product_id,
+    user_id = current_user["id"]
+
+    # Basit küfür filtresi
+    prof = db.collection("settings").document("profanity").get()
+    blocked = (prof.to_dict() or {}).get("blocked_words", []) if prof.exists else []
+    low = content.lower()
+    if any(bw.lower() in low for bw in blocked):
+        raise HTTPException(status_code=400, detail="Uygunsuz içerik tespit edildi.")
+
+    ref = db.collection("comments").document()
+    data = {
+        "target_type": target_type,
+        "target_id": "__all__",               # genel yorum işareti
         "user_id": user_id,
-        "rating": comment.rating,
-        "content": comment.content,
+        "rating": int(rating),
+        "content": content,
         "is_deleted": False,
-        "created_at": None
+        "created_at": firestore.SERVER_TIMESTAMP,
     }
-    comm_ref.set(comm_data)
-    comm_data['id'] = comm_ref.id
-    return comm_data
+    ref.set(data)
+    snap = ref.get()
+    out = snap.to_dict() or {}
+    out["id"] = ref.id
+    return out
 
-@router.post("/services/{service_id}/comments", response_model=CommentOut)
-def add_service_comment(service_id: str, comment: CommentCreate, current_user: dict = Depends(get_current_user)):
-    """
-    Add a comment/review for a service by a user. User must have completed an appointment for the service.
-    """
-    user_id = current_user['id']
-    # Check if user had an approved (and presumably past) appointment for this service
-    appts = db.collection("appointments").where("user_id", "==", user_id).where("service_id", "==", service_id).where("status", "==", "approved").stream()
-    had_appointment = False
-    for appt in appts:
-        had_appointment = True
-        break
-    if not had_appointment:
-        raise HTTPException(status_code=400, detail="Cannot review a service not utilized")
-    # Profanity filter (same as above)
-    profanity_doc = db.collection("settings").document("profanity").get()
-    blocked_words = []
-    if profanity_doc.exists:
-        blocked_words = profanity_doc.to_dict().get('blocked_words', [])
-    for bad_word in blocked_words:
-        if bad_word.lower() in comment.content.lower():
-            raise HTTPException(status_code=400, detail="Comment contains inappropriate language")
-    comm_ref = db.collection("comments").document()
-    comm_data = {
-        "target_type": "service",
-        "target_id": service_id,
-        "user_id": user_id,
-        "rating": comment.rating,
-        "content": comment.content,
-        "is_deleted": False,
-        "created_at": None
-    }
-    comm_ref.set(comm_data)
-    comm_data['id'] = comm_ref.id
-    return comm_data
-
-# Admin moderation endpoints
-admin_router = APIRouter(prefix="/comments", dependencies=[Depends(get_current_admin)])
-
-@admin_router.get("/", response_model=List[CommentOut])
-def list_comments(target_type: str = None, target_id: str = None):
-    """
-    Admin endpoint to list comments. Can filter by target_type and/or target_id.
-    """
-    query = db.collection("comments")
+# 2) Listeleme (opsiyonel filtreler)
+@router.get("/", response_model=List[CommentOut], summary="Yorumları listele")
+def list_comments(
+    target_type: Optional[Literal["product","service"]] = Query(None),
+    only_general: bool = Query(False, description="Sadece genel yorumlar (__all__)"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    q = db.collection("comments").where(filter=FieldFilter("is_deleted", "==", False))
     if target_type:
-        query = query.where("target_type", "==", target_type)
-    if target_id:
-        query = query.where("target_id", "==", target_id)
-    docs = query.stream()
-    comments = []
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        comments.append(data)
-    return comments
+        q = q.where(filter=FieldFilter("target_type", "==", target_type))
+    if only_general:
+        q = q.where(filter=FieldFilter("target_id", "==", "__all__"))
+    try:
+        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+    except Exception:
+        pass
+    docs = list(q.limit(limit).stream())
+    return [{**d.to_dict(), "id": d.id} for d in docs]
 
-@admin_router.delete("/{comment_id}")
-def delete_comment(comment_id: str, hard: bool = False):
+
+# -------------------- ADMIN --------------------
+admin_router = APIRouter(prefix="/comments", tags=["Admin: Comments"], dependencies=[Depends(get_current_admin)])
+
+@admin_router.get("/", response_model=List[CommentOut], summary="(Admin) yorum listesi (parametresiz)")
+def admin_list_comments():
     """
-    Admin endpoint to delete a comment.
-    Soft delete by default (mark is_deleted), or hard delete if specified.
+    Parametresiz admin listesi:
+    - Sadece **is_deleted = False** yorumlar
+    - `created_at`'e göre **son eklenenler en üstte**
+    - Varsayılan limit: **100**
     """
-    comm_ref = db.collection("comments").document(comment_id)
-    doc = comm_ref.get()
-    if not doc.exists:
+    q = (
+        db.collection("comments")
+          .where(filter=FieldFilter("is_deleted", "==", False))
+    )
+    try:
+        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+    except Exception:
+        pass  # created_at olmayan eski kayıtlar varsa sıralamasız getir
+
+    docs = list(q.limit(100).stream())
+    return [{**d.to_dict(), "id": d.id} for d in docs]
+
+@admin_router.delete("/{comment_id}", summary="(Admin) sil")
+def admin_delete_comment(comment_id: str, hard: bool = False):
+    ref = db.collection("comments").document(comment_id)
+    snap = ref.get()
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="Comment not found")
     if hard:
-        comm_ref.delete()
-    else:
-        comm_ref.update({"is_deleted": True})
-    return {"detail": f"Comment {'hard ' if hard else ''}deleted"}
+        ref.delete()
+        return {"detail": "Comment hard deleted"}
+    ref.update({"is_deleted": True})
+    return {"detail": "Comment deleted"}

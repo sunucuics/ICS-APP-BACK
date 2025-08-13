@@ -1,23 +1,23 @@
 """
-app/schemas/comment.py - Pydantic models for Comments (product/service reviews).
+app/schemas/comment.py - Pydantic models for comments/reviews.
 """
-from pydantic import BaseModel, Field
+from typing import Optional, Literal
 from datetime import datetime
-from typing import Optional
+from pydantic import BaseModel, conint, constr
 
+# Public create: 1-5 puan, max 500 karakter; hedefi body'de seçiyoruz.
 class CommentCreate(BaseModel):
-    """Schema for creating a new comment/review."""
-    content: str = Field(..., description="Text content of the comment")
-    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5")
+    target_type: Literal["product", "service"]
+    target_id: str
+    rating: conint(ge=1, le=5)                    # 1..5
+    content: constr(min_length=1, max_length=500) # max 500
 
 class CommentOut(BaseModel):
     id: str
-    target_type: str
-    target_id: str
+    target_type: Literal["product", "service"]   # genel: ürünler ya da servisler
+    target_id: str                                # genel yorumda "__all__" yazacağız
     user_id: str
-    content: str
     rating: int
-    created_at: datetime
-
-    class Config:
-        orm_mode = True
+    content: str
+    is_deleted: bool = False
+    created_at: Optional[datetime] = None

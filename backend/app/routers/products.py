@@ -2,7 +2,7 @@
 app/routers/products.py - Routes for product listing (public) and product management (admin).
 Handles image uploads to Firebase Storage on create.
 """
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, status
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, status , Query
 from typing import List , Optional , Union
 from uuid import uuid4
 from app.config import db, bucket
@@ -11,57 +11,49 @@ from app.schemas.product import ProductOut , ProductCreate
 from firebase_admin import firestore
 from datetime import datetime
 from google.cloud.firestore_v1.field_path import FieldPath
+from google.cloud.firestore_v1 import FieldFilter
+from google.cloud import firestore as gcf
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
 @router.get("/", response_model=List[ProductOut])
-def list_products(category_name: Optional[str] = None):
-    """
-    Aktif (is_deleted==False) tüm ürünleri döndürür.
-    - Ürünler kategori slug altındaki  `products/{slug}/items`  alt-koleksiyonlarında
-      tutulduğu için **collection_group('items')** kullanıyoruz.
-    - `category_name` verilirse filtre uygulanır.
-    - İndirim (discounts) kontrolü yapılarak `final_price` hesaplanır.
-    """
-    # ➊  Koleksiyon-grup sorgusu
-    base_q = (
-        db.collection_group("items")
-        .where("is_deleted", "==", False)
-    )
+def list_products(category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")):
+    # Tüm ürünler: products/<slug>/items alt koleksiyonlarını tara
+    colg = db.collection_group("items")
+    q = colg.where(filter=FieldFilter("is_deleted", "==", False))
+
+    # Kategori filtresi (kategori adına göre id çöz)
     if category_name:
-        base_q = base_q.where("category_name", "==", category_name)
-
-    product_list: List[dict] = []
-    now = datetime.utcnow()
-
-    for doc in base_q.stream():
-        data = doc.to_dict()
-        data["id"] = doc.id
-
-        # ➋  Aktif indirim (ürüne veya kategorisine) varsa final_price hesapla
-        disc_q = (
-            db.collection("discounts")
-            .where("active", "==", True)
-            .where("target_id", "in", [data["id"], data.get("category_id")])
-            .stream()
+        cat_q = (
+            db.collection("categories")
+              .where(filter=FieldFilter("name", "==", category_name))
+              .where(filter=FieldFilter("type", "==", "product"))
+              .limit(1)
+              .stream()
         )
+        cat_doc = next(cat_q, None)
+        if not cat_doc:
+            return []  # böyle bir kategori yoksa boş dön
+        cat_id = cat_doc.id
+        q = q.where(filter=FieldFilter("category_id", "==", cat_id))
 
-        best_percent = 0
-        for d in disc_q:
-            disc = d.to_dict()
-            start_at, end_at = disc.get("start_at"), disc.get("end_at")
-            if start_at and now < start_at:
-                continue
-            if end_at and now > end_at:
-                continue
-            best_percent = max(best_percent, disc["percent"])
+    # Sıralama (created_at her üründe yoksa try/except)
+    try:
+        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+    except Exception:
+        pass
 
-        final_price = round(data["price"] * (100 - best_percent) / 100, 2)
-        data["final_price"] = final_price
+    docs = list(q.stream())
 
-        product_list.append(data)
-
-    return product_list
+    out = []
+    for d in docs:
+        data = d.to_dict() or {}
+        data["id"] = d.id
+        # final_price emniyeti
+        base_price = data.get("price")
+        data["final_price"] = data.get("final_price", base_price)
+        out.append(data)
+    return out
 
 @router.get("/{product_id}", response_model=ProductOut)
 def get_product(product_id: str):

@@ -1,37 +1,38 @@
 """
 app/routers/categories.py - Routes for category retrieval (public) and management (admin).
 """
-from fastapi import APIRouter, Depends, HTTPException , status, Form
-from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException , status, Form , Query
+from typing import Optional, List , Literal
 from app.config import db
 from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut , CategoryRead, CategoryType
 from app.core.security import get_current_admin
+from google.cloud.firestore_v1 import FieldFilter
 
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
 
 @router.get("/", response_model=List[CategoryOut])
-def list_categories(type: Optional[str] = None):
+def list_categories(
+    category_type: Optional[Literal["product", "service"]] = Query(None, alias="type")
+):
     """
-    List categories. Optionally filter by type (product or service).
-    Only active categories are returned (is_upcoming categories are included but flagged).
-    Soft-deleted categories are not returned to customers.
+    List categories. Optionally filter by type (product|service).
+    Soft-deleted categories (if any) are skipped.
     """
-    col_ref = db.collection("categories")
-    query = col_ref
-    if type:
-        query = query.where("type", "==", type)
-    # Exclude any categories we might mark as deleted (if we had is_deleted for categories, which we did not explicitly store; assume deletion = removed doc)
-    docs = query.stream()
-    categories = []
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        # If category had an is_deleted field and it's True, skip it (assuming we would set is_deleted similarly to products).
-        if data.get('is_deleted'):
+    col = db.collection("categories")
+    q = col
+    if category_type:
+        q = q.where(filter=FieldFilter("type", "==", category_type))
+
+    docs = q.stream()
+    out = []
+    for d in docs:
+        data = d.to_dict() or {}
+        if data.get("is_deleted"):
             continue
-        categories.append(data)
-    return categories
+        data["id"] = d.id
+        out.append(data)
+    return out
 
 # Admin sub-router for category management
 admin_router = APIRouter(prefix="/categories", dependencies=[Depends(get_current_admin)])
