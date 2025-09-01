@@ -1,5 +1,111 @@
 """
-app/routers/appointments.py - Routes for appointment booking (user) and management (admin).
+# `app/routers/appointments.py` — Randevu Yönetimi Dokümantasyonu
+
+Bu modül, kullanıcıların randevu talebi oluşturabilmesini, kendi randevularını listeleyebilmesini ve admin paneli üzerinden randevuların yönetilebilmesini sağlayan API uç noktalarını içerir.
+Hem **kullanıcı** hem de **admin** işlemleri için ayrı router’lar tanımlanmıştır.
+
+---
+
+## Genel Yapı
+- `router`: Kullanıcı tarafı işlemleri (`/appointments` prefix’i ile)
+- `admin_router`: Admin tarafı işlemleri (`/appointments` prefix’i ile, `get_current_admin` bağımlılığıyla korunur)
+- Firestore veri tabanı (`app.config.db`) kullanılır.
+- Randevuların çakışmaması için tarih-saat aralıkları kontrol edilir.
+- Servis bilgileri `services` koleksiyonundan, kullanıcı bilgileri `users` koleksiyonundan çekilir.
+
+---
+
+## Kullanıcı Tarafı Fonksiyonlar
+
+### 1) `request_appointment(service_id: str, start: datetime, current_user: dict) -> AppointmentOut`
+**Amaç:** Kullanıcıların form-data üzerinden randevu talebi oluşturması.
+
+**Adımlar:**
+1. `service_id` ve `start` bilgileri form-data olarak alınır.
+2. `current_user` bilgisi `get_current_user` ile elde edilir.
+3. Randevu **1 saatlik** olacak şekilde `end_time` hesaplanır.
+4. İlgili servis Firestore’dan çekilir:
+   - Servis yoksa veya silinmişse `404` döner.
+   - Servis henüz aktif değilse (`is_upcoming=True`) `400` döner.
+5. Aynı servis ve saat diliminde başka `pending` veya `approved` randevu varsa `400` döner.
+6. Randevu Firestore’a `"pending"` statüsüyle kaydedilir.
+7. Oluşan randevu bilgisi `id` eklenerek döndürülür.
+
+---
+
+### 2) `list_my_appointments(current_user: dict) -> List[AppointmentOut]`
+**Amaç:** Giriş yapmış kullanıcının tüm randevularını listelemek.
+
+**Adımlar:**
+1. `current_user` ile `user_id` elde edilir.
+2. Firestore’da `appointments` koleksiyonundan ilgili `user_id` eşleşmeleri çekilir.
+3. Her belgeye `id` eklenir.
+4. Başlangıç saatine göre sıralanır.
+5. Liste döndürülür.
+
+---
+
+### 3) `get_all_busy_slots() -> dict`
+**Amaç:** Önümüzdeki **30 gün** için tüm servislerdeki dolu randevu saatlerini döndürmek.
+
+**Adımlar:**
+1. Şimdiki tarih (`now`) ve 30 gün sonrası (`date_to`) hesaplanır.
+2. Firestore’da `status` alanı `"pending"` veya `"approved"` olan, başlangıcı bu tarih aralığında olan randevular çekilir.
+3. `service_id`, `start`, `end`, `status` alanları ile liste oluşturulur.
+4. `{ "busy": [...] }` formatında döndürülür.
+
+---
+
+## Admin Tarafı Fonksiyonlar
+
+### 4) `list_appointments(status: Optional[str]) -> List[AppointmentAdminOut]`
+**Amaç:** Tüm randevuları listelemek, isteğe bağlı olarak `status` filtresi uygulamak.
+
+**Adımlar:**
+1. Firestore’dan tüm randevular çekilir; `status` parametresi verilmişse filtre uygulanır.
+2. Tüm `user_id` ve `service_id` değerleri toplanır.
+3. Firestore `get_all` ile kullanıcılar (`users`) ve servisler (`services`) tek sorguda çekilir.
+4. Kullanıcı ve servis bilgileri haritalanarak (`user_map`, `svc_map`) her randevuya eklenir.
+5. Başlangıç tarihine göre sıralanır ve döndürülür.
+
+---
+
+### 5) `create_appointment(service_id: str, user_id: str, start: datetime, end: datetime) -> AppointmentOut`
+**Amaç:** Admin panelinden manuel randevu oluşturmak.
+
+**Adımlar:**
+1. `end` boşsa `start + 1 saat` olarak belirlenir.
+2. Çakışma kontrolü yapılır; çakışma varsa `400` döner.
+3. Randevu `"approved"` statüsüyle Firestore’a eklenir.
+4. `id` eklenerek döndürülür.
+
+---
+
+### 6) `update_appointment_status_form(appointment_id: str, status: AppointmentStatus)`
+**Amaç:** Mevcut randevunun durumunu güncellemek.
+
+**Adımlar:**
+1. `appointment_id` ile belge çekilir, yoksa `404` döner.
+2. `status` alanı güncellenir.
+3. Güncelleme bilgisi döndürülür.
+
+---
+
+### 7) `delete_appointment(appointment_id: str, status: AppointmentStatus)`
+**Amaç:** Randevuyu tamamen silmek (blok veya test kaydı temizlemek için).
+
+**Adımlar:**
+1. `appointment_id` ile belge çekilir, yoksa `404` döner.
+2. Belge Firestore’dan silinir.
+3. Silindi bilgisi döndürülür.
+
+---
+
+## Kullanım Notları
+- **Tarih formatı:** `start` ve `end` alanları ISO 8601 formatında gönderilmelidir.
+- **Yetkilendirme:** Kullanıcı fonksiyonları `get_current_user`, admin fonksiyonları `get_current_admin` bağımlılığı ile korunur.
+- **Çakışma kontrolü:** Randevu başlangıcı ve bitişi mevcut randevularla kesişmemelidir.
+
 """
 from fastapi import APIRouter, Depends, HTTPException , Form , Query
 from typing import List , Literal , Optional

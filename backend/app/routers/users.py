@@ -1,6 +1,72 @@
 """
-app/routers/users.py - Routes for user profile and address management.
-Includes endpoints to get current user profile, add/update/delete addresses, etc.
+# `app/routers/users.py` — Kullanıcı ve Adres Yönetimi Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, giriş yapmış kullanıcının profilini görüntülemesini, adres ekleme/güncelleme/silme işlemlerini ve tüm adreslerini listelemesini sağlar.
+Tüm işlemler `get_current_user` bağımlılığı ile kimlik doğrulama gerektirir.
+
+---
+
+## Endpoint’ler
+
+### `GET /users/me`
+**Amaç:** Giriş yapmış kullanıcının profilini döndürmek.
+
+**İşleyiş:**
+1. `get_current_user` ile kullanıcı bilgisi Firestore’dan alınır.
+2. Profil bilgileri döndürülür.
+
+---
+
+### `POST /users/me/addresses`
+**Amaç:** Yeni adres eklemek.
+
+**Parametreler (Form-Data):** `AddressCreate` şeması.
+**İşleyiş:**
+1. Yeni adres için `uuid4()` ile benzersiz `id` üretilir.
+2. Adres bilgileri kullanıcının mevcut adres listesine eklenir.
+3. Firestore’da `users/{user_id}` dokümanındaki `addresses` alanı güncellenir.
+4. Eklenen adres döndürülür.
+
+---
+
+### `PUT /users/me/addresses/{addr_id}`
+**Amaç:** Mevcut adresi güncellemek.
+
+**Parametreler:**
+- `addr_id`: Güncellenecek adresin ID’si
+- `AddressUpdate` şeması (JSON)
+
+**İşleyiş:**
+1. Kullanıcının adres listesi çekilir.
+2. `addr_id` eşleşen adres bulunur ve gönderilen alanlar güncellenir.
+3. Güncellenmiş adres listesi Firestore’a yazılır.
+4. Güncel profil döndürülür.
+
+---
+
+### `DELETE /users/me/addresses/{addr_id}`
+**Amaç:** Adres silmek.
+
+**Parametreler:**
+- `addr_id`: Silinecek adresin ID’si
+
+**İşleyiş:**
+1. Kullanıcının adres listesi çekilir.
+2. `addr_id` eşleşmeyen adresler listede tutulur.
+3. Adres bulunamazsa `404` döner.
+4. Güncellenmiş adres listesi Firestore’a yazılır.
+5. Güncel profil döndürülür.
+
+---
+
+### `GET /users/me/addresses`
+**Amaç:** Giriş yapmış kullanıcının tüm adreslerini listelemek.
+
+**İşleyiş:**
+1. Firestore’dan `users/{user_id}` dokümanı çekilir.
+2. `addresses` alanı liste olarak döndürülür.
+
 """
 from fastapi import APIRouter, Depends, HTTPException
 from uuid import uuid4

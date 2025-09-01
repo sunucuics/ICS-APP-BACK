@@ -1,11 +1,112 @@
 """
-app/schemas/user.py - Pydantic models for User and Address schemas.
-Defines input/output structures for user-related data.
+# `app/schemas/user.py` — Kullanıcı ve Adres Şema Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, kullanıcı profili, adres yönetimi ve kimlik doğrulama işlemleri için kullanılan Pydantic veri modellerini tanımlar.
+Frontend, formlar ve API veri alışverişi için bu alan adlarını ve veri tiplerini esas almalıdır.
+
+---
+
+## Ortak Tipler
+- **NameStr**: En az 1 karakter, boşluklar kırpılmış.
+- **PhoneStr**: `555 123 4567` formatında, regex ile doğrulanır.
+
+---
+
+## Adres Şemaları
+
+### `AddressBase`
+Temel adres yapısı.
+| Alan         | Tip     | Zorunlu | Açıklama |
+|--------------|---------|---------|----------|
+| label        | `str` / `null` | ✖ | Adres etiketi |
+| name         | `str` / `null` | ✖ | İletişim adı (varsayılan kullanıcı adı) |
+| city         | `str`   | ✔       | Şehir |
+| zipCode      | `str`   | ✔       | Posta kodu |
+| district     | `str`   | ✔       | İlçe |
+| neighborhood | `str` / `null` | ✖ | Mahalle |
+| street       | `str` / `null` | ✖ | Sokak |
+| buildingNo   | `str` / `null` | ✖ | Bina numarası |
+| floor        | `str` / `null` | ✖ | Kat |
+| apartment    | `str` / `null` | ✖ | Daire |
+| note         | `str` / `null` | ✖ | Ek not / teslimat notu |
+
+---
+
+### `AddressCreate`
+Yeni adres oluşturma için (Form-Data desteği ile).
+- `as_form` metodu sayesinde form alanları doğrudan bu şemaya dönüştürülür.
+
+---
+
+### `AddressUpdate`
+Adres güncelleme için tüm alanlar opsiyoneldir.
+
+---
+
+### `AddressOut`
+API cevaplarında dönen adres yapısı (`id` eklenmiş).
+
+---
+
+## Kullanıcı Şemaları
+
+### `UserBase`
+Ortak kullanıcı alanları.
+| Alan  | Tip     | Açıklama |
+|-------|---------|----------|
+| name  | `str` / `null` | Ad Soyad |
+| phone | `str` / `null` | Telefon |
+
+---
+
+### `UserCreate`
+Kullanıcı kayıt verisi.
+| Alan     | Tip     | Zorunlu |
+|----------|---------|---------|
+| name     | `NameStr` | ✔ |
+| phone    | `PhoneStr`| ✔ |
+| email    | `EmailStr`| ✔ |
+| password | `str` (min 6 karakter) | ✔ |
+
+---
+
+### `UserProfile`
+Kullanıcı profil çıktısı.
+| Alan      | Tip       |
+|-----------|-----------|
+| id        | `str`     |
+| name      | `str` / `null` |
+| email     | `EmailStr`|
+| phone     | `str` / `null` |
+| role      | `str`     |
+| addresses | `list[AddressBase]` |
+
+---
+
+## Giriş / Çıkış Şemaları
+
+### `LoginRequest`
+Giriş isteği.
+| Alan     | Tip     |
+|----------|---------|
+| email    | `EmailStr` |
+| password | `str` (min 6 karakter) |
+
+---
+
+### `LoginResponse`
+Başarılı girişte dönen token paketi.
+| Alan          | Tip   |
+|---------------|-------|
+| id_token      | `str` |
+| refresh_token | `str` |
+| expires_in    | `int` |
+| user_id       | `str` |
+
 """
 from pydantic import BaseModel, EmailStr, constr, Field
 from typing import List, Optional , Annotated
-from sqlalchemy import Column, Integer, String, ForeignKey
-from sqlalchemy.orm import relationship
 from fastapi import Form
 
 PHONE_REGEX = r'^\d{3}\s\d{3}\s\d{4}$'
@@ -154,3 +255,12 @@ class LoginResponse(BaseModel):
     refresh_token: str
     expires_in:    int         # saniye
     user_id:       str
+
+class RegisterResponse(BaseModel):
+    # Kayıttan sonra ekranda göstermek için profil
+    user_id: str
+    user: "UserProfile"  # ileriye referans, alt satırdaki if TYPE_CHECKING düzenin varsa kaldırabilirsin
+    # Firebase tokenları
+    id_token: str
+    refresh_token: str
+    expires_in: int

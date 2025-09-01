@@ -1,5 +1,103 @@
 """
-app/schemas/appointment.py - Pydantic models for Appointments.
+# `app/schemas/appointment.py` — Appointment (Randevu) Şema Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, randevu oluşturma, güncelleme ve listeleme işlemleri için kullanılan Pydantic veri modellerini tanımlar.
+Frontend tarafı, API ile veri alışverişinde bu alan adlarını ve tiplerini esas almalıdır.
+
+---
+
+## Kullanıcı Tarafı Şemaları
+
+### `AppointmentRequest`
+Kullanıcının randevu talebi oluşturması için gerekli alanlar.
+| Alan        | Tip       | Zorunlu | Açıklama |
+|-------------|----------|---------|----------|
+| service_id  | `str`    | ✔       | Randevu alınacak hizmetin ID’si |
+| start       | `datetime` | ✔     | Randevu başlangıç tarihi ve saati |
+
+---
+
+## Admin Tarafı Şemaları
+
+### `AppointmentAdminCreate`
+Admin panelinden manuel randevu oluşturmak veya saat bloklamak için.
+| Alan        | Tip        | Zorunlu | Açıklama |
+|-------------|-----------|---------|----------|
+| service_id  | `str`     | ✔       | Hizmet ID’si |
+| user_id     | `str` / `null` | ✖ | Belirli kullanıcı için rezervasyon yapılacaksa kullanıcı ID’si; boş bırakılırsa saat bloklanır |
+| start       | `datetime` | ✔     | Başlangıç zamanı |
+| end         | `datetime` / `null` | ✖ | Bitiş zamanı; boşsa backend varsayılan süre ekler |
+
+---
+
+### `AppointmentUpdate`
+Randevu durumunu güncellemek için.
+| Alan   | Tip | Zorunlu | Açıklama |
+|--------|-----|---------|----------|
+| status | `"approved"` \| `"cancelled"` | ✔ | Yeni durum |
+
+---
+
+## Enum
+
+### `AppointmentStatus`
+| Değer      | Açıklama |
+|------------|----------|
+| `pending`  | Beklemede |
+| `approved` | Onaylandı |
+| `cancelled`| İptal edildi |
+
+---
+
+## Çıkış Şemaları (Response)
+
+### `AppointmentOut`
+Kullanıcı ve admin tarafında randevu yanıtı.
+| Alan       | Tip   | Açıklama |
+|------------|-------|----------|
+| id         | `str` | Randevu ID’si |
+| service_id | `str` | Hizmet ID’si |
+| user_id    | `str` / `null` | Kullanıcı ID’si |
+| start      | `datetime` | Başlangıç |
+| end        | `datetime` | Bitiş |
+| status     | `"pending"` \| `"approved"` \| `"cancelled"` | Durum |
+
+---
+
+### `UserBrief`
+Admin listelerinde kullanıcı özet bilgisi.
+| Alan      | Tip     |
+|-----------|---------|
+| id        | `str`   |
+| name      | `str` / `null` |
+| phone     | `str` / `null` |
+| email     | `str` / `null` |
+| addresses | `list[dict]` / `null` |
+
+---
+
+### `ServiceBrief`
+Admin listelerinde hizmet özet bilgisi.
+| Alan  | Tip          |
+|-------|--------------|
+| id    | `str`        |
+| title | `str` / `null` |
+| price | `float` / `null` |
+
+---
+
+### `AppointmentAdminOut`
+Admin listelerinde detaylı randevu çıktısı.
+| Alan    | Tip           |
+|---------|---------------|
+| id      | `str`         |
+| start   | `datetime`    |
+| end     | `datetime`    |
+| status  | `str`         |
+| user    | `UserBrief`   |
+| service | `ServiceBrief`|
+
 """
 from datetime import datetime
 from typing import Optional, Literal

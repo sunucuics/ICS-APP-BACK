@@ -1,3 +1,75 @@
+"""# `app/routers/comments.py` — Yorum Yönetimi Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, kullanıcıların genel yorum eklemesini, yorumları listelemesini ve admin paneli üzerinden yorum yönetimi yapılmasını sağlar.
+Yorumlar ürün veya hizmet tipinde olabilir, puanlama (1–5) ve içerik metni içerir.
+
+---
+
+## Kullanıcı Tarafı Endpoint’ler
+
+### `POST /comments/`
+**Amaç:** Genel yorum eklemek (3 kutu: `target_type`, `rating`, `content`).
+
+**Parametreler (Form-Data):**
+- `target_type`: `"product"` veya `"service"`
+- `rating`: 1–5 arası tamsayı
+- `content`: 1–500 karakter arası metin
+
+**İşleyiş:**
+1. `get_current_user` ile kullanıcı doğrulaması yapılır.
+2. `settings/profanity` dokümanındaki yasaklı kelimeler kontrol edilir.
+3. Firestore `comments` koleksiyonuna yeni yorum eklenir:
+   - `target_id` = `"__all__"` → genel yorum işareti
+   - `created_at` = Sunucu zaman damgası
+   - `is_deleted` = `False`
+4. Oluşan yorum `id` ile birlikte döndürülür.
+
+---
+
+### `GET /comments/`
+**Amaç:** Yorumları listelemek (opsiyonel filtrelerle).
+
+**Parametreler (Query):**
+- `target_type`: `"product"` veya `"service"` (opsiyonel)
+- `only_general`: `true` ise sadece genel yorumlar
+- `limit`: 1–200 arası, varsayılan 50
+
+**İşleyiş:**
+1. `is_deleted = False` olan yorumlar çekilir.
+2. `target_type` varsa filtrelenir.
+3. `only_general=true` ise `target_id="__all__"` filtrelenir.
+4. `created_at` alanına göre azalan sıralama yapılır.
+5. Sonuç listesi `id` eklenerek döndürülür.
+
+---
+
+## Admin Tarafı Endpoint’ler
+
+### `GET /comments/` *(Admin)*
+**Amaç:** Admin olarak yorum listesini parametresiz almak.
+
+**İşleyiş:**
+1. `is_deleted = False` olan yorumlar çekilir.
+2. `created_at`’e göre azalan sıralama yapılır (mümkünse).
+3. Maksimum 100 kayıt döndürülür.
+
+---
+
+### `DELETE /comments/{comment_id}` *(Admin)*
+**Amaç:** Yorum silmek (soft veya hard delete).
+
+**Parametreler:**
+- `comment_id`: Silinecek yorumun ID’si
+- `hard`: `true` ise kalıcı silme, `false` ise soft delete
+
+**İşleyiş:**
+1. Yorum dokümanı çekilir, yoksa `404` döner.
+2. `hard=true` ise doküman Firestore’dan tamamen silinir.
+3. `hard=false` ise `is_deleted=True` olarak işaretlenir.
+4. Silme işlemi sonucu döndürülür.
+"""
+
 from typing import List, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Form, Query
 from pydantic import conint, constr

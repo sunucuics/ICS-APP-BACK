@@ -1,71 +1,45 @@
-"""
-app/schemas/category.py - Pydantic models for Category.
-"""
-from typing import Literal, Optional , Annotated
-from enum import Enum
+# app/schemas/category.py
+from typing import Optional
 from fastapi import Form
-
 from pydantic import BaseModel, Field
 
-class CategoryType(str, Enum):
-    product  = "product"
-    service  = "service"
-
 class CategoryBase(BaseModel):
-    """Common fields for category creation/update."""
-    name: str = Field(..., description="Name of the category")
-    description: str = Field("", description="Description of this category")
-    parent_id: str = Field("", description="Optional parent category ID")
-    is_upcoming: bool = False
-
+    """Kategori ortak alanları."""
+    name: str = Field(..., min_length=1, description="Kategori adı")
+    description: str = Field("", description="Açıklama (opsiyonel)")
+    parent_id: Optional[str] = Field(None, description="Üst kategori ID (root için boş bırak)")
 
 # ---------- input ----------
 class CategoryCreate(BaseModel):
     """
-    Admin ⇒ Yeni kategori oluşturma girdisi.
-    ▸ parent_id yalnızca alt-kategori gerekiyorsa gönderilir.
+    Admin ⇒ Yeni kategori oluşturma girdisi (yalnızca ürün kategorisi).
+    Kapak görseli dosya olarak endpoint'te alınır (Pydantic'e dahil edilmez).
     """
-    name: str = Field(..., description="Kategori adı")
-    type: Literal["product", "service"] = Field(..., description="Kategori tipi")
+    name: str = Field(..., min_length=1, description="Kategori adı")
     description: str = Field("", description="Açıklama (opsiyonel)")
-    is_upcoming: bool = Field(False, description="Yakında mı? (default False)")
-    parent_id: Optional[str] = Field(
-        None, description="Üst kategori ID (alt-kategori için)"
-    )
+    parent_id: Optional[str] = Field(None, description="Üst kategori ID (opsiyonel)")
 
-    # Form-Data desteği
+    # Form-Data desteği (JSON da desteklenir)
     @classmethod
     def as_form(
         cls,
         name: str = Form(...),
-        type: str = Form(..., regex="^(product|service)$"),
         description: str = Form(""),
-        is_upcoming: bool = Form(False),
         parent_id: Optional[str] = Form(None),
     ):
-        return cls(
-            name=name,
-            type=type,
-            description=description,
-            is_upcoming=is_upcoming,
-            parent_id=parent_id,
-        )
-
-# ---------- output ----------
-class CategoryRead(CategoryCreate):
-    id: str
-
+        return cls(name=name, description=description, parent_id=parent_id)
 
 class CategoryUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    parent_id: Optional[str] = None
-    is_upcoming: Optional[bool] = None
+    """Kategori güncelleme için opsiyonel alanlar."""
+    name: Optional[str] = Field(None, description="Yeni kategori adı")
+    description: Optional[str] = Field(None, description="Yeni açıklama")
+    parent_id: Optional[str] = Field(None, description="Yeni üst kategori ID")
 
-
-class CategoryOut(CategoryBase):
+# ---------- output ----------
+class CategoryOut(BaseModel):
+    """Listeleme/Görüntüleme çıktısı."""
     id: str
-    type: Literal["product", "service"]
-
-    model_config = {"from_attributes": True}
-
+    name: str
+    description: str = ""
+    parent_id: Optional[str] = None
+    cover_image: Optional[str] = None  # Storage URL'i

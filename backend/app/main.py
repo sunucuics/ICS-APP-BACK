@@ -1,6 +1,54 @@
 """
-app/main.py - Application entry point.
-Sets up FastAPI app, includes routers, configures middleware, and starts background scheduler.
+# `app/main.py` — Ana Uygulama Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, FastAPI uygulamasının başlangıç noktasıdır.
+Router’lar eklenir, CORS ayarları yapılır, admin ve public endpoint’ler bağlanır, arka planda çalışan scheduler yapılandırılır.
+
+---
+
+## Uygulama Başlatma
+- `FastAPI` örneği başlatılır (`title`, `description`, `version`).
+- CORS ayarları `settings.allowed_origins` üzerinden yapılır (liste veya `*`).
+
+---
+
+## Router Dahil Etme
+**Public Router’lar:**
+- `/auth`
+- `/users`
+- `/categories`
+- `/products`
+- `/services`
+- `/carts`
+- `/orders`
+- `/appointments`
+- `/comments`
+
+**Admin Router’lar (prefix `/admin`):**
+- `/categories`
+- `/products`
+- `/services`
+- `/orders`
+- `/appointments`
+- `/discounts`
+- `/comments`
+
+Tüm admin router’lar ilgili modüllerde `get_current_admin` ile korunur.
+
+---
+
+## Arka Plan Scheduler
+- **Kütüphane:** APScheduler (`BackgroundScheduler`)
+- **İş:** `update_tracking_statuses` (kargo takip durumlarını günceller)
+- **Periyot:** 30 dakikada bir (sadece `settings.tracking_api_key` varsa çalışır)
+
+**Olaylar:**
+- `startup`: Scheduler başlatılır.
+- `shutdown`: Scheduler kapatılır.
+
+---
+
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -1,5 +1,62 @@
 """
-app/schemas/service.py - Pydantic models for Service (flat collection, no category).
+# `app/schemas/service.py` — Hizmet Şema Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, hizmet (service) oluşturma, güncelleme ve listeleme işlemleri için kullanılan Pydantic modellerini tanımlar.
+Hizmetler kategoriye bağlı değildir, `services/{id}` şeklinde düz (flat) bir koleksiyonda tutulur.
+
+---
+
+## Ortak Şema
+
+### `ServiceBase`
+Tüm hizmetler için ortak alanlar.
+| Alan        | Tip     | Zorunlu | Açıklama |
+|-------------|---------|---------|----------|
+| title       | `str`   | ✔       | Hizmet başlığı/ismi |
+| description | `str`   | ✖       | Hizmet açıklaması |
+| is_upcoming | `bool`  | ✖       | Yakında mı? |
+
+---
+
+## Girdi Şemaları (Input)
+
+### `ServiceCreate`
+Yeni hizmet oluşturmak için.
+| Alan        | Tip     | Zorunlu | Açıklama |
+|-------------|---------|---------|----------|
+| title       | `str`   | ✔       | Hizmet başlığı |
+| description | `str`   | ✖       | Açıklama |
+| is_upcoming | `bool`  | ✖       | Yakında mı? |
+
+---
+
+### `ServiceUpdate`
+Admin panelinde hizmet güncellemek için.
+| Alan        | Tip     | Açıklama |
+|-------------|---------|----------|
+| title       | `str` / `null` | Yeni başlık |
+| description | `str` / `null` | Yeni açıklama |
+| is_upcoming | `bool` / `null`| Yeni yakında mı bilgisi |
+| image       | `str` / `null` | Yeni görsel URL’si |
+
+---
+
+## Çıktı Şemaları (Output)
+
+### `ServiceOut`
+Hizmet listeleme veya detay yanıtı.
+| Alan        | Tip     | Açıklama |
+|-------------|---------|----------|
+| id          | `str`   | Hizmet ID’si |
+| title       | `str`   | Hizmet başlığı |
+| description | `str`   | Açıklama |
+| image       | `str` / `null` | Görsel URL’si |
+| is_upcoming | `bool`  | Yakında mı bilgisi |
+| is_deleted  | `bool`  | Silinmiş mi bilgisi |
+| created_at  | `datetime` / `null` | Oluşturulma zamanı |
+| kind        | `str` / `null` | Tür bilgisi (varsayılan `"service"`) |
+
 """
 from pydantic import BaseModel, Field
 from typing import Optional

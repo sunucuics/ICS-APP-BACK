@@ -1,8 +1,59 @@
 """
-app/core/security.py - Security and authentication utilities.
+# `app/core/security.py` — Güvenlik & Kimlik Doğrulama Dokümantasyonu
 
-Contains dependency functions for verifying JWT tokens from Firebase and retrieving the current user.
-Also includes role-checking for admin access and any other security-related helper functions.
+Bu modül, **Firebase ID Token** doğrulaması ile kimlik denetimi yapan FastAPI bağımlılıklarını ve **rol bazlı yetkilendirme** yardımcılarını içerir. Endpoint’lerde `Depends(...)` ile kullanılarak kullanıcı veya admin erişimi sağlanabilir.
+
+---
+
+## Genel İşleyiş
+
+- **Kimlik Doğrulama:** `Authorization: Bearer <Firebase ID token>` başlığı ile gelen token, **Firebase Admin SDK** ile doğrulanır.
+- **Kullanıcı Getirme / Oluşturma:** Token doğrulandıktan sonra Firestore’daki `users/{uid}` dokümanı okunur. Yoksa token’dan gelen bilgilerle varsayılan bir profil oluşturulur.
+- **Rol Kontrolü:** `get_current_admin` fonksiyonu, kullanıcının `role` alanının `"admin"` olup olmadığını kontrol eder.
+
+> **Not:** `firebase_admin` başlatımı (`firebase_admin.initialize_app(...)`) uygulama genelinde yapılmış olmalıdır. Ayrıca `app.config.db` Firestore istemcisini (`db`) sağlamalıdır.
+
+---
+
+## Güvenlik Şeması
+
+### `oauth2_scheme = HTTPBearer(auto_error=False)`
+- **Amaç:** `Authorization` başlığındaki Bearer token’ı almak için kullanılır.
+- `auto_error=False` ile token yoksa hata fırlatma kontrolü bizde olur.
+
+**Beklenen Header:**
+
+"""
+"""
+---
+
+## Fonksiyonlar
+
+### 1) `get_current_user(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> dict`
+**Amaç:** Geçerli kullanıcıyı doğrulamak ve döndürmek.
+
+**Adımlar:**
+1. **Token kontrolü:** Token yoksa `401 Unauthorized` hatası döner.
+2. **Token doğrulama:**  
+   `firebase_auth.verify_id_token(...)` ile Firebase ID Token doğrulanır. Geçersizse `401 Unauthorized` döner.
+3. **Kullanıcı verisi çekme:**  
+   Firestore’daki `users/{uid}` dokümanı alınır.
+4. **Yoksa oluşturma:**  
+   Kullanıcı dokümanı yoksa token’dan alınan `name`, `email`, `phone_number` bilgileriyle varsayılan bir profil (`role="customer"`, `addresses=[]`, `is_guest=False`) oluşturulur.
+5. **Sonuç:**  
+   Kullanıcı verisi `id` alanıyla birlikte döndürülür.
+
+**Dönen Değer Örneği:**
+```json
+{
+  "id": "firebase_uid",
+  "name": "Ad Soyad",
+  "email": "email@example.com",
+  "phone": "+90...",
+  "role": "customer",
+  "addresses": [],
+  "is_guest": false
+}
 """
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials

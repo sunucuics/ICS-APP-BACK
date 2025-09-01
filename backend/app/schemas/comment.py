@@ -1,5 +1,39 @@
 """
-app/schemas/comment.py - Pydantic models for comments/reviews.
+# `app/schemas/comment.py` — Yorum Şema Dokümantasyonu
+
+## Genel Bilgi
+Bu dosya, kullanıcıların ürün veya hizmetler için yorum eklemesini ve yorum verilerinin API çıktılarında kullanılmasını sağlayan Pydantic modellerini tanımlar.
+
+---
+
+## Girdi Şemaları (Input)
+
+### `CommentCreate`
+Yeni yorum oluşturmak için.
+| Alan         | Tip      | Zorunlu | Açıklama |
+|--------------|----------|---------|----------|
+| target_type  | `"product"` \| `"service"` | ✔ | Yorumun hedef türü |
+| target_id    | `str`    | ✔       | Yorumun hedef ID’si (genel yorumlarda `"__all__"`) |
+| rating       | `int` (1–5) | ✔   | Puan |
+| content      | `str` (1–500 karakter) | ✔ | Yorum metni |
+
+---
+
+## Çıktı Şemaları (Output)
+
+### `CommentOut`
+Yorum listeleme veya görüntüleme için.
+| Alan         | Tip      | Açıklama |
+|--------------|----------|----------|
+| id           | `str`    | Yorum ID’si |
+| target_type  | `"product"` \| `"service"` | Hedef tür |
+| target_id    | `str`    | Hedef ID (genel yorumlarda `"__all__"`) |
+| user_id      | `str`    | Yorumu yazan kullanıcı ID’si |
+| rating       | `int`    | Puan |
+| content      | `str`    | Yorum metni |
+| is_deleted   | `bool`   | Yorum silinmiş mi? (varsayılan `False`) |
+| created_at   | `datetime` / `null` | Yorum oluşturulma zamanı |
+
 """
 from typing import Optional, Literal
 from datetime import datetime
