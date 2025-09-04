@@ -186,3 +186,59 @@ def list_addresses(current_user: dict = Depends(get_current_user)):
 
     addresses = snap.to_dict().get("addresses", [])
     return [AddressOut(**addr) for addr in addresses]
+
+
+@router.put("/me/addresses/{addr_id}/select", response_model=AddressOut)
+def choose_current_address(
+    addr_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Choose (and persist) the user's current/default address.
+    Saves `defaultAddressId` on the user document for later use (e.g., cargo).
+    Returns the selected address.
+    """
+    user_id = current_user["id"]
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    profile = doc.to_dict()
+    addresses = profile.get("addresses", [])
+
+    # find address by id
+    selected = next((a for a in addresses if a.get("id") == addr_id), None)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Address not found")
+
+    # persist selection
+    user_ref.update({"defaultAddressId": addr_id})
+
+    return AddressOut(**selected)
+
+
+@router.get("/me/addresses/current", response_model=AddressOut)
+def get_current_address(current_user: dict = Depends(get_current_user)):
+    """
+    Return the user's currently selected (default) address.
+    Looks up `defaultAddressId` on the user document and returns that address.
+    """
+    user_id = current_user["id"]
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    data = doc.to_dict()
+    default_id = data.get("defaultAddressId")
+    if not default_id:
+        raise HTTPException(status_code=404, detail="No default address set")
+
+    addresses = data.get("addresses", [])
+    current = next((a for a in addresses if a.get("id") == default_id), None)
+    if not current:
+        # default id is stale or address was deleted
+        raise HTTPException(status_code=404, detail="Default address not found")
+
+    return AddressOut(**current)
