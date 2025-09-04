@@ -109,31 +109,52 @@ def list_products(
     - created_at varsa DESC sıralama
     """
     colg = db.collection_group("items")
-    q = colg.where(filter=FieldFilter("is_deleted", "==", False))
+    # Geçici olarak is_deleted filtresini kaldırıyoruz - index sorunu olabilir
+    # q = colg.where(filter=FieldFilter("is_deleted", "==", False))
+    q = colg
 
     if category_name:
         # Artık type filtresi YOK; dokümana kaydedilen category_name üzerinden filtre
-        q = q.where(filter=FieldFilter("category_name", "==", category_name))
+        print(f"🔍 Filtering by category_name: '{category_name}'")
+        # Geçici olarak filtrelemeyi kaldırıyoruz - debug için
+        # q = q.where(filter=FieldFilter("category_name", "==", category_name))
 
-    try:
-        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
-    except Exception:
-        pass
+    # Geçici olarak order_by'ı kaldırıyoruz - index sorunu olabilir
+    # try:
+    #     q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+    # except Exception as e:
+    #     print(f"⚠️ Order by error: {e}")
+    #     pass
 
     out: List[ProductOut] = []
-    for d in q.stream():
-        src = d.to_dict() or {}
-        out.append(ProductOut(
-            id=src.get("id", d.id),
-            title=src.get("title", ""),
-            description=src.get("description", ""),
-            price=float(src.get("price", 0)),
-            final_price=float(src.get("final_price", src.get("price", 0) or 0)),
-            stock=int(src.get("stock", 0)),
-            is_upcoming=bool(src.get("is_upcoming", False)),
-            category_name=src.get("category_name", ""),
-            images=src.get("images", []) or [],
-        ))
+    try:
+        for d in q.stream():
+            src = d.to_dict() or {}
+            print(f"📦 Processing product: {src.get('title', 'Unknown')} - category: {src.get('category_name', 'None')}")
+            
+            # Kategori filtrelemesini kod seviyesinde yap
+            if category_name and src.get("category_name") != category_name:
+                continue
+                
+            # is_deleted filtresini kod seviyesinde yap
+            if src.get("is_deleted", False):
+                continue
+                
+            out.append(ProductOut(
+                id=src.get("id", d.id),
+                title=src.get("title", ""),
+                description=src.get("description", ""),
+                price=float(src.get("price", 0)),
+                final_price=float(src.get("final_price", src.get("price", 0) or 0)),
+                stock=int(src.get("stock", 0)),
+                is_upcoming=bool(src.get("is_upcoming", False)),
+                category_name=src.get("category_name", ""),
+                images=src.get("images", []) or [],
+            ))
+        print(f"✅ Found {len(out)} products")
+    except Exception as e:
+        print(f"❌ Error processing products: {e}")
+        raise e
     return out
 
 
