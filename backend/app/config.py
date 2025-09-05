@@ -9,6 +9,7 @@ from pydantic import Field
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from pydantic_settings import BaseSettings   # ✅ BaseSettings buraya taşındı
+from typing import Optional
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
@@ -22,7 +23,13 @@ class Settings(BaseSettings):
     debug: bool = Field(False, env='DEBUG')
     allowed_origins: str = Field('*', env='ALLOWED_ORIGINS')  # Comma-separated list or '*' for all
     firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
-
+    delete_account_secret: Optional[str] = None
+    smtp_host: str = "localhost"
+    smtp_port: int = 465
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from: Optional[str] = None
+    smtp_use_starttls: bool = False  # 587 için true
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
