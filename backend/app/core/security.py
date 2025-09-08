@@ -61,7 +61,8 @@ from firebase_admin import auth as firebase_auth
 from app import config
 from app.config import settings, db
 from firebase_admin import firestore
-
+from app.schemas.principal import Principal
+from app.core.auth import get_principal
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)
 
@@ -81,6 +82,8 @@ def get_current_user(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme
     try:
         # Verify the token with Firebase Admin SDK. This throws if invalid.
         decoded_token = firebase_auth.verify_id_token(token.credentials)
+        provider = (decoded_token.get('firebase') or {}).get('sign_in_provider')
+        is_guest = (provider == "anonymous")
         uid = decoded_token.get('uid')
     except Exception as exc:
         # Verification failed
@@ -102,7 +105,7 @@ def get_current_user(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme
             "role": "customer",
             "addresses": [],
             "created_at": firestore.SERVER_TIMESTAMP,
-            "is_guest": False
+            "is_guest": is_guest,  # <- burada True/False
         }
         user_ref.set(user_data)
         user = user_data
@@ -129,3 +132,27 @@ def get_current_admin(current_user: dict = Depends(get_current_user)):
 # Additional security helpers (if needed):
 # e.g., password hashing for manual auth or generating secure tokens for invites, etc.
 # Not used here since Firebase manages authentication.
+
+
+def require_non_guest(principal: Principal = Depends(get_principal)) -> Principal:
+    """
+    Misafir kullanıcıları (role='guest') 403 ile engeller.
+    Sipariş/servis gibi aksiyon endpoint'lerinde kullan.
+    """
+    if principal.role == "guest":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Guest users are not allowed for this action."
+        )
+    return principal
+
+def require_admin(principal: Principal = Depends(get_principal)) -> Principal:
+    """
+    Sadece admin kullanıcıları kabul eder.
+    """
+    if principal.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privilege required."
+        )
+    return principal
