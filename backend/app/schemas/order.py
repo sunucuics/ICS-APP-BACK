@@ -1,37 +1,117 @@
-"""
-app/schemas/order.py - Pydantic models for Orders.
-"""
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime
+# app/schemas/orders.py
+from __future__ import annotations
 
-class OrderItem(BaseModel):
+from typing import Optional, List, Literal, Any, Dict
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+# Sipariş durumları
+OrderStatus = Literal[
+    "Hazırlanıyor",
+    "Sipariş Alındı",
+    "Kargoya Verildi",
+    "Yolda",
+    "Dağıtımda",
+    "Teslim Edildi",
+    "İptal",
+    "İade",
+]
+
+# Pydantic v1: extra alanları koru (response'ta kırpılmasın)
+class _Base(BaseModel):
+    class Config:
+        extra = "allow"
+
+# (Input) Sepete/checkout'a gelen minimal item
+class OrderItem(_Base):
     product_id: str
     name: str
-    qty: int
-    price: float  # price per unit at purchase time
-    # Note: final price per item after discount could be derived from price if needed.
+    quantity: int = 1
+    price: float
 
-class OrderCreate(BaseModel):
-    """Schema for creating a new order (checkout)."""
-    # We might accept card details and optionally an address ID for shipping.
-    address_id: Optional[str] = Field(None, description="Address ID to use for shipping (if user has multiple addresses)")
-    card_holder_name: str = Field(..., description="Name on credit card")
-    card_number: str = Field(..., description="Credit card number")
-    expire_month: str = Field(..., description="Card expiry month (MM)")
-    expire_year: str = Field(..., description="Card expiry year (YYYY)")
-    cvc: str = Field(..., description="Card CVC code")
+# (Output) Siparişte dönen satır — zengin alanlar + ürün snapshot
+class OrderItemOut(_Base):
+    # Zorunlu (OrderOut uyumu)
+    product_id: str
+    name: str
+    quantity: int = 1
+    price: float
 
-class OrderOut(BaseModel):
+    # Alias/ekler (coerce_item bunları dolduruyor)
+    title: Optional[str] = None
+    unit_price: Optional[float] = None
+    total: Optional[float] = None
+    line_total: Optional[float] = None
+    currency: Optional[str] = None
+    sku: Optional[str] = None
+    variant_id: Optional[str] = None
+    image_url: Optional[str] = None
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+    # Ürün snapshot (admin panel için hızlı gösterim)
+    product: Optional[Dict[str, Any]] = None
+
+# Adres modeli (esnek; fazladan alanları saklar)
+class AddressOut(_Base):
+    name: Optional[str] = None
+    label: Optional[str] = None
+    city: Optional[str] = None
+    district: Optional[str] = None
+    neighborhood: Optional[str] = None
+    street: Optional[str] = None
+    buildingNo: Optional[str] = None
+    apartment: Optional[str] = None
+    floor: Optional[str] = None
+    zipCode: Optional[str] = None
+    note: Optional[str] = None
+    id: Optional[str] = None
+
+# Tutar özeti
+class TotalsOut(_Base):
+    item_count: int
+    subtotal: float
+    discount: float
+    shipping: float
+    tax: float
+    grand_total: float
+    currency: str
+
+# Kargo bilgisi
+class ShipmentOut(_Base):
+    provider: Optional[str] = None
+    tracking_number: Optional[str] = None
+    status: Optional[str] = None
+    simulated: Optional[bool] = None
+    log: Optional[str] = None
+
+# (Input) sipariş oluşturma payload'ı
+class OrderCreate(_Base):
+    items: List[OrderItem] = Field(default_factory=list)
+    note: Optional[str] = None
+
+# (Output) sipariş cevabı — tüm detaylarla
+class OrderOut(_Base):
     id: str
     user_id: str
-    items: List[OrderItem]
-    total: float
-    payment_status: str
-    shipping_status: str
-    tracking_number: Optional[str]
-    carrier_code: Optional[str]
-    created_at: datetime
+    status: OrderStatus
 
-    class Config:
-        orm_mode = True
+    # Geriye uyumluluk: üst seviyede de dursun
+    tracking_number: Optional[str] = None
+    shipping_provider: Literal["Aras Kargo"] = "Aras Kargo"
+
+    integration_code: Optional[str] = None
+    address: AddressOut
+    items: List[OrderItemOut] = Field(default_factory=list)
+
+    # Yeni bloklar
+    totals: Optional[TotalsOut] = None
+    shipment: Optional[ShipmentOut] = None
+
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+# Pickup isteği (opsiyonel akışlar için)
+class PickupBody(_Base):
+    date: Optional[str] = Field(None, description="YYYY-MM-DD (boşsa ayarlardan hesaplanır)")
+    window: Optional[str] = Field(None, description="örn: 13:00-17:00")

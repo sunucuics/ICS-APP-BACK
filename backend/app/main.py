@@ -60,8 +60,13 @@ from app.routers import services as services_router
 from app.routers import orders as orders_router
 from app.routers import appointments as appointments_router
 from app.routers import comments as comments_router
-from app.integrations.shipping_provider import update_tracking_statuses
 from firebase_admin import firestore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from app.services.orders_sync import sync_open_orders_once  # job fonksiyonun
+
+# Tek bir scheduler instance'ı oluştur
+scheduler = AsyncIOScheduler()
+scheduler.add_job(sync_open_orders_once, "interval", minutes=10, id="orders-sync", replace_existing=True)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -102,28 +107,24 @@ app.include_router(discounts.router, prefix="/admin")  # all routes in discounts
 app.include_router(comments_router.admin_router, prefix="/admin")
 app.include_router(featured.admin_router, prefix="/admin")
 
-# Background scheduler for tracking updates
-# We'll use APScheduler if tracking integration is enabled
-from apscheduler.schedulers.background import BackgroundScheduler
 
-scheduler = BackgroundScheduler()
-if settings.tracking_api_key:
-    # schedule tracking status updates every 30 minutes
-    scheduler.add_job(update_tracking_statuses, 'interval', minutes=30)
-
-# Start and stop scheduler with app events
 @app.on_event("startup")
-def on_startup():
-    if settings.tracking_api_key:
+async def _startup_scheduler():
+    if not scheduler.running:
         scheduler.start()
-        print("Background scheduler started for shipment tracking.")
+    # Job'u güvenle ekle (varsa üstüne yaz)
+    scheduler.add_job(
+        sync_open_orders_once,
+        "interval",
+        minutes=2,
+        id="orders-sync",
+        replace_existing=True,
+    )
 
 @app.on_event("shutdown")
-def on_shutdown():
-    try:
-        scheduler.shutdown()
-    except Exception:
-        pass
+async def _shutdown_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 
 # Run the app directly with uvicorn (for development)
 if __name__ == "__main__":

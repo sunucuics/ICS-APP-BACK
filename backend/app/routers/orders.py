@@ -1,242 +1,404 @@
-"""
-app/routers/orders.py - Routes for order checkout (user) and order management (admin).
-Handles payment process, order creation, and providing tracking info.
-"""
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from typing import List
-from datetime import datetime
-from app.core.security import get_current_user, get_current_admin
-from app.config import db
-from app.integrations import payment as payment_integration, shipping_provider
-from app.schemas.order import OrderCreate, OrderOut
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from firebase_admin import firestore
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from typing import Any, Dict, List, Optional
+import uuid
+from app.routers import users as users_router
+from fastapi.responses import JSONResponse
+from google.api_core.exceptions import FailedPrecondition
+from app.config import db, settings
+from app.schemas.order import OrderCreate, OrderOut, OrderItem , PickupBody
+from app.integrations.shipping_provider import (
+    create_shipment_with_setorder,
+    get_status_with_integration_code,
+)
+from app.core.security import get_current_user as get_principal
+from app.core.security import get_current_admin
+from app.services.orders_helpers import (
+    _fetch_active_address,
+    _call_users_current_address,
+    _resolve_active_address,
+    _extract_uid,
+    _extract_name,
+    _extract_phone,
+    _to_order_item,
+    _fetch_cart_items,
+    _clear_cart,
+    _order_doc_to_out,
+    _doc_to_out,
+    _map_aras_status,
+    coerce_item,
+    calc_totals,
+    build_order_doc,
+    order_doc_to_out,
+    ensure_aras_env_or_raise,
+    aras_single_package,
+    fetch_cart_items,
+    clear_cart,
+    resolve_active_address,
+    extract_uid,
+    extract_name,
+    extract_phone,
+    enrich_items_from_products,
+)
+from app.services.fulfillment import auto_after_create , attach_label, schedule_pickup
+from datetime import date
+from google.cloud.firestore_v1.base_query import FieldFilter
+import inspect
+
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
+admin_router = APIRouter(prefix="/orders", tags=["Admin Orders"])
 
-@router.post("/", response_model=OrderOut)
-def checkout_order(order_data: OrderCreate, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+
+
+@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def create_order(
+    payload: OrderCreate,
+    simulate: bool = Query(False, description="True ise Aras'a istek atılmaz, sahte takip no üretilir."),
+    clear_cart_on_success: bool = Query(True, description="Sipariş başarılıysa sepeti temizle."),
+    checkout_id: Optional[str] = Query(
+        None,
+        description="Aynı checkout için tek sipariş üretmek üzere idempotent anahtar (ör. UUID).",
+    ),
+    principal=Depends(get_principal),
+):
     """
-    Checkout the current cart and create an order.
-    Processes payment via iyzico and creates an order record upon success.
+    TEK CHECKOUT → TEK SİPARİŞ (TEK TAKİP NO)
+    - Sepetin tamamı 'items' altında saklanır.
+    - Aras entegrasyonunda tek paket/tek takip numarası oluşturulur.
+    - Aynı checkout_id ile tekrar çağrılırsa, yeni sipariş açmaz.
     """
-    user_id = current_user['id']
-    # Retrieve cart
-    cart_doc = db.collection("carts").document(user_id).get()
-    if not cart_doc.exists or not cart_doc.to_dict().get('items'):
-        raise HTTPException(status_code=400, detail="Cart is empty")
-    cart = cart_doc.to_dict()
-    cart_items = cart.get('items', [])
-    # Validate stock and calculate total
-    total = 0.0
-    # Also prepare items list for order record
-    order_items = []
-    for item in cart_items:
-        product_id = item['product_id']
-        qty = item['qty']
-        # Check product availability
-        product_ref = db.collection("products").document(product_id)
-        product_doc = product_ref.get()
-        if not product_doc.exists or product_doc.to_dict().get('is_deleted'):
-            raise HTTPException(status_code=400, detail=f"Product {product_id} no longer available")
-        product = product_doc.to_dict()
-        if product.get('is_upcoming'):
-            raise HTTPException(status_code=400, detail=f"Product {product['title']} is not yet available for purchase")
-        if product.get('stock', 0) < qty:
-            raise HTTPException(status_code=400, detail=f"Not enough stock for product {product['title']}")
-        price = float(product['price'])
-        # Apply discount if any (similar logic as in listing)
-        final_price = price
-        best_percent = 0
-        import datetime
-        now = datetime.datetime.utcnow()
-        disc_q = db.collection("discounts").where("active", "==", True).where("target_id", "in", [product_id, product.get('category_id')]).stream()
-        for d in disc_q:
-            disc = d.to_dict()
-            start_at = disc.get('start_at'); end_at = disc.get('end_at')
-            if start_at and now < start_at: continue
-            if end_at and now > end_at: continue
-            if disc['target_type'] == 'product' and disc['target_id'] == product_id:
-                best_percent = max(best_percent, disc['percent'])
-                break
-            elif disc['target_type'] == 'category' and disc['target_id'] == product.get('category_id'):
-                best_percent = max(best_percent, disc['percent'])
-        if best_percent > 0:
-            final_price = round(price * (100 - best_percent) / 100, 2)
-        total += final_price * qty
-        order_items.append({
-            "product_id": product_id,
-            "name": product.get('title', ''),
-            "qty": qty,
-            "price": final_price
-        })
-    # Process payment through iyzico
-    # Prepare card info
-    card_info = {
-        "cardHolderName": order_data.card_holder_name,
-        "cardNumber": order_data.card_number,
-        "expireMonth": order_data.expire_month,
-        "expireYear": order_data.expire_year,
-        "cvc": order_data.cvc
-    }
-    # Get user's chosen shipping address
-    shipping_address = None
-    if order_data.address_id:
-        # find the address in user's profile
-        user_doc = db.collection("users").document(user_id).get()
-        if user_doc.exists:
-            user_profile = user_doc.to_dict()
-            for addr in user_profile.get('addresses', []):
-                if addr.get('id') == order_data.address_id:
-                    shipping_address = addr
-                    break
-    if not shipping_address:
-        # If not provided or not found, use first address or throw error
-        user_profile = current_user  # current_user has addresses loaded (in security dependency)
-        addresses = user_profile.get('addresses', [])
-        if addresses:
-            shipping_address = addresses[0]
-        else:
-            raise HTTPException(status_code=400, detail="Shipping address not provided")
-    # Use shipping_address to build contact info
-    address_info = {
-        "contactName": shipping_address.get('name') or current_user.get('name', ""),
-        "address": shipping_address.get('address'),
-        "city": shipping_address.get('city'),
-        "country": shipping_address.get('country'),
-        "zipCode": shipping_address.get('zipCode')
-    }
-    # Execute payment
-    order_id = db.collection("orders").document().id  # generate an ID for conversation reference
-    success, payment_result = payment_integration.create_payment(
+    uid = extract_uid(principal)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Oturum bulunamadı.")
+
+    # 0) Aktif adres
+    try:
+        addr = resolve_active_address(principal)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Aktif adres çözümleme hatası: {e}")
+    if not addr:
+        raise HTTPException(status_code=400, detail="Aktif adres bulunamadı. Lütfen bir adres seçin.")
+
+    # 1) Item'lar — CART-FIRST
+    cart_items_raw = fetch_cart_items(uid)
+    request_items_raw = payload.items or []
+    raw_items = cart_items_raw or request_items_raw
+    if not raw_items:
+        raise HTTPException(status_code=400, detail="Sepet boş. Lütfen önce ürün ekleyin.")
+
+    items = [coerce_item(it) for it in raw_items]
+    items = enrich_items_from_products(items)
+    currency = (items[0]["currency"] if items else "TRY").upper()
+    totals = calc_totals(items, currency=currency)
+
+    # 2) Idempotent kontrol (checkout_id varsa)
+    if checkout_id:
+        try:
+            existing = list(
+                db.collection("orders")
+                  .where(filter=FieldFilter("user_id", "==", uid))
+                  .where(filter=FieldFilter("_checkout_id", "==", checkout_id))
+                  .limit(1)
+                  .stream()
+            )
+            if existing:
+                return order_doc_to_out(existing[0])
+        except Exception:
+            # Lookup başarısızsa devam et
+            pass
+
+    # 3) Sipariş ID
+    order_id = str(uuid.uuid4())
+
+    # 4) Kargo (tek paket/tek takip)
+    if simulate:
+        tracking_no = f"FAKE-{order_id[:8]}"
+        log_msg = "Simülasyon: Aras'a istek gönderilmedi."
+    else:
+        try:
+            ensure_aras_env_or_raise()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        receiver = {
+            "name": addr.get("name") or addr.get("label") or (extract_name(principal) or "Müşteri"),
+            "phone": extract_phone(principal),
+            "address": addr,
+        }
+        ok, tracking_no, log_msg = aras_single_package(
+            receiver=receiver,
+            integration_code=order_id,
+            items=items,
+        )
+        if not ok:
+            raise HTTPException(status_code=502, detail=f"Kargo oluşturulamadı: {log_msg}")
+
+    # 5) Firestore yazımı
+    order_doc = build_order_doc(
+        uid=uid,
         order_id=order_id,
-        user=current_user,
-        cart_items=order_items,
-        card_info=card_info,
-        shipping_address=address_info,
-        billing_address=None
+        addr=addr,
+        items=items,
+        totals=totals,
+        tracking_no=tracking_no,
+        note=payload.note,
+        simulated=simulate,
+        checkout_id=checkout_id,
+        log_msg=log_msg,
     )
-    if not success:
-        raise HTTPException(status_code=402, detail=f"Payment failed: {payment_result.get('message')}")
-    # Payment success: create order record
-    order_data_doc = {
-        "user_id": user_id,
-        "items": order_items,
-        "total": round(total, 2),
-        "payment_status": "paid" if success else "failed",
-        "shipping_status": "pending",  # not shipped yet
-        "tracking_number": None,
-        "carrier_code": None,
-        "created_at": datetime.utcnow()
-    }
-    db.collection("orders").document(order_id).set(order_data_doc)
-    # Update stock for each product (deduct quantities sold)
-    for item in order_items:
-        product_ref = db.collection("products").document(item['product_id'])
-        # We perform an atomic update (could also use transaction for stronger consistency)
-        product_ref.update({"stock": firestore.Increment(-item['qty']) if hasattr(__import__('firebase_admin').firestore, 'Increment') else product_ref.get().to_dict().get('stock', 0) - item['qty']})
-    # Clear user's cart
-    db.collection("carts").document(user_id).delete()
-    # Optionally, start a background task to register shipment with tracking provider (if available)
-    background_tasks.add_task(shipping_provider.register_shipment, order_id, "", "")
-    # Prepare return data
-    order_data_doc["id"] = order_id
-    return order_data_doc
+    db.collection("orders").document(order_id).set(order_doc)
 
-@router.get("/", response_model=List[OrderOut])
-def list_my_orders(current_user: dict = Depends(get_current_user)):
-    """
-    List all orders of the current logged-in user.
-    """
-    user_id = current_user['id']
-    orders_ref = db.collection("orders").where("user_id", "==", user_id)
-    docs = orders_ref.stream()
-    orders = []
+    # 6) Sepeti temizle (opsiyonel)
+    if clear_cart_on_success and cart_items_raw:
+        clear_cart(uid)
+
+    # 7) Opsiyonel otomasyonlar
+    try:
+        auto_after_create(order_id=order_id, integration_code=order_id)
+    except Exception:
+        pass
+
+    saved = db.collection("orders").document(order_id).get()
+    return order_doc_to_out(saved)
+
+
+@router.get("/my", response_model=Dict[str, List[OrderOut]])
+def list_my_orders(principal=Depends(get_principal)):
+    uid = extract_uid(principal)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Oturum bulunamadı.")
+
+    # İndeks varsa hızlı yol
+    try:
+        q = (
+            db.collection("orders")
+              .where(filter=FieldFilter("user_id", "==", uid))
+              .order_by("created_at", direction=firestore.Query.DESCENDING)
+              .stream()
+        )
+        docs = list(q)
+    except FailedPrecondition:
+        # İndeks yoksa: indexesiz sorgu + Python tarafı sıralama
+        q = (
+            db.collection("orders")
+              .where(filter=FieldFilter("user_id", "==", uid))
+              .stream()
+        )
+        docs = sorted(
+            list(q),
+            key=lambda d: (d.to_dict() or {}).get("created_at") or 0,
+            reverse=True,
+        )
+
+    active, past = [], []
     for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        orders.append(data)
-    # Sort by created_at descending perhaps
-    orders.sort(key=lambda o: o.get('created_at', datetime.min), reverse=True)
-    return orders
+        out = order_doc_to_out(doc)   # dict döner
+        status = (out.get("status") or "").strip()
+        if status in ("Teslim Edildi", "İptal"):
+            past.append(out)
+        else:
+            active.append(out)
+
+    return {"active": active, "past": past}
+
+
 
 @router.get("/{order_id}", response_model=OrderOut)
-def get_order(order_id: str, current_user: dict = Depends(get_current_user)):
-    """
-    Retrieve a specific order by ID (if it belongs to the current user).
-    """
-    doc = db.collection("orders").document(order_id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Order not found")
-    order = doc.to_dict()
-    # Only allow owner or admin to fetch
-    if order.get('user_id') != current_user['id'] and current_user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Not allowed to view this order")
-    order['id'] = order_id
-    return order
+def get_order_detail(order_id: str, principal=Depends(get_principal)):
+    """Tekil sipariş detayını döndürür (kullanıcı kendi siparişini, admin tümünü görebilir)."""
+    snap = db.collection("orders").document(order_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    d = snap.to_dict()
+    uid = _extract_uid(principal)
+    role = getattr(principal, "role", None) or (getattr(principal, "user", {}) or {}).get("role", "user")
+    if d.get("user_id") != uid and role != "admin":
+        raise HTTPException(status_code=403, detail="Yetki yok.")
+    return _order_doc_to_out(snap)
 
-@router.get("/{order_id}/tracking")
-def get_tracking_info(order_id: str, current_user: dict = Depends(get_current_user)):
-    """
-    Get the latest tracking status for a given order.
-    Accessible to the order owner or admin.
-    """
-    doc = db.collection("orders").document(order_id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Order not found")
-    order = doc.to_dict()
-    if order.get('user_id') != current_user['id'] and current_user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Not authorized to view tracking for this order")
-    tracking_number = order.get('tracking_number')
-    carrier_code = order.get('carrier_code')
-    status = order.get('shipping_status')
-    if not tracking_number or not carrier_code:
-        return {"detail": "No tracking information available for this order."}
-    # If integration was active, we might call an API to refresh status here.
-    # For now, just return what we have in the order record.
-    return {
-        "tracking_number": tracking_number,
-        "carrier": carrier_code,
-        "status": status
-    }
 
-# Admin sub-router for orders management
-admin_router = APIRouter(prefix="/orders", dependencies=[Depends(get_current_admin)])
+@router.post("/{order_id}/sync-status", response_model=OrderOut)
+def sync_status_from_aras(order_id: str, principal=Depends(get_principal)):
+    """
+    Bu sipariş için Aras'tan durum sorgular ve Firestore'a yansıtır.
+    - Simülasyon (FAKE) siparişlerde Aras'a gitmez, mevcut kaydı döndürür.
+    - 'Teslim' bilgisi gelirse status='Teslim Edildi' yapılır.
+    - Yeni barkod/InvoiceKey yakalanırsa tracking_number güncellenir.
+    Kullanıcı kendi siparişini, admin tüm siparişleri senkron edebilir.
+    """
+    ref = db.collection("orders").document(order_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    d = snap.to_dict() or {}
 
-@admin_router.get("/", response_model=List[OrderOut])
-def list_all_orders():
-    """
-    Admin endpoint to list all orders.
-    Could be filtered by status or date in future.
-    """
-    docs = db.collection("orders").stream()
-    orders = []
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        orders.append(data)
-    orders.sort(key=lambda o: o.get('created_at', datetime.min), reverse=True)
-    return orders
+    uid = _extract_uid(principal)
+    role = getattr(principal, "role", None) or (getattr(principal, "user", {}) or {}).get("role", "user")
+    if d.get("user_id") != uid and role != "admin":
+        raise HTTPException(status_code=403, detail="Yetki yok.")
 
-@admin_router.put("/{order_id}/shipping")
-def update_order_shipping(order_id: str, tracking_number: str = None, carrier_code: str = None, status: str = None):
+    # Simülasyon/FAKE siparişlerde Aras'a sorgu atma
+    if d.get("_simulated") or str(d.get("tracking_number") or "").startswith("FAKE-"):
+        return _order_doc_to_out(snap)
+
+    integ = d.get("integration_code")
+    if not integ:
+        raise HTTPException(status_code=400, detail="Sipariş entegrasyon kodu yok.")
+
+    ok, status_text, delivered, new_track = get_status_with_integration_code(integ)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Aras sorgu hatası: {status_text}")
+
+    # Aras metnini bizim statülere eşle
+    new_status = "Teslim Edildi" if delivered else _map_aras_status(status_text)
+
+    patch = {"status": new_status, "updated_at": SERVER_TIMESTAMP}
+    if new_track and new_track != d.get("tracking_number"):
+        patch["tracking_number"] = new_track
+    if status_text:
+        patch["_last_aras_status"] = status_text
+
+    ref.update(patch)
+    return _order_doc_to_out(ref.get())
+
+
+
+
+@admin_router.get("/", response_model=List[OrderOut], dependencies=[Depends(get_current_admin)])
+def admin_list_orders():
+    q = (
+        db.collection("orders")
+          .order_by("created_at", direction=firestore.Query.DESCENDING)
+          .stream()
+    )
+    # helpers dict döndürür; FastAPI bunu OrderOut'a parse eder
+    return [order_doc_to_out(doc) for doc in q]
+
+
+@admin_router.post("/{order_id}/mark-delivered", response_model=OrderOut, dependencies=[Depends(get_current_admin)])
+def admin_mark_delivered(order_id: str):
+    """Siparişi 'Teslim Edildi' yapar."""
+    ref = db.collection("orders").document(order_id)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    ref.update({"status": "Teslim Edildi", "updated_at": SERVER_TIMESTAMP})
+    return _doc_to_out(ref.get())
+
+
+@admin_router.post("/{order_id}/sync-status", response_model=OrderOut, dependencies=[Depends(get_current_admin)])
+def admin_sync_status(order_id: str):
     """
-    Admin endpoint to update shipping info of an order.
-    This can add a tracking number and carrier, or update the shipping status.
+    Aras'tan durumu çekip kaydı günceller (teslim olduysa işaretler).
+    Simülasyon (FAKE) siparişlerde Aras'a gitmez, mevcut kaydı döndürür.
     """
-    order_ref = db.collection("orders").document(order_id)
-    doc = order_ref.get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Order not found")
-    updates = {}
-    if tracking_number is not None:
-        updates['tracking_number'] = tracking_number
-    if carrier_code is not None:
-        updates['carrier_code'] = carrier_code
-    if status is not None:
-        updates['shipping_status'] = status
-    if not updates:
-        raise HTTPException(status_code=400, detail="No updates provided")
-    order_ref.update(updates)
-    # If tracking number and carrier were set, optionally register with tracking service
-    if tracking_number and carrier_code:
-        shipping_provider.register_shipment(order_id, tracking_number, carrier_code)
-    return {"detail": "Order shipping info updated."}
+    ref = db.collection("orders").document(order_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    d = snap.to_dict() or {}
+
+    # Simülasyon/FAKE siparişlerde Aras'a sorgu atma
+    if d.get("_simulated") or str(d.get("tracking_number") or "").startswith("FAKE-"):
+        return _doc_to_out(snap)
+
+    integ = d.get("integration_code")
+    if not integ:
+        raise HTTPException(status_code=400, detail="integration_code yok.")
+
+    ok, status_text, delivered, new_track = get_status_with_integration_code(integ)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Aras sorgu hatası: {status_text}")
+
+    patch = {"updated_at": SERVER_TIMESTAMP}
+    patch["status"] = "Teslim Edildi" if delivered else _map_aras_status(status_text)
+
+    if new_track and new_track != d.get("tracking_number"):
+        patch["tracking_number"] = new_track
+    if status_text:
+        patch["_last_aras_status"] = status_text
+
+    ref.update(patch)
+    return _doc_to_out(ref.get())
+
+
+@router.get("/_debug/address")
+def debug_active_address(principal=Depends(get_principal)):
+    uid = _extract_uid(principal)
+    info: Dict[str, Any] = {"uid": uid, "steps": []}
+
+    a1 = _fetch_active_address(uid) if uid else None
+    info["steps"].append({"fetch_active_address": bool(a1)})
+
+    a2 = None
+    err2 = None
+    try:
+        a2 = _call_users_current_address(principal)
+    except Exception as e:
+        err2 = str(e)
+    info["steps"].append({"users.get_current_address.ok": bool(isinstance(a2, dict) and a2.get("city")), "error": err2})
+
+    a3 = None
+    if uid:
+        try:
+            udoc = db.collection("users").document(uid).get()
+            if udoc.exists:
+                udata = udoc.to_dict() or {}
+                for key in ("address", "shipping_address", "current_address"):
+                    ad = udata.get(key)
+                    if isinstance(ad, dict) and ad.get("city"):
+                        a3 = ad
+                        break
+        except Exception as e:
+            info["steps"].append({"users.root.error": str(e)})
+
+    addr = a1 or (a2 if isinstance(a2, dict) else None) or a3
+    return JSONResponse({
+        "uid": uid,
+        "address_found": bool(addr),
+        "address": addr,
+        "details": info["steps"],
+    })
+
+
+@admin_router.post("/{order_id}/label")
+def admin_get_label(order_id: str):
+    ref = db.collection("orders").document(order_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    integ = (snap.to_dict() or {}).get("integration_code")
+    if not integ:
+        raise HTTPException(status_code=400, detail="integration_code yok.")
+    ok, url, msg = attach_label(order_id, integ)
+    if not ok:
+        raise HTTPException(status_code=502, detail=msg)
+    return {"label_url": url, "message": msg}
+
+
+
+@admin_router.post("/{order_id}/mark-shipped", response_model=OrderOut, dependencies=[Depends(get_current_admin)])
+def admin_mark_shipped(order_id: str):
+    """
+    Body gerektirmez. Sadece order_id ile statüyü 'Kargoya Verildi' yapar.
+    - 'Teslim Edildi' veya 'İptal' ise değiştirmez (idempotent).
+    - 'Kargoya Verildi' ise olduğu gibi döner.
+    """
+    ref = db.collection("orders").document(order_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+    d = snap.to_dict() or {}
+
+    current = (d.get("status") or "").strip()
+    if current in ("Teslim Edildi", "İptal"):
+        # kapanmış siparişi zorlamayalım
+        return _doc_to_out(snap)
+
+    if current != "Kargoya Verildi":
+        ref.update({"status": "Kargoya Verildi", "updated_at": SERVER_TIMESTAMP})
+
+    return _doc_to_out(ref.get())

@@ -83,9 +83,6 @@ class ProductBase(BaseModel):
     is_upcoming: bool = Field(False, description="If true, product is coming soon (not purchasable)")
 
 
-from pydantic import BaseModel
-from typing import Optional
-from fastapi import Form
 
 class ProductCreate(BaseModel):
     name: str = Field(..., min_length=1, description="Ürün adı")
@@ -114,7 +111,6 @@ class ProductCreate(BaseModel):
             is_upcoming=is_upcoming,
             category_name=category_name,
         )
-
 
 
 class ProductUpdate(BaseModel):

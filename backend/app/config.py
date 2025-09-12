@@ -19,7 +19,23 @@ class Settings(BaseSettings):
     iyzico_api_key: str = Field('', env='IYZICO_API_KEY')
     iyzico_secret_key: str = Field('', env='IYZICO_SECRET_KEY')
     iyzico_base_url: str = Field('https://sandbox-api.iyzipay.com', env='IYZICO_BASE_URL')
-    tracking_api_key: str = Field('', env='TRACKING_API_KEY')
+
+    ARAS_ENV: str = "TEST"                 # TEST | PROD
+    ARAS_USERNAME: str = ""
+    ARAS_PASSWORD: str = ""
+    ARAS_CUSTOMER_CODE: str | None = None
+    ARAS_TIMEOUT: int = 15
+    ARAS_TRACKING_LINK_TEMPLATE: str | None = None
+
+    @property
+    def ARAS_BASE_URL(self) -> str:
+        """ARAS_ENV'e göre doğru SOAP endpointini döndürür."""
+        return (
+            "https://customerservicestest.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
+            if self.ARAS_ENV.upper() == "TEST"
+            else "https://customerws.araskargo.com.tr/arascargoservice.asmx"
+        )
+
     debug: bool = Field(False, env='DEBUG')
     allowed_origins: str = Field('*', env='ALLOWED_ORIGINS')  # Comma-separated list or '*' for all
     firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
@@ -30,9 +46,19 @@ class Settings(BaseSettings):
     smtp_password: Optional[str] = None
     smtp_from: Optional[str] = None
     smtp_use_starttls: bool = False  # 587 için true
+
+    ARAS_ENV: str = "TEST"
+    AUTO_LABEL: bool = False
+    AUTO_PICKUP: bool = False
+    PICKUP_TIME_WINDOW: str = "13:00-17:00"
+    PICKUP_DAYS_OFFSET: int = 0
+    LABEL_PUBLIC: bool = False
+    LABEL_URL_EXPIRES_HOURS: int = 24
+    ARAS_WEBHOOK_SECRET: str = ""
+
     class Config:
         env_file = ".env"
-        env_file_encoding = "utf-8"
+        case_sensitive = False
 
 # Load settings from environment (.env file, etc.)
 settings = Settings()
