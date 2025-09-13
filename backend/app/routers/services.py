@@ -83,8 +83,7 @@ from google.cloud import firestore as gcf  # for Query.DESCENDING
 # Public router => GET /services/
 router = APIRouter(prefix="/services", tags=["Services"])
 
-@router.get("/", response_model=List[ServiceOut], response_model_exclude_none=True, summary="List Services")
-def list_services(response: Response):
+def _list_services_impl(response: Response):
     """
     Ana ekran: sadece silinmemiş hizmetleri döner.
     created_at varsa DESC sıralar. Limit sabit (örn. 20).
@@ -208,3 +207,15 @@ def delete_service(service_id: str, hard: bool = False):
     else:
         doc_ref.update({"is_deleted": True})
         return {"detail": "Service deleted"}
+
+
+@router.get("", response_model=List[ServiceOut], response_model_exclude_none=True, summary="List Services")
+def list_services_no_slash(response: Response):
+    """List services endpoint without trailing slash."""
+    return _list_services_impl(response)
+
+
+@router.get("/", response_model=List[ServiceOut], response_model_exclude_none=True, summary="List Services")
+def list_services_with_slash(response: Response):
+    """List services endpoint with trailing slash."""
+    return _list_services_impl(response)

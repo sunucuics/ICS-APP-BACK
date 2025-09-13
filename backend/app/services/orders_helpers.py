@@ -194,19 +194,23 @@ def aras_single_package(
 
 def enrich_items_from_products(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    product_id ile 'products' koleksiyonundan özet bilgileri çekip satıra snapshot olarak ekler.
+    product_id ile 'products/{slug}/items' alt koleksiyonundan özet bilgileri çekip satıra snapshot olarak ekler.
     Yoksa sessizce geçer. (UYGULAMA: sipariş oluştururken çağır)
     """
     try:
         ids = {it.get("product_id") for it in items if it.get("product_id")}
         cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Collection group query ile tüm products/{slug}/items alt koleksiyonlarını ara
+        colg = db.collection_group("items")
         for pid in ids:
             if not pid:
                 continue
             try:
-                doc = db.collection("products").document(str(pid)).get()
-                if doc.exists:
-                    cache[str(pid)] = doc.to_dict() or {}
+                # Collection group query ile product_id'ye göre ara
+                docs = list(colg.where(filter=FieldFilter("id", "==", str(pid))).limit(1).stream())
+                if docs:
+                    cache[str(pid)] = docs[0].to_dict() or {}
             except Exception:
                 continue
 

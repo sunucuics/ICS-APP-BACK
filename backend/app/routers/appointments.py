@@ -109,10 +109,16 @@ Hem **kullanıcı** hem de **admin** işlemleri için ayrı router’lar tanıml
 """
 from fastapi import APIRouter, Depends, HTTPException , Form , Query
 from typing import List , Literal , Optional
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, date, time
+import calendar
 from app.core.security import get_current_user, get_current_admin
 from app.config import db
-from app.schemas.appointment import AppointmentRequest, AppointmentAdminCreate, AppointmentUpdate, AppointmentOut , AppointmentStatus , AppointmentAdminOut, UserBrief, ServiceBrief
+from app.schemas.appointment import (
+    AppointmentRequest, AppointmentAdminCreate, AppointmentUpdate, AppointmentOut, 
+    AppointmentStatus, AppointmentAdminOut, UserBrief, ServiceBrief,
+    ServiceAvailability, MonthlyAvailability, DayAvailability, TimeSlot,
+    AppointmentBookingRequest, AppointmentWithDetails
+)
 
 router = APIRouter(prefix="/appointments", tags=["Appointments"])
 
@@ -303,6 +309,70 @@ def delete_appointment(appointment_id: str,
     return {"detail": "Appointment deleted"}
 
 
+# Admin - Servis müsaitlik yönetimi
+
+@admin_router.get("/service-availability/{service_id}", response_model=ServiceAvailability)
+def get_service_availability(service_id: str):
+    """
+    Servis müsaitlik ayarlarını getirir.
+    """
+    # Servis kontrolü
+    service_doc = db.collection("services").document(service_id).get()
+    if not service_doc.exists or service_doc.to_dict().get('is_deleted'):
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    # Müsaitlik ayarlarını al
+    availability_doc = db.collection("service_availability").document(service_id).get()
+    if availability_doc.exists:
+        data = availability_doc.to_dict()
+        return ServiceAvailability(
+            service_id=service_id,
+            working_hours=data.get('working_hours', {}),
+            break_times=data.get('break_times', []),
+            is_available=data.get('is_available', True)
+        )
+    else:
+        # Varsayılan ayarlar
+        return ServiceAvailability(
+            service_id=service_id,
+            working_hours={
+                'monday': ['09:00', '18:00'],
+                'tuesday': ['09:00', '18:00'],
+                'wednesday': ['09:00', '18:00'],
+                'thursday': ['09:00', '18:00'],
+                'friday': ['09:00', '18:00'],
+                'saturday': ['10:00', '16:00'],
+                'sunday': []
+            },
+            break_times=[{'start': '12:00', 'end': '13:00'}],
+            is_available=True
+        )
+
+
+@admin_router.put("/service-availability/{service_id}")
+def update_service_availability(
+    service_id: str,
+    availability: ServiceAvailability
+):
+    """
+    Servis müsaitlik ayarlarını günceller.
+    """
+    # Servis kontrolü
+    service_doc = db.collection("services").document(service_id).get()
+    if not service_doc.exists or service_doc.to_dict().get('is_deleted'):
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    # Müsaitlik ayarlarını kaydet
+    db.collection("service_availability").document(service_id).set({
+        'working_hours': availability.working_hours,
+        'break_times': availability.break_times,
+        'is_available': availability.is_available,
+        'updated_at': datetime.utcnow()
+    })
+    
+    return {"detail": "Service availability updated successfully"}
+
+
 @router.get("/calendar")
 def get_all_busy_slots():
     """
@@ -329,3 +399,252 @@ def get_all_busy_slots():
         })
 
     return {"busy": busy}
+
+
+# Yeni endpoint'ler - Aylık takvim sistemi için
+
+@router.get("/availability/{service_id}/{year}/{month}", response_model=MonthlyAvailability)
+def get_monthly_availability(
+    service_id: str,
+    year: int,
+    month: int
+):
+    """
+    Belirli bir hizmet için aylık müsaitlik bilgilerini döndürür.
+    """
+    # Geçerli tarih kontrolü
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="Invalid month")
+    
+    if year < datetime.now().year:
+        raise HTTPException(status_code=400, detail="Cannot get availability for past years")
+    
+    # Servis kontrolü
+    service_doc = db.collection("services").document(service_id).get()
+    if not service_doc.exists or service_doc.to_dict().get('is_deleted'):
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    # Servis müsaitlik ayarlarını al
+    availability_doc = db.collection("service_availability").document(service_id).get()
+    availability_data = availability_doc.to_dict() if availability_doc.exists else {}
+    
+    # Varsayılan çalışma saatleri (Pazartesi-Cuma 09:00-18:00)
+    default_working_hours = {
+        'monday': ['09:00', '18:00'],
+        'tuesday': ['09:00', '18:00'],
+        'wednesday': ['09:00', '18:00'],
+        'thursday': ['09:00', '18:00'],
+        'friday': ['09:00', '18:00'],
+        'saturday': ['10:00', '16:00'],
+        'sunday': []
+    }
+    
+    working_hours = availability_data.get('working_hours', default_working_hours)
+    break_times = availability_data.get('break_times', [])
+    
+    # Ayın günlerini oluştur
+    days_in_month = calendar.monthrange(year, month)[1]
+    days = []
+    
+    # Mevcut randevuları al
+    month_start = datetime(year, month, 1)
+    month_end = datetime(year, month, days_in_month, 23, 59, 59)
+    
+    existing_appointments = db.collection("appointments").where("service_id", "==", service_id) \
+        .where("status", "in", ["pending", "approved"]) \
+        .where("start", ">=", month_start) \
+        .where("start", "<=", month_end).stream()
+    
+    # Randevuları tarihe göre grupla
+    appointments_by_date = {}
+    for appt in existing_appointments:
+        data = appt.to_dict()
+        start_time = data.get('start')
+        if isinstance(start_time, str):
+            start_time = datetime.fromisoformat(start_time)
+        appt_date = start_time.date()
+        if appt_date not in appointments_by_date:
+            appointments_by_date[appt_date] = []
+        appointments_by_date[appt_date].append({
+            'id': appt.id,
+            'start': start_time,
+            'end': data.get('end')
+        })
+    
+    # Her gün için müsaitlik bilgilerini oluştur
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        day_name = current_date.strftime('%A').lower()
+        
+        # Çalışma günü mü kontrol et
+        is_working_day = day_name in working_hours and working_hours[day_name]
+        
+        time_slots = []
+        if is_working_day:
+            # Çalışma saatleri
+            work_start, work_end = working_hours[day_name]
+            work_start_time = datetime.strptime(work_start, '%H:%M').time()
+            work_end_time = datetime.strptime(work_end, '%H:%M').time()
+            
+            # 1 saatlik dilimler oluştur
+            current_time = work_start_time
+            while current_time < work_end_time:
+                slot_start = datetime.combine(current_date, current_time)
+                slot_end = slot_start + timedelta(hours=1)
+                
+                # Mola saatleri kontrolü
+                is_break_time = False
+                for break_time in break_times:
+                    break_start = datetime.strptime(break_time['start'], '%H:%M').time()
+                    break_end = datetime.strptime(break_time['end'], '%H:%M').time()
+                    if break_start <= current_time < break_end:
+                        is_break_time = True
+                        break
+                
+                # Randevu kontrolü
+                appointment_id = None
+                is_available = not is_break_time
+                
+                if current_date in appointments_by_date:
+                    for appt in appointments_by_date[current_date]:
+                        appt_start = appt['start']
+                        appt_end = appt['end']
+                        if isinstance(appt_end, str):
+                            appt_end = datetime.fromisoformat(appt_end)
+                        
+                        if slot_start < appt_end and slot_end > appt_start:
+                            is_available = False
+                            appointment_id = appt['id']
+                            break
+                
+                time_slots.append(TimeSlot(
+                    start_time=current_time.strftime('%H:%M'),
+                    end_time=(current_time.replace(hour=current_time.hour + 1)).strftime('%H:%M'),
+                    is_available=is_available,
+                    appointment_id=appointment_id
+                ))
+                
+                # Sonraki saat
+                current_time = (datetime.combine(current_date, current_time) + timedelta(hours=1)).time()
+        
+        days.append(DayAvailability(
+            date=current_date,
+            is_working_day=is_working_day,
+            time_slots=time_slots
+        ))
+    
+    return MonthlyAvailability(
+        service_id=service_id,
+        year=year,
+        month=month,
+        days=days
+    )
+
+
+@router.post("/book", response_model=AppointmentOut)
+def book_appointment(
+    request: AppointmentBookingRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Yeni randevu talebi oluşturur.
+    """
+    user_id = current_user['id']
+    
+    # Servis kontrolü
+    service_doc = db.collection("services").document(request.service_id).get()
+    if not service_doc.exists or service_doc.to_dict().get('is_deleted'):
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    if service_doc.to_dict().get('is_upcoming'):
+        raise HTTPException(status_code=400, detail="Service not yet available for booking")
+    
+    # Tarih ve saat kontrolü
+    if request.date < date.today():
+        raise HTTPException(status_code=400, detail="Cannot book appointments in the past")
+    
+    # Randevu başlangıç ve bitiş zamanlarını oluştur
+    start_datetime = datetime.combine(request.date, datetime.strptime(request.start_time, '%H:%M').time())
+    end_datetime = start_datetime + timedelta(hours=1)
+    
+    # Çakışma kontrolü
+    overlapping = db.collection("appointments").where("service_id", "==", request.service_id) \
+        .where("status", "in", ["pending", "approved"]).stream()
+    
+    for appt in overlapping:
+        data = appt.to_dict()
+        s, e = data.get('start'), data.get('end')
+        if isinstance(s, str): s = datetime.fromisoformat(s)
+        if isinstance(e, str): e = datetime.fromisoformat(e)
+        if start_datetime < e and end_datetime > s:
+            raise HTTPException(status_code=400, detail="Time slot is not available")
+    
+    # Randevu oluştur
+    ref = db.collection("appointments").document()
+    appt_data = {
+        "service_id": request.service_id,
+        "user_id": user_id,
+        "start": start_datetime,
+        "end": end_datetime,
+        "status": "pending",
+        "notes": request.notes
+    }
+    ref.set(appt_data)
+    appt_data["id"] = ref.id
+    return appt_data
+
+
+@router.get("/my-appointments", response_model=List[AppointmentWithDetails])
+def get_my_appointments(current_user: dict = Depends(get_current_user)):
+    """
+    Kullanıcının randevularını detaylı bilgilerle birlikte döndürür.
+    """
+    user_id = current_user['id']
+    
+    # Randevuları al
+    docs = db.collection("appointments").where("user_id", "==", user_id).stream()
+    appointments = []
+    
+    for doc in docs:
+        data = doc.to_dict()
+        appointments.append({
+            'id': doc.id,
+            'service_id': data.get('service_id'),
+            'user_id': data.get('user_id'),
+            'start': data.get('start'),
+            'end': data.get('end'),
+            'status': data.get('status', 'pending'),
+            'notes': data.get('notes')
+        })
+    
+    if not appointments:
+        return []
+    
+    # Servis bilgilerini al
+    service_ids = list(set([apt['service_id'] for apt in appointments]))
+    service_docs = db.get_all([db.collection("services").document(sid) for sid in service_ids])
+    service_map = {doc.id: doc.to_dict() for doc in service_docs if doc.exists}
+    
+    # Sonuçları oluştur
+    results = []
+    for apt in appointments:
+        service_data = service_map.get(apt['service_id'], {})
+        
+        results.append(AppointmentWithDetails(
+            id=apt['id'],
+            service_id=apt['service_id'],
+            user_id=apt['user_id'],
+            start=apt['start'],
+            end=apt['end'],
+            status=apt['status'],
+            notes=apt['notes'],
+            service=ServiceBrief(
+                id=apt['service_id'],
+                title=service_data.get('title'),
+                price=service_data.get('price')
+            )
+        ))
+    
+    # Tarihe göre sırala
+    results.sort(key=lambda x: x.start or datetime.min)
+    return results

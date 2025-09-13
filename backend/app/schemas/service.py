@@ -86,8 +86,7 @@ class ServiceOut(BaseModel):
     created_at: Optional[datetime] = None  # Firestore timestamp okununca datetime gelir
     kind: Optional[str] = "service"
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 class ServiceCreate(BaseModel):
     title: str

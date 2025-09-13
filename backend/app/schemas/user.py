@@ -155,8 +155,8 @@ class UserProfile(UserBase):
     addresses: List[AddressBase] = Field(default_factory=list, description="List of saved addresses")
 
     class Config:
-        orm_mode = True
-        schema_extra = {
+        from_attributes = True
+        json_schema_extra = {
             "example": {
                 "id": "12345UID",
                 "name": "Alice Example",

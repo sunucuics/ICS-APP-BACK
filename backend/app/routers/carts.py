@@ -166,8 +166,7 @@ def clear_cart(current_user: dict = Depends(get_current_user)):
     return  # 204 No Content
 
 
-@router.get("/")
-def get_cart(request: Request, current_user: dict = Depends(get_current_user)):
+def _get_cart_impl(request: Request, current_user: dict = Depends(get_current_user)):
     """
     Return FULL cart with product information (like Amazon):
     - title, description, image, price/final_price, stock, category_name, etc.
@@ -264,3 +263,15 @@ def cart_total(request: Request, current_user: dict = Depends(get_current_user))
         "total_quantity": total_qty,
         "total_price": float(total_price),
     }
+
+
+@router.get("")
+def get_cart_no_slash(request: Request, current_user: dict = Depends(get_current_user)):
+    """Get cart endpoint without trailing slash."""
+    return _get_cart_impl(request, current_user)
+
+
+@router.get("/")
+def get_cart_with_slash(request: Request, current_user: dict = Depends(get_current_user)):
+    """Get cart endpoint with trailing slash."""
+    return _get_cart_impl(request, current_user)

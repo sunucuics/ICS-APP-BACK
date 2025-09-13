@@ -13,7 +13,7 @@ Frontend tarafı, API ile veri alışverişinde bu alan adlarını ve tiplerini 
 Kullanıcının randevu talebi oluşturması için gerekli alanlar.
 | Alan        | Tip       | Zorunlu | Açıklama |
 |-------------|----------|---------|----------|
-| service_id  | `str`    | ✔       | Randevu alınacak hizmetin ID’si |
+| service_id  | `str`    | ✔       | Randevu alınacak hizmetin ID'si |
 | start       | `datetime` | ✔     | Randevu başlangıç tarihi ve saati |
 
 ---
@@ -24,8 +24,8 @@ Kullanıcının randevu talebi oluşturması için gerekli alanlar.
 Admin panelinden manuel randevu oluşturmak veya saat bloklamak için.
 | Alan        | Tip        | Zorunlu | Açıklama |
 |-------------|-----------|---------|----------|
-| service_id  | `str`     | ✔       | Hizmet ID’si |
-| user_id     | `str` / `null` | ✖ | Belirli kullanıcı için rezervasyon yapılacaksa kullanıcı ID’si; boş bırakılırsa saat bloklanır |
+| service_id  | `str`     | ✔       | Hizmet ID'si |
+| user_id     | `str` / `null` | ✖ | Belirli kullanıcı için rezervasyon yapılacaksa kullanıcı ID'si; boş bırakılırsa saat bloklanır |
 | start       | `datetime` | ✔     | Başlangıç zamanı |
 | end         | `datetime` / `null` | ✖ | Bitiş zamanı; boşsa backend varsayılan süre ekler |
 
@@ -35,7 +35,7 @@ Admin panelinden manuel randevu oluşturmak veya saat bloklamak için.
 Randevu durumunu güncellemek için.
 | Alan   | Tip | Zorunlu | Açıklama |
 |--------|-----|---------|----------|
-| status | `"approved"` \| `"cancelled"` | ✔ | Yeni durum |
+| status | `"approved"` | `"cancelled"` | ✔ | Yeni durum |
 
 ---
 
@@ -56,12 +56,12 @@ Randevu durumunu güncellemek için.
 Kullanıcı ve admin tarafında randevu yanıtı.
 | Alan       | Tip   | Açıklama |
 |------------|-------|----------|
-| id         | `str` | Randevu ID’si |
-| service_id | `str` | Hizmet ID’si |
-| user_id    | `str` / `null` | Kullanıcı ID’si |
+| id         | `str` | Randevu ID'si |
+| service_id | `str` | Hizmet ID'si |
+| user_id    | `str` / `null` | Kullanıcı ID'si |
 | start      | `datetime` | Başlangıç |
 | end        | `datetime` | Bitiş |
-| status     | `"pending"` \| `"approved"` \| `"cancelled"` | Durum |
+| status     | `"pending"` | `"approved"` | `"cancelled"` | Durum |
 
 ---
 
@@ -99,10 +99,9 @@ Admin listelerinde detaylı randevu çıktısı.
 | service | `ServiceBrief`|
 
 """
-from datetime import datetime
-from typing import Optional, Literal
+from datetime import datetime, date, time
+from typing import Optional, Literal, List, Dict, Any
 from enum import Enum
-from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
@@ -164,3 +163,62 @@ class AppointmentAdminOut(BaseModel):
     user: UserBrief
     service: ServiceBrief
 
+
+# Yeni şemalar - Aylık takvim sistemi için
+
+class ServiceAvailability(BaseModel):
+    """Hizmet için ustanın müsaitlik bilgileri"""
+    service_id: str
+    working_hours: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Günlere göre çalışma saatleri. Örnek: {'monday': ['09:00', '18:00']}"
+    )
+    break_times: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="Mola saatleri. Örnek: [{'start': '12:00', 'end': '13:00'}]"
+    )
+    is_available: bool = Field(default=True, description="Genel müsaitlik durumu")
+
+
+class TimeSlot(BaseModel):
+    """Zaman dilimi bilgisi"""
+    start_time: str = Field(..., description="Başlangıç saati (HH:MM)")
+    end_time: str = Field(..., description="Bitiş saati (HH:MM)")
+    is_available: bool = Field(..., description="Müsait mi?")
+    appointment_id: Optional[str] = Field(None, description="Eğer dolu ise randevu ID'si")
+
+
+class DayAvailability(BaseModel):
+    """Günlük müsaitlik bilgisi"""
+    date: date = Field(..., description="Tarih")
+    is_working_day: bool = Field(..., description="Çalışma günü mü?")
+    time_slots: List[TimeSlot] = Field(default_factory=list, description="Saat dilimleri")
+
+
+class MonthlyAvailability(BaseModel):
+    """Aylık müsaitlik bilgisi"""
+    service_id: str = Field(..., description="Hizmet ID'si")
+    year: int = Field(..., description="Yıl")
+    month: int = Field(..., description="Ay (1-12)")
+    days: List[DayAvailability] = Field(default_factory=list, description="Günlük müsaitlikler")
+
+
+class AppointmentBookingRequest(BaseModel):
+    """Randevu alma talebi"""
+    service_id: str = Field(..., description="Hizmet ID'si")
+    date: date = Field(..., description="Randevu tarihi")
+    start_time: str = Field(..., description="Başlangıç saati (HH:MM)")
+    notes: Optional[str] = Field(None, description="Ek notlar")
+
+
+class AppointmentWithDetails(BaseModel):
+    """Detaylı randevu bilgisi"""
+    id: str
+    service_id: str
+    user_id: Optional[str]
+    start: datetime
+    end: datetime
+    status: Literal["pending", "approved", "cancelled"]
+    notes: Optional[str] = None
+    service: Optional[ServiceBrief] = None
+    user: Optional[UserBrief] = None

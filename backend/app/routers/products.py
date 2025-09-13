@@ -98,8 +98,7 @@ from google.cloud import firestore as gcf
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
-@router.get("/", response_model=List[ProductOut], summary="List Products")
-def list_products(
+def _list_products_impl(
     category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
 ):
     """
@@ -156,6 +155,22 @@ def list_products(
         print(f"❌ Error processing products: {e}")
         raise e
     return out
+
+
+@router.get("", response_model=List[ProductOut], summary="List Products")
+def list_products_no_slash(
+    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
+):
+    """List products endpoint without trailing slash."""
+    return _list_products_impl(category_name)
+
+
+@router.get("/", response_model=List[ProductOut], summary="List Products")
+def list_products_with_slash(
+    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
+):
+    """List products endpoint with trailing slash."""
+    return _list_products_impl(category_name)
 
 
 @router.get("/{product_id}", response_model=ProductOut, summary="Get Product")

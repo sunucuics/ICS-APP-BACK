@@ -14,5 +14,4 @@ class Cart(BaseModel):
     user_id: str = Field(..., description="ID of the user who owns this cart")
     items: List[CartItem] = Field(default_factory=list, description="List of cart items")
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

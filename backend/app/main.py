@@ -72,7 +72,8 @@ scheduler.add_job(sync_open_orders_once, "interval", minutes=10, id="orders-sync
 app = FastAPI(
     title="E-Commerce & Service Booking API",
     description="Backend API for an e-commerce and appointment booking application.",
-    version="1.0.0"
+    version="1.0.0",
+    redirect_slashes=False
 )
 
 # Configure CORS (allow front-end domain or all origins as specified)

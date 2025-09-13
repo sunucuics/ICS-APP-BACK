@@ -86,8 +86,8 @@ def get_my_profile(current_user: dict = Depends(get_current_user)):
 
 @router.post("/me/addresses", response_model=AddressOut)
 def add_address(
-    address: AddressCreate = Depends(AddressCreate.as_form),
-    current_user: dict     = Depends(get_current_user),
+    address: AddressCreate,
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Add a new address to the current user's address list and
@@ -123,6 +123,35 @@ def add_address(
     user_ref.update({"addresses": addresses})
 
     return AddressOut(**new_addr)
+
+@router.post("/me/addresses/{addr_id}/choose-current", response_model=AddressOut)
+def choose_current_address(addr_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Set an address as the current/default address for the user.
+    """
+    user_id = current_user['id']
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    profile = doc.to_dict()
+    addresses = profile.get('addresses', [])
+    
+    # Find the address to set as current
+    target_address = None
+    for addr in addresses:
+        if addr.get('id') == addr_id:
+            target_address = addr
+            break
+    
+    if not target_address:
+        raise HTTPException(status_code=404, detail="Address not found")
+    
+    # Update default address field in user profile
+    user_ref.update({"defaultAddressId": addr_id})
+    
+    return AddressOut(**target_address)
 
 @router.put("/me/addresses/{addr_id}", response_model=UserProfile)
 def update_address(addr_id: str, addr_update: AddressUpdate, current_user: dict = Depends(get_current_user)):
@@ -186,36 +215,6 @@ def list_addresses(current_user: dict = Depends(get_current_user)):
 
     addresses = snap.to_dict().get("addresses", [])
     return [AddressOut(**addr) for addr in addresses]
-
-
-@router.put("/me/addresses/{addr_id}/select", response_model=AddressOut)
-def choose_current_address(
-    addr_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """
-    Choose (and persist) the user's current/default address.
-    Saves `defaultAddressId` on the user document for later use (e.g., cargo).
-    Returns the selected address.
-    """
-    user_id = current_user["id"]
-    user_ref = db.collection("users").document(user_id)
-    doc = user_ref.get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    profile = doc.to_dict()
-    addresses = profile.get("addresses", [])
-
-    # find address by id
-    selected = next((a for a in addresses if a.get("id") == addr_id), None)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Address not found")
-
-    # persist selection
-    user_ref.update({"defaultAddressId": addr_id})
-
-    return AddressOut(**selected)
 
 
 @router.get("/me/addresses/current", response_model=AddressOut)

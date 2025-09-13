@@ -54,8 +54,7 @@ admin_router = APIRouter(prefix="/orders", tags=["Admin Orders"])
 
 
 
-@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
-def create_order(
+def _create_order_impl(
     payload: OrderCreate,
     simulate: bool = Query(False, description="True ise Aras'a istek atılmaz, sahte takip no üretilir."),
     clear_cart_on_success: bool = Query(True, description="Sipariş başarılıysa sepeti temizle."),
@@ -164,6 +163,36 @@ def create_order(
 
     saved = db.collection("orders").document(order_id).get()
     return order_doc_to_out(saved)
+
+
+@router.post("", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def create_order_no_slash(
+    payload: OrderCreate,
+    simulate: bool = Query(False, description="True ise Aras'a istek atılmaz, sahte takip no üretilir."),
+    clear_cart_on_success: bool = Query(True, description="Sipariş başarılıysa sepeti temizle."),
+    checkout_id: Optional[str] = Query(
+        None,
+        description="Aynı checkout için tek sipariş üretmek üzere idempotent anahtar (ör. UUID).",
+    ),
+    principal=Depends(get_principal),
+):
+    """Create order endpoint without trailing slash."""
+    return _create_order_impl(payload, simulate, clear_cart_on_success, checkout_id, principal)
+
+
+@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def create_order_with_slash(
+    payload: OrderCreate,
+    simulate: bool = Query(False, description="True ise Aras'a istek atılmaz, sahte takip no üretilir."),
+    clear_cart_on_success: bool = Query(True, description="Sipariş başarılıysa sepeti temizle."),
+    checkout_id: Optional[str] = Query(
+        None,
+        description="Aynı checkout için tek sipariş üretmek üzere idempotent anahtar (ör. UUID).",
+    ),
+    principal=Depends(get_principal),
+):
+    """Create order endpoint with trailing slash."""
+    return _create_order_impl(payload, simulate, clear_cart_on_success, checkout_id, principal)
 
 
 @router.get("/my", response_model=Dict[str, List[OrderOut]])

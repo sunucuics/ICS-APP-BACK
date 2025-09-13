@@ -20,8 +20,7 @@ from google.cloud import firestore as gcf  # Query.DESCENDING
 # ---------- Public ----------
 router = APIRouter(prefix="/categories", tags=["Categories"])
 
-@router.get("/", response_model=List[CategoryOut], response_model_exclude_none=True, summary="List Categories")
-def list_categories(response: Response):
+def _list_categories_impl(response: Response):
     """
     Ürün kategorilerini listeler.
     - Sadece `is_deleted=False` kayıtlar
@@ -204,3 +203,15 @@ def get_category(category_id: str):
         parent_id=data.get("parent_id"),
         cover_image=data.get("cover_image"),
     )
+
+
+@router.get("", response_model=List[CategoryOut], response_model_exclude_none=True, summary="List Categories")
+def list_categories_no_slash(response: Response):
+    """List categories endpoint without trailing slash."""
+    return _list_categories_impl(response)
+
+
+@router.get("/", response_model=List[CategoryOut], response_model_exclude_none=True, summary="List Categories")
+def list_categories_with_slash(response: Response):
+    """List categories endpoint with trailing slash."""
+    return _list_categories_impl(response)
