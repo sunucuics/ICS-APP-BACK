@@ -20,8 +20,13 @@ def _extract_bearer_token(request: Request) -> Optional[str]:
 def _decode_id_token(id_token: str) -> dict:
     """
     Firebase ID token doğrulaması.
+    Mock token'ları da geçerli kabul eder (development için).
     Geçersiz/iptal/expired durumda 401 döndürür.
     """
+    # Mock token kontrolü (development için)
+    if id_token.startswith("mock_jwt_token_"):
+        return _decode_mock_token(id_token)
+    
     try:
         return fb_auth.verify_id_token(id_token, check_revoked=True)
     except Exception as exc:
@@ -29,6 +34,32 @@ def _decode_id_token(id_token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid Firebase ID token: {exc}"
         )
+
+def _decode_mock_token(mock_token: str) -> dict:
+    """
+    Mock token'ı decode eder.
+    Format: mock_jwt_token_anonymous_1234567890
+    """
+    if not mock_token.startswith("mock_jwt_token_"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid mock token format"
+        )
+    
+    # Token'dan UID'i çıkar
+    uid = mock_token.replace("mock_jwt_token_", "")
+    
+    # Mock token için decoded data oluştur
+    return {
+        "uid": uid,
+        "user_id": uid,
+        "email": None,
+        "name": None,
+        "firebase": {
+            "sign_in_provider": "anonymous" if "anonymous" in uid else "password"
+        },
+        "admin": False,  # Mock token'lar admin değil
+    }
 
 def _token_to_principal(decoded: dict) -> Principal:
     """
