@@ -60,6 +60,7 @@ from app.routers import services as services_router
 from app.routers import orders as orders_router
 from app.routers import appointments as appointments_router
 from app.routers import comments as comments_router
+
 from firebase_admin import firestore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.services.orders_sync import sync_open_orders_once  # job fonksiyonun
@@ -107,6 +108,7 @@ app.include_router(appointments_router.admin_router, prefix="/admin")
 app.include_router(discounts.router, prefix="/admin")  # all routes in discounts are admin-protected via dependencies
 app.include_router(comments_router.admin_router, prefix="/admin")
 app.include_router(featured.admin_router, prefix="/admin")
+
 
 
 @app.on_event("startup")

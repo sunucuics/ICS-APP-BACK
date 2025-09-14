@@ -243,12 +243,16 @@ async def login(
 # --------------------------------------------------------------------------- #
 # LOGOUT – refresh token’ları iptal eder, ID token’ı geçersiz kılar
 # --------------------------------------------------------------------------- #
-@router.post("/logout", summary="Sunucu tarafında oturumu kapat")
-def logout(current_user = Depends(get_current_user)):
-    """Kullanıcının bütün refresh token’larını iptal eder."""
+@router.post("/logout", summary="Sunucu tarafında oturumu kapat (refresh revoke)")
+def logout(current_user: dict = Depends(get_current_user)):
+    """
+    Tüm cihazlardaki refresh token'ları iptal eder.
+    İstemci ayrıca firebase SDK'da signOut() çağırmalıdır.
+    """
+    uid = current_user["id"]
     try:
-        firebase_auth.revoke_refresh_tokens(current_user["id"])
-    except _auth_utils.UserNotFoundError:
-        # Uygun olmayan durum – sessizce geç
+        firebase_auth.revoke_refresh_tokens(uid)
+    except Exception:
+        # Kullanıcı silinmiş vs. ise sessizce geçiyoruz.
         pass
     return {"detail": "Logged out"}

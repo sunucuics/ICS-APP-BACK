@@ -63,57 +63,83 @@ from app.config import settings, db
 from firebase_admin import firestore
 from app.schemas.principal import Principal
 from app.core.auth import get_principal
+from typing import Optional, Dict
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)
 
-def get_current_user(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)):
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme)
+) -> Dict:
     """
-    Dependency to get the currently authenticated user.
-    It verifies the Firebase ID token and returns user data (from Firestore) if valid.
-    If no token or an invalid token is provided, raises HTTP 401.
+    Firebase ID token'ı doğrular (revocation kontrolü ile).
+    Kullanıcı profili Firestore'da yoksa oluşturur ve kullanıcıyı döner.
     """
-    if token is None:
-        # No token provided
+    if not credentials or not credentials.scheme or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication credentials were not provided",
-            headers={"WWW-Authenticate": "Bearer"}
+            headers={"WWW-Authenticate": "Bearer"},
         )
+
+    id_token = credentials.credentials
     try:
-        # Verify the token with Firebase Admin SDK. This throws if invalid.
-        decoded_token = firebase_auth.verify_id_token(token.credentials)
-        provider = (decoded_token.get('firebase') or {}).get('sign_in_provider')
-        is_guest = (provider == "anonymous")
-        uid = decoded_token.get('uid')
-    except Exception as exc:
-        # Verification failed
+        # ÖNEMLİ: check_revoked=True -> logout sonrası token'lar reddedilir
+        decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except firebase_auth.RevokedIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"}
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    # Fetch user profile from Firestore
-    user_ref = db.collection('users').document(uid)
+
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    provider = (decoded.get("firebase") or {}).get("sign_in_provider")
+    is_guest = (provider == "anonymous")
+
+    # Kullanıcı profilini getir/oluştur
+    user_ref = db.collection("users").document(uid)
     doc = user_ref.get()
+
     if not doc.exists:
-        # If user profile doesn't exist yet, create one using info from token (for social logins)
-        # We can extract name/email from decoded_token if available
         user_data = {
-            "name": decoded_token.get('name', ""),
-            "email": decoded_token.get('email', ""),
-            "phone": decoded_token.get('phone_number', ""),
+            "name": decoded.get("name", "") or "",
+            "email": decoded.get("email", "") or "",
+            "phone": decoded.get("phone_number", "") or "",
+            "email_verified": bool(decoded.get("email_verified")),
             "role": "customer",
             "addresses": [],
             "created_at": firestore.SERVER_TIMESTAMP,
-            "is_guest": is_guest,  # <- burada True/False
+            "is_guest": is_guest,
         }
         user_ref.set(user_data)
-        user = user_data
-        user['id'] = uid
+        user = {**user_data, "id": uid}
     else:
-        user = doc.to_dict()
-        user['id'] = uid
-    # Attach the UID and role for further use
+        user = doc.to_dict() or {}
+        user["id"] = uid
+        # is_guest alanı yoksa ekle (opsiyonel küçük bakım)
+        if "is_guest" not in user:
+            user_ref.set({"is_guest": is_guest}, merge=True)
+            user["is_guest"] = is_guest
+
     return user
 
 def get_current_admin(current_user: dict = Depends(get_current_user)):
