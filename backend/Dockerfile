@@ -1,27 +1,30 @@
-# Use a lightweight Python base image
 FROM python:3.11-slim
 
-# Set working directory
-WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=8080
 
-# Install system dependencies (if any needed, e.g., for Firebase or Pillow for image handling)
+# Temel paketler (psycopg2, curl vs. için)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev \
+    build-essential libpq-dev curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install (using pip for simplicity; could use Poetry as well)
+WORKDIR /app
+RUN useradd -m appuser
+
+# Bağımlılıklar (cache için ayrı katman)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
-# Copy the application code
-COPY app ./app
+# Uygulama + opsiyonel dosyalar (alembic varsa gelir, yoksa sorun olmaz)
+COPY . .
 
-# Copy the Firebase service account key if needed (for container, one might mount it or use secret manager)
-# For security, we assume credentials will be provided via secure means, not baked into image
-# COPY path/to/firebase_key.json /app/firebase_key.json
+# Windows satır sonu düzelt + izinler
+RUN sed -i 's/\r$//' entrypoint.sh || true \
+ && chmod +x entrypoint.sh \
+ && chown -R appuser:appuser /app
 
-# Expose the port (if running directly in container)
-EXPOSE 8000
-
-# Default command to run the app with Uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+USER appuser
+EXPOSE ${PORT}
+ENTRYPOINT ["./entrypoint.sh"]
