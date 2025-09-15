@@ -129,6 +129,22 @@ async def _shutdown_scheduler():
     if scheduler.running:
         scheduler.shutdown(wait=False)
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    # hafif bir liveness check: app ayakta mı, scheduler durumu nedir?
+    import firebase_admin
+    return {
+        "status": "ok",
+        "scheduler": "running" if scheduler.running else "stopped",
+        "firebase": "initialized" if firebase_admin._apps else "not_initialized"
+    }
+
+# (opsiyonel) readiness: dış servislere bağlanmayı da burada deneyebilirsin
+@app.get("/readyz", include_in_schema=False)
+async def readyz():
+    return {"status": "ready"}
+
+
 # Run the app directly with uvicorn (for development)
 if __name__ == "__main__":
     import uvicorn
