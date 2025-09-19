@@ -18,6 +18,7 @@ class CategoryCreate(BaseModel):
     name: str = Field(..., min_length=1, description="Kategori adı")
     description: str = Field("", description="Açıklama (opsiyonel)")
     parent_id: Optional[str] = Field(None, description="Üst kategori ID (opsiyonel)")
+    is_fixed: bool = Field(False, description="Bu kategori sabit (pin'li) olsun mu? (Yalnızca 1 tanesi True olabilir)")
 
     # Form-Data desteği (JSON da desteklenir)
     @classmethod
@@ -26,14 +27,16 @@ class CategoryCreate(BaseModel):
         name: str = Form(...),
         description: str = Form(""),
         parent_id: Optional[str] = Form(None),
+        is_fixed: bool = Form(False),
     ):
-        return cls(name=name, description=description, parent_id=parent_id)
+        return cls(name=name, description=description, parent_id=parent_id, is_fixed=is_fixed)
 
 class CategoryUpdate(BaseModel):
     """Kategori güncelleme için opsiyonel alanlar."""
     name: Optional[str] = Field(None, description="Yeni kategori adı")
     description: Optional[str] = Field(None, description="Yeni açıklama")
     parent_id: Optional[str] = Field(None, description="Yeni üst kategori ID")
+    is_fixed: Optional[bool] = Field(None, description="Sabitlik durumunu güncelle (True=pin, False=unpin)")
 
 # ---------- output ----------
 class CategoryOut(BaseModel):
@@ -43,3 +46,4 @@ class CategoryOut(BaseModel):
     description: str = ""
     parent_id: Optional[str] = None
     cover_image: Optional[str] = None  # Storage URL'i
+    is_fixed: bool = False
