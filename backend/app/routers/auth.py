@@ -1,5 +1,5 @@
 """
-# `app/routers/auth.py` — Kimlik Doğrulama Dokümantasyonu
+# app/routers/auth.py — Kimlik Doğrulama Dokümantasyonu
 
 ## Genel Bilgi
 Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işlemlerini yönetir. Firebase Authentication kullanılarak kimlik doğrulama yapılır ve Firestore’da kullanıcı profili saklanır.
@@ -8,56 +8,56 @@ Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işl
 
 ## Endpoint’ler
 
-### `POST /auth/register`
-**Amaç:** Yeni kullanıcı kaydı oluşturmak.
+### POST /auth/register
+*Amaç:* Yeni kullanıcı kaydı oluşturmak.
 
-**Parametreler (Form-Data):**
-- `name`: Ad Soyad (min. 1 karakter)
-- `phone`: Telefon numarası (`555 123 4567` formatında)
-- `email`: E-posta adresi
-- `password`: Şifre (min. 6 karakter)
+*Parametreler (Form-Data):*
+- name: Ad Soyad (min. 1 karakter)
+- phone: Telefon numarası (555 123 4567 formatında)
+- email: E-posta adresi
+- password: Şifre (min. 6 karakter)
 
-**İşleyiş:**
+*İşleyiş:*
 1. Telefon numarası format kontrolü yapılır.
 2. Firebase’de kullanıcı oluşturulur.
-3. Firestore’da `users/{uid}` dokümanı oluşturulur.
-4. Kullanıcı bilgileri `id` ile birlikte döndürülür.
+3. Firestore’da users/{uid} dokümanı oluşturulur.
+4. Kullanıcı bilgileri id ile birlikte döndürülür.
 
 ---
 
-### `POST /auth/reset-password`
-**Amaç:** Şifre sıfırlama bağlantısı göndermek.
+### POST /auth/reset-password
+*Amaç:* Şifre sıfırlama bağlantısı göndermek.
 
-**Parametreler:**
-- `email`: Bağlantının gönderileceği e-posta.
+*Parametreler:*
+- email: Bağlantının gönderileceği e-posta.
 
-**İşleyiş:**
+*İşleyiş:*
 1. Firebase üzerinden şifre sıfırlama bağlantısı üretilir.
 2. Her durumda başarılı yanıt döndürülür (kullanıcı var/yok bilgisi verilmez).
 
 ---
 
-### `POST /auth/login`
-**Amaç:** E-posta ve şifre ile giriş yapmak.
+### POST /auth/login
+*Amaç:* E-posta ve şifre ile giriş yapmak.
 
-**Parametreler (Form-Data):**
-- `email`: E-posta adresi
-- `password`: Şifre (min. 6 karakter)
+*Parametreler (Form-Data):*
+- email: E-posta adresi
+- password: Şifre (min. 6 karakter)
 
-**İşleyiş:**
+*İşleyiş:*
 1. Firebase REST API’sine giriş isteği gönderilir.
-2. Başarılıysa `id_token`, `refresh_token`, `expires_in`, `user_id` döndürülür.
-3. Başarısızsa `401 Unauthorized` döner.
+2. Başarılıysa id_token, refresh_token, expires_in, user_id döndürülür.
+3. Başarısızsa 401 Unauthorized döner.
 
 ---
 
-### `POST /auth/logout`
-**Amaç:** Oturumu kapatmak.
+### POST /auth/logout
+*Amaç:* Oturumu kapatmak.
 
-**İşleyiş:**
-1. `get_current_user` ile kimlik doğrulama yapılır.
+*İşleyiş:*
+1. get_current_user ile kimlik doğrulama yapılır.
 2. Firebase’de kullanıcının tüm refresh token’ları iptal edilir.
-3. `"Logged out"` mesajı döndürülür.
+3. "Logged out" mesajı döndürülür.
 
 """
 from fastapi import APIRouter, Depends, HTTPException, status , Form , Query
@@ -89,34 +89,40 @@ PHONE_PATTERN = re.compile(r"^\d{3}\s\d{3}\s\d{4}$")   # 555 123 4567
     "/register",
     response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Yeni kullanıcı kaydı (token ile)",
+    summary="Yeni kullanıcı kaydı (Firebase UID ile)",
 )
 async def register(
     name: str = Form(..., min_length=1, description="Ad Soyad"),
     phone: str = Form(..., description="Telefon (555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
+    firebase_uid: str = Form(..., description="Firebase UID"),
 ):
-    """Form verisiyle kullanıcı oluşturur ve anında giriş token'larını döndürür."""
+    """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
     # 1) Telefon formatı
     if not PHONE_PATTERN.fullmatch(phone):
         raise HTTPException(422, "Telefon biçimi '555 123 4567' olmalı")
 
-    # 2) Firebase'te kullanıcı oluştur
+    # 2) Firebase kullanıcısının var olduğunu doğrula
     try:
-        rec = firebase_auth.create_user(
-            email=email,
-            password=password,
-            display_name=name,
-        )
-    except _auth_utils.EmailAlreadyExistsError:
-        raise HTTPException(400, "Bu e-posta zaten kayıtlı")
+        user_record = firebase_auth.get_user(firebase_uid)
+        if user_record.email != email:
+            raise HTTPException(400, "Firebase UID ile email eşleşmiyor")
+    except firebase_auth.UserNotFoundError:
+        raise HTTPException(400, "Firebase kullanıcısı bulunamadı")
     except Exception as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, f"Firebase kullanıcı doğrulama hatası: {str(exc)}")
 
-    uid = rec.uid
+    uid = firebase_uid
 
-    # 3) Firestore profilini yaz (created_at server-side timestamp)
+    # 3) Firestore'da kullanıcı zaten var mı kontrol et
+    user_doc_ref = db.collection("users").document(uid)
+    user_doc = user_doc_ref.get()
+
+    if user_doc.exists:
+        raise HTTPException(400, "Bu kullanıcı zaten kayıtlı")
+
+    # 4) Firestore profilini yaz (created_at server-side timestamp)
     profile_doc = {
         "name": name,
         "email": email,
@@ -128,7 +134,7 @@ async def register(
     }
     db.collection("users").document(uid).set(profile_doc)
 
-    # 4) Kullanıcıyı hemen oturum açmış kabul etmek için Firebase'e sign-in yap
+    # 5) Kullanıcıyı hemen oturum açmış kabul etmek için Firebase'e sign-in yap
     payload = {
         "email": email,
         "password": password,
@@ -140,11 +146,9 @@ async def register(
     if resp.status_code != 200:
         # Bu çok nadir olur; yine de hatayı net verelim
         message = data.get("error", {}).get("message", "SIGNIN_FAILED")
-        # kullanıcı zaten oluşturuldu; istersen burada 201 ile sadece user döndürüp
-        # token alamadık diye uyarı da verebilirsin. Şimdilik 400 yapıyoruz:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Giriş başarısız: {message}")
 
-    # 5) Response: profil (created_at henüz server tarafında yazıldığı için None döndürüyoruz)
+    # 6) Response: profil (created_at henüz server tarafında yazıldığı için None döndürüyoruz)
     user_out = UserProfile(
         id=uid,
         name=name,
