@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Form
 from pydantic import EmailStr
-from app.core.security import get_current_user
-from app.schemas.delete import DeleteVerifyRequest
-from app.services import account_delete as svc
+from backend.app.core.security import get_current_user
+from backend.app.schemas.delete import DeleteVerifyRequest
+from backend.app.services import account_delete as svc
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 

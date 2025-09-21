@@ -9,9 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from typing import List, Optional
 from uuid import uuid4
 
-from app.config import db, bucket
-from app.core.security import get_current_admin
-from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut
+from backend.app.config import db, bucket
+from backend.app.core.security import get_current_admin
+from backend.app.schemas.category import CategoryCreate, CategoryUpdate, CategoryOut
 
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import FieldFilter

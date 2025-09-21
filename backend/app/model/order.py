@@ -2,7 +2,7 @@ import uuid
 from sqlalchemy import Column, String, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.sql import func
-from app.database import Base  # SQLAlchemy Base declarative base
+from backend.app.database import Base  # SQLAlchemy Base declarative base
 
 class Order(Base):
     __tablename__ = "orders"

@@ -8,13 +8,13 @@ from firebase_admin import auth as fb_auth  # <-- Auth fallback
 from google.cloud.firestore_v1 import FieldFilter
 from google.cloud import firestore as gcf
 
-from app.config import db
-from app.core.security import get_current_user, get_current_admin
-from app.schemas.comment import CommentOut, TargetType , ProfanityIn , ProfanityWordsIn
+from backend.app.config import db
+from backend.app.core.security import get_current_user, get_current_admin
+from backend.app.schemas.comment import CommentOut, TargetType , ProfanityIn , ProfanityWordsIn
 
 router = APIRouter(prefix="/comments", tags=["Comments"])
 admin_router = APIRouter(
-    prefix="/admin/comments",
+    prefix="/comments",
     tags=["Admin: Comments"],
     dependencies=[Depends(get_current_admin)],
 )
@@ -182,6 +182,27 @@ def list_service_comments(
 # ---------- Admin Uçları ----------
 
 # (Admin) ÜRÜN yorumları — yeni→eski
+@admin_router.get("/", response_model=List[CommentOut], summary="(Admin) Tüm yorumları listele")
+def list_all_comments():
+    """
+    Admin - List all comments
+    """
+    comments_ref = db.collection("comments").order_by("created_at", direction=firestore.Query.DESCENDING)
+    docs = comments_ref.stream()
+    comments = []
+    for doc in docs:
+        comment_data = doc.to_dict()
+        comment_data["id"] = doc.id
+        comments.append(CommentOut(**comment_data))
+    return comments
+
+@admin_router.get("", response_model=List[CommentOut], summary="(Admin) Tüm yorumları listele (no slash)")
+def list_all_comments_no_slash():
+    """
+    Admin - List all comments (no trailing slash)
+    """
+    return list_all_comments()
+
 @admin_router.get("/products", response_model=List[CommentOut], summary="(Admin) Ürün yorumları (yeni→eski)")
 def admin_list_product_comments(
     limit: int = Query(100, ge=1, le=200),
@@ -230,6 +251,23 @@ def admin_delete_comment(comment_id: str, hard: bool = Query(False)):
         return {"detail": "Comment hard deleted"}
     ref.update({"is_deleted": True})
     return {"detail": "Comment deleted"}
+
+@admin_router.put("/{comment_id}/approve", summary="(Admin) Yorumu onayla")
+def admin_approve_comment(comment_id: str):
+    """
+    Admin - Approve a comment (set is_hidden to False and is_deleted to False)
+    """
+    ref = db.collection("comments").document(comment_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    
+    # Hem is_hidden hem de is_deleted'i false yap
+    ref.update({
+        "is_hidden": False,
+        "is_deleted": False
+    })
+    return {"detail": "Comment approved"}
 
 
 def _prof_parent():

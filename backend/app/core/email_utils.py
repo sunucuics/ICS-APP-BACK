@@ -1,7 +1,7 @@
 import asyncio, ssl, smtplib
 from email.message import EmailMessage
 from typing import Optional
-from app.config import settings
+from backend.app.config import settings
 
 async def send_email(to: str, subject: str, html: str, sender_name: Optional[str] = None):
     """

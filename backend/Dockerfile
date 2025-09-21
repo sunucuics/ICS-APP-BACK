@@ -19,6 +19,8 @@ RUN pip install -r requirements.txt
 
 # Uygulama + opsiyonel dosyalar (alembic varsa gelir, yoksa sorun olmaz)
 COPY . .
+# Backend klasörünü app olarak mount et
+RUN ln -sf /app /app/backend
 
 # Windows satır sonu düzelt + izinler
 RUN sed -i 's/\r$//' entrypoint.sh || true \

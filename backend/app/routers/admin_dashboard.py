@@ -4,13 +4,8 @@ Handles admin dashboard statistics and overview data
 """
 
 from fastapi import APIRouter, Depends, HTTPException
-from app.core.auth import get_current_admin
-from app.model.order import Order
-from app.model.user import User
-from app.model.product import Product
-from app.model.service import Service
-from app.model.appointment import Appointment
-from app.model.comment import Comment
+from backend.app.core.auth import get_current_admin
+from backend.app.schemas.principal import Principal
 from firebase_admin import firestore
 from typing import Dict, Any
 from datetime import datetime, timedelta
@@ -19,7 +14,7 @@ router = APIRouter()
 
 @router.get("/dashboard/stats")
 async def get_dashboard_stats(
-    current_admin: User = Depends(get_current_admin)
+    current_admin: Principal = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
     Get dashboard statistics for admin panel
@@ -42,6 +37,7 @@ async def get_dashboard_stats(
             "total_services": 0,
             "total_appointments": 0,
             "total_comments": 0,
+            "active_discounts": 0,
             "orders_today": 0,
             "orders_this_week": 0,
             "orders_this_month": 0,
@@ -69,7 +65,9 @@ async def get_dashboard_stats(
             if order_date_str:
                 try:
                     order_date = datetime.fromisoformat(order_date_str.replace('Z', '+00:00')).date()
-                    order_total = float(order_data.get('total', 0))
+                    # Get order total from totals.grand_total
+                    totals = order_data.get('totals', {})
+                    order_total = float(totals.get('grand_total', 0))
                     
                     if order_date == today:
                         stats["orders_today"] += 1
@@ -125,6 +123,38 @@ async def get_dashboard_stats(
             if not comment_data.get('approved', False):
                 stats["pending_comments"] += 1
         
+        # Get active discounts count
+        discounts_ref = db.collection('discounts')
+        discounts = discounts_ref.stream()
+        
+        for discount_doc in discounts:
+            discount_data = discount_doc.to_dict()
+            
+            # Check if discount is active
+            is_active = discount_data.get('active', False)
+            if is_active:
+                # Check date range if specified
+                start_at = discount_data.get('start_at')
+                end_at = discount_data.get('end_at')
+                
+                if start_at:
+                    try:
+                        start_date = datetime.fromisoformat(start_at.replace('Z', '+00:00')).date()
+                        if now.date() < start_date:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                
+                if end_at:
+                    try:
+                        end_date = datetime.fromisoformat(end_at.replace('Z', '+00:00')).date()
+                        if now.date() > end_date:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                
+                stats["active_discounts"] += 1
+        
         # Get recent orders (last 5)
         recent_orders_ref = db.collection('orders').order_by('created_at', direction=firestore.Query.DESCENDING).limit(5)
         recent_orders = recent_orders_ref.stream()
@@ -159,7 +189,7 @@ async def get_dashboard_stats(
 
 @router.get("/dashboard/overview")
 async def get_dashboard_overview(
-    current_admin: User = Depends(get_current_admin)
+    current_admin: Principal = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
     Get dashboard overview with summary information

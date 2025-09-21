@@ -52,18 +52,19 @@ Tüm admin router’lar ilgili modüllerde `get_current_admin` ile korunur.
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
-from app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments , auth_delete , featured, admin_dashboard
-from app.routers import categories as categories_router
-from app.routers import products as products_router
-from app.routers import services as services_router
-from app.routers import orders as orders_router
-from app.routers import appointments as appointments_router
-from app.routers import comments as comments_router
+from backend.app.config import settings
+from backend.app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments , auth_delete , featured, admin_dashboard, analytics, notifications, settings as settings_router
+from backend.app.routers import categories as categories_router
+from backend.app.routers import products as products_router
+from backend.app.routers import services as services_router
+from backend.app.routers import orders as orders_router
+from backend.app.routers import appointments as appointments_router
+from backend.app.routers import comments as comments_router
+from backend.app.routers import users as users_router
 
 from firebase_admin import firestore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from app.services.orders_sync import sync_open_orders_once  # job fonksiyonun
+from backend.app.services.orders_sync import sync_open_orders_once  # job fonksiyonun
 
 # Tek bir scheduler instance'ı oluştur
 scheduler = AsyncIOScheduler()
@@ -108,7 +109,11 @@ app.include_router(orders_router.admin_router, prefix="/admin")
 app.include_router(appointments_router.admin_router, prefix="/admin")
 app.include_router(discounts.router, prefix="/admin")  # all routes in discounts are admin-protected via dependencies
 app.include_router(comments_router.admin_router, prefix="/admin")
+app.include_router(users_router.admin_router, prefix="/admin")
 app.include_router(featured.admin_router, prefix="/admin")
+app.include_router(analytics.router, prefix="/admin")
+app.include_router(notifications.router, prefix="/admin")
+app.include_router(settings_router.router, prefix="/admin")
 
 
 

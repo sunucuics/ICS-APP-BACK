@@ -6,8 +6,8 @@ from typing import Optional, Tuple
 from firebase_admin import storage
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
-from app.config import db, settings
-from app.integrations.shipping_provider import (
+from backend.app.config import db, settings
+from backend.app.integrations.shipping_provider import (
     get_label_pdf,            # (ok, filename, pdf_bytes, msg)
     request_pickup,           # (ok, pickup_id_or_msg)
 )

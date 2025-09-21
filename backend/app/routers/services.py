@@ -73,9 +73,9 @@ from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, s
 from typing import List, Optional
 from uuid import uuid4
 
-from app.config import db, bucket
-from app.core.security import get_current_admin
-from app.schemas.service import ServiceOut
+from backend.app.config import db, bucket
+from backend.app.core.security import get_current_admin
+from backend.app.schemas.service import ServiceOut
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import FieldFilter
 from google.cloud import firestore as gcf  # for Query.DESCENDING
@@ -105,6 +105,27 @@ def _list_services_impl(response: Response):
 
 # Admin sub-router => /admin/services/...
 admin_router = APIRouter(prefix="/services", tags=["Admin: Services"], dependencies=[Depends(get_current_admin)])
+
+@admin_router.get("/", response_model=list[ServiceOut], response_model_exclude_none=True)
+def list_services_admin():
+    """
+    Admin - List all services
+    """
+    services_ref = db.collection("services")
+    docs = services_ref.stream()
+    services = []
+    for doc in docs:
+        service_data = doc.to_dict()
+        service_data["id"] = doc.id
+        services.append(ServiceOut(**service_data))
+    return services
+
+@admin_router.get("", response_model=list[ServiceOut], response_model_exclude_none=True)
+def list_services_admin_no_slash():
+    """
+    Admin - List all services (no trailing slash)
+    """
+    return list_services_admin()
 
 @admin_router.post("/", response_model=ServiceOut, status_code=status.HTTP_201_CREATED, response_model_exclude_none=True)
 async def create_service(

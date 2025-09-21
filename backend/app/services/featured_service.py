@@ -6,7 +6,7 @@ from firebase_admin import firestore as fb_fs
 from google.cloud.firestore_v1 import CollectionReference, Query
 from google.cloud.firestore_v1.base_query import FieldFilter  # ✅ uyarısız where()
 
-from app.schemas.featured import FeaturedKind, FeaturedItemOut
+from backend.app.schemas.featured import FeaturedKind, FeaturedItemOut
 
 db = fb_fs.client()
 
@@ -16,7 +16,7 @@ def _collection(kind: FeaturedKind) -> CollectionReference:
 
 # (opsiyonel) settings ile ürün koleksiyon adı override edilebilsin
 try:
-    from app.config import settings
+    from backend.app.config import settings
     _PRODUCTS_COLLECTION_OVERRIDE = (
         getattr(settings, "products_collection", None)
         or getattr(settings, "product_collection", None)

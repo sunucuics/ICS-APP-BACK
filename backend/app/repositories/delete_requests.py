@@ -1,6 +1,6 @@
 import time
 from typing import Optional, Dict, Any
-from app.config import db
+from backend.app.config import db
 from google.cloud import firestore as gcf
 
 COL = "delete_requests"

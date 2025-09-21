@@ -1,0 +1,15 @@
+{
+  "hosting": {
+    "public": "backend",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**",
+      "**/venv/**",
+      "**/*.py",
+      "**/requirements.txt"
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false
+  }
+}

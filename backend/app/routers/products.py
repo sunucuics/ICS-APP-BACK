@@ -87,14 +87,15 @@ Fotoğraf yükleme işlemleri Firebase Storage üzerinden yapılır, ürün veri
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, status , Query
 from typing import List , Optional , Union
 from uuid import uuid4
-from app.config import db, bucket
-from app.core.security import get_current_user, get_current_admin
-from app.schemas.product import ProductOut , ProductCreate
+from backend.app.config import db, bucket
+from backend.app.core.security import get_current_user, get_current_admin
+from backend.app.schemas.product import ProductOut , ProductCreate, ProductUpdate
 from firebase_admin import firestore
 from datetime import datetime
 from google.cloud.firestore_v1.field_path import FieldPath
 from google.cloud.firestore_v1 import FieldFilter
 from google.cloud import firestore as gcf
+from google.cloud.firestore import SERVER_TIMESTAMP
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
@@ -301,52 +302,89 @@ async def create_product(
     return data
 
 
+@admin_router.post(
+    "",
+    response_model=ProductOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Product (JSON)",
+)
+async def create_product_json(
+    product_in: ProductCreate,
+):
+    """
+    Admin endpoint to create a product via JSON (without images).
+    Images can be added later via the upload endpoint.
+    """
+    # 1) Kategori kontrolü
+    cat_ref = db.collection("categories").where("name", "==", product_in.category_name).limit(1).stream()
+    cat_docs = list(cat_ref)
+    if not cat_docs:
+        raise HTTPException(status_code=400, detail=f"Kategori bulunamadı: {product_in.category_name}")
+    cat_doc = cat_docs[0]
+    cat_data = cat_doc.to_dict()
+    # Kategori type kontrolü kaldırıldı - tüm kategoriler ürün kategorisi olarak kabul ediliyor
+
+    # 2) Slug oluştur
+    slug = product_in.name.lower().replace(" ", "-").replace("ı", "i").replace("ğ", "g").replace("ü", "u").replace("ş", "s").replace("ö", "o").replace("ç", "c")
+    
+    # 3) Ürün verilerini hazırla
+    data = {
+        "id": "",  # Firestore otomatik ID verecek
+        "title": product_in.name,
+        "description": product_in.description or "",
+        "price": float(product_in.price),
+        "final_price": float(product_in.price),  # İndirim yoksa aynı
+        "stock": int(product_in.stock),
+        "is_upcoming": bool(product_in.is_upcoming),
+        "category_id": cat_doc.id,
+        "category_name": product_in.category_name,
+        "images": [],  # Boş başla, sonra eklenebilir
+        "created_at": SERVER_TIMESTAMP,
+        "updated_at": SERVER_TIMESTAMP,
+    }
+
+    # 4) Firestore'a kaydet
+    prod_ref = db.collection("products").document(slug).collection("items").document()
+    data["id"] = prod_ref.id
+    prod_ref.set(data)
+    return data
+
 
 @admin_router.put("/{product_id}", response_model=ProductOut)
 async def update_product(product_id: str,
-                         title: str = Form(None),
-                         description: str = Form(None),
-                         price: float = Form(None),
-                         stock: int = Form(None),
-                         category_id: str = Form(None),
-                         is_upcoming: bool = Form(None),
-                         images: List[UploadFile] = File(None)):
+                         product_update: ProductUpdate):
     """
     Admin endpoint to update a product.
     Allows updating basic fields; image update can be done by uploading new images (which will replace existing images).
     If images are provided, they will overwrite the current images of the product.
     """
-    doc_ref = db.collection("products").document(product_id)
-    doc = doc_ref.get()
-    if not doc.exists:
+    # Find the product in subcollections using collection_group
+    snap = next(
+        db.collection_group("items")
+          .where(filter=FieldFilter("id", "==", product_id))
+          .limit(1)
+          .stream(),
+        None,
+    )
+    if not snap:
         raise HTTPException(status_code=404, detail="Product not found")
+    
+    doc_ref = snap.reference
+    
     update_data = {}
-    if title is not None: update_data["title"] = title
-    if description is not None: update_data["description"] = description
-    if price is not None: update_data["price"] = price
-    if stock is not None: update_data["stock"] = stock
-    if category_id is not None: update_data["category_id"] = category_id
-    if is_upcoming is not None: update_data["is_upcoming"] = is_upcoming
-    if images is not None:
-        # If new images provided, we upload them and replace the old image list
-        new_urls = []
-        if len(images) > 5:
-            raise HTTPException(status_code=400, detail="Maximum 5 images allowed")
-        # Optionally, delete old images from storage (not doing here to avoid accidental data loss if needed).
-        for img in images:
-            filename = img.filename or f"{uuid4()}.jpg"
-            blob = bucket.blob(f"products/{product_id}/{filename}")
-            try:
-                blob.upload_from_file(img.file, content_type=img.content_type)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Image upload failed: {e}")
-            try:
-                blob.make_public()
-                public_url = blob.public_url
-            except Exception:
-                public_url = blob.generate_signed_url(expiration=3600*24*365*10)
-            new_urls.append(public_url)
-        update_data["images"] = new_urls
+    if product_update.title is not None: 
+        update_data["title"] = product_update.title
+    if product_update.description is not None: 
+        update_data["description"] = product_update.description
+    if product_update.price is not None: 
+        update_data["price"] = product_update.price
+    if product_update.stock is not None: 
+        update_data["stock"] = product_update.stock
+    if product_update.category_id is not None: 
+        update_data["category_id"] = product_update.category_id
+    if product_update.is_upcoming is not None: 
+        update_data["is_upcoming"] = product_update.is_upcoming
+    # Note: Image updates are handled separately via upload endpoint
     if update_data:
         doc_ref.update(update_data)
     # Return updated document

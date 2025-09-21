@@ -64,13 +64,13 @@ from fastapi import APIRouter, Depends, HTTPException, status , Form , Query
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
-from app.schemas.user import UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
-from app.core.security import (get_current_user)
-from app.config import db
+from backend.app.schemas.user import UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
+from backend.app.core.security import (get_current_user)
+from backend.app.config import db
 import re
 from pydantic import EmailStr
 import httpx
-from app.config import settings
+from backend.app.config import settings
 from google.cloud import firestore as gcf
 from dotenv import load_dotenv
 load_dotenv()

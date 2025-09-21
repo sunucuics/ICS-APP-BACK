@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, status
 from typing import Dict, Any
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-from app.config import db, settings
+from backend.app.config import db, settings
 
 router = APIRouter(prefix="/shipping", tags=["Shipping Webhooks"])
 

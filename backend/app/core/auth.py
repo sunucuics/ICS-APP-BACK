@@ -2,7 +2,7 @@
 from typing import Optional
 from fastapi import Request, HTTPException, status
 from firebase_admin import auth as fb_auth
-from app.schemas.principal import Principal
+from backend.app.schemas.principal import Principal
 
 def _extract_bearer_token(request: Request) -> Optional[str]:
     """
@@ -113,3 +113,23 @@ async def get_principal(request: Request) -> Principal:
         raise HTTPException(status_code=401, detail="Missing Authorization header.")
     decoded = _decode_id_token(token)
     return _token_to_principal(decoded)
+
+async def get_current_user(request: Request) -> Principal:
+    """
+    Token zorunlu: doğrular ve Principal döner.
+    (user veya admin olabilir, guest olamaz)
+    """
+    principal = await get_principal(request)
+    if principal.role == "guest":
+        raise HTTPException(status_code=401, detail="Guest users not allowed.")
+    return principal
+
+async def get_current_admin(request: Request) -> Principal:
+    """
+    Token zorunlu: doğrular ve admin Principal döner.
+    Sadece admin kullanıcılar erişebilir.
+    """
+    principal = await get_principal(request)
+    if principal.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return principal

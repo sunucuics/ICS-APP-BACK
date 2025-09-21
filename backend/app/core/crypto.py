@@ -1,5 +1,5 @@
 import hmac, hashlib, secrets
-from app.config import settings
+from backend.app.config import settings
 
 def delete_secret() -> str:
     return getattr(settings, "delete_account_secret", None) or settings.secret_key

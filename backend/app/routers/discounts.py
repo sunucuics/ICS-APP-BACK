@@ -9,11 +9,27 @@ from datetime import date, datetime, time, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Form
+from pydantic import BaseModel
 from google.cloud.firestore_v1 import FieldFilter
 
-from app.config import db
-from app.core.security import get_current_admin
-from app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountOut
+from backend.app.config import db
+from backend.app.core.security import get_current_admin
+from backend.app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountOut
+
+
+# ---------------------------------------------------------------------
+# JSON Request Models
+# ---------------------------------------------------------------------
+
+class DiscountCreateRequest(BaseModel):
+    name: str
+    percentage: float
+    targetType: str
+    targetId: Optional[str] = None
+    startDate: Optional[datetime] = None
+    endDate: Optional[datetime] = None
+    isActive: bool = True
+    description: Optional[str] = None
 
 
 # ---------------------------------------------------------------------
@@ -69,28 +85,62 @@ def _best_discount_percent_for_product(product_id: str) -> float:
 
 def _recalc_product_final_price(product_id: str) -> None:
     """
-    products/<slug>/items altındaki ürünü id ile bulur ve final_price'ı günceller.
+    Ürünün final_price'ını günceller. Hem ana products koleksiyonunda hem de alt koleksiyonlarda günceller.
     """
-    prod = next(
-        db.collection_group("items")
-        .where(filter=FieldFilter("id", "==", product_id))
-        .limit(1)
-        .stream(),
-        None,
-    )
-    if not prod:
-        return
-    pdata = prod.to_dict() or {}
-    base_price = float(pdata.get("price", 0.0))
-    pct = _best_discount_percent_for_product(product_id)
-    new_final = round(base_price * (100.0 - pct) / 100.0, 2)
-    if pdata.get("final_price") != new_final:
-        prod.reference.update({"final_price": new_final})
+    # Ana products koleksiyonunda güncelle
+    prod_ref = db.collection("products").document(product_id)
+    prod_doc = prod_ref.get()
+    if prod_doc.exists:
+        pdata = prod_doc.to_dict() or {}
+        base_price = float(pdata.get("price", 0.0))
+        pct = _best_discount_percent_for_product(product_id)
+        new_final = round(base_price * (100.0 - pct) / 100.0, 2)
+        if pdata.get("final_price") != new_final:
+            prod_ref.update({"final_price": new_final})
+    
+    # Alt koleksiyonlarda da güncelle (products/{slug}/items)
+    items = db.collection_group("items").where(filter=FieldFilter("id", "==", product_id)).stream()
+    for item in items:
+        pdata = item.to_dict() or {}
+        base_price = float(pdata.get("price", 0.0))
+        pct = _best_discount_percent_for_product(product_id)
+        new_final = round(base_price * (100.0 - pct) / 100.0, 2)
+        if pdata.get("final_price") != new_final:
+            item.reference.update({"final_price": new_final})
 
 
 # ---------------------------------------------------------------------
 # Routes (form tabanlı)
 # ---------------------------------------------------------------------
+
+@router.get("", response_model=List[DiscountOut], summary="List Discounts (no slash)")
+def list_discounts_no_slash(
+    product_id: Optional[str] = Query(None, description="Belirli ürün ID'sine ait indirimler"),
+    active: Optional[bool] = Query(None, description="Aktif filtre"),
+):
+    """
+    Yalnızca PRODUCT indirimlerini listeler. Opsiyonel ürün ve aktiflik filtresi.
+    """
+    q = db.collection("discounts").where(filter=FieldFilter("target_type", "==", "product"))
+    if product_id:
+        q = q.where(filter=FieldFilter("target_id", "==", product_id))
+    if active is not None:
+        q = q.where(filter=FieldFilter("active", "==", bool(active)))
+
+    out: List[DiscountOut] = []
+    for doc in q.stream():
+        data = doc.to_dict() or {}
+        out.append(DiscountOut(
+            id=doc.id,
+            target_type="product",
+            target_id=data.get("target_id"),
+            percent=float(data.get("percent", 0.0)),
+            active=bool(data.get("active", False)),
+            start_at=data.get("start_at"),
+            end_at=data.get("end_at"),
+        ))
+    return out
+
 
 @router.get("/", response_model=List[DiscountOut], summary="List Discounts")
 def list_discounts(
@@ -138,6 +188,44 @@ def get_discount(discount_id: str):
         start_at=data.get("start_at"),
         end_at=data.get("end_at"),
     )
+
+
+@router.post(
+    "",
+    response_model=DiscountOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Discount (JSON, no slash)",
+)
+def create_discount_json_no_slash(request: DiscountCreateRequest):
+    """
+    JSON ile indirim oluşturur.
+    """
+    if request.percentage <= 0 or request.percentage > 100:
+        raise HTTPException(status_code=400, detail="percentage 0-100 aralığında olmalı")
+    
+    if request.targetType not in ["product", "category"]:
+        raise HTTPException(status_code=400, detail="targetType 'product' veya 'category' olmalı")
+    
+    if request.startDate and request.endDate and request.startDate > request.endDate:
+        raise HTTPException(status_code=400, detail="startDate > endDate olamaz")
+
+    payload = {
+        "target_type": request.targetType,
+        "target_id": request.targetId,
+        "percent": float(request.percentage),
+        "active": bool(request.isActive),
+        "start_at": request.startDate,
+        "end_at": request.endDate,
+    }
+
+    ref = db.collection("discounts").document()
+    ref.set(payload)
+
+    # Ürünün final fiyatını güncelle (sadece product için)
+    if request.targetType == "product" and request.targetId:
+        _recalc_product_final_price(request.targetId)
+
+    return DiscountOut(id=ref.id, **payload)
 
 
 @router.post(

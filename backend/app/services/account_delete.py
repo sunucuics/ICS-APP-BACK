@@ -1,13 +1,13 @@
 from google.api_core.exceptions import NotFound
 from firebase_admin import auth as firebase_auth, _auth_utils
-from app.core.crypto import gen_numeric_code, hmac_hash
-from app.core.constants import (
+from backend.app.core.crypto import gen_numeric_code, hmac_hash
+from backend.app.core.constants import (
     DELETE_CODE_TTL_SECONDS,
     DELETE_MAX_ATTEMPTS,
     DELETE_CODE_LENGTH,
 )
-from app.repositories import delete_requests as repo
-from app.core.email_utils import send_email
+from backend.app.repositories import delete_requests as repo
+from backend.app.core.email_utils import send_email
 
 
 # --- Silme istek akışı ---
@@ -37,7 +37,7 @@ def _cleanup_user_data(uid: str) -> None:
     (Opsiyonel) Kullanıcıya bağlı diğer koleksiyonları temizlemek için örnek.
     İhtiyacın yoksa silebilirsin.
     """
-    from app.config import db
+    from backend.app.config import db
 
     to_clean = [
         ("addresses", "user_id"),
@@ -68,7 +68,7 @@ def _revoke_and_delete_user(uid: str) -> None:
         pass
 
     # Firestore profilini sil
-    from app.config import db
+    from backend.app.config import db
     try:
         db.collection("users").document(uid).delete()
     except NotFound:

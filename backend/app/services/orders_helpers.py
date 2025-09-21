@@ -7,10 +7,10 @@ from fastapi.responses import JSONResponse
 import inspect
 from google.cloud.firestore_v1.base_query import FieldFilter
 from decimal import Decimal
-from app.config import db , settings
-from app.routers import users as users_router
-from app.schemas.order import OrderItem, OrderOut
-from app.integrations.shipping_provider import create_shipment_with_setorder  # sizdeki yol farklıysa düzeltin
+from backend.app.config import db , settings
+from backend.app.routers import users as users_router
+from backend.app.schemas.order import OrderItem, OrderOut
+from backend.app.integrations.shipping_provider import create_shipment_with_setorder  # sizdeki yol farklıysa düzeltin
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
 
@@ -493,7 +493,7 @@ def auto_after_create(order_id: str, integration_code: str) -> None:
     Bu stub, var/yok durumunda hataya düşmemesi için güvenli bırakılmıştır.
     """
     try:
-        # from app.services.automation import after_order_create
+        # from backend.app.services.automation import after_order_create
         # after_order_create(order_id=order_id, integration_code=integration_code)
         return
     except Exception:
@@ -525,10 +525,20 @@ def build_order_doc(
     simulated: bool,
     checkout_id: Optional[str],
     log_msg: str,
+    principal: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Firestore'a yazılacak sipariş dokümanını derler.
     """
+    # Müşteri bilgilerini ekle
+    customer_info = {}
+    if principal:
+        customer_info = {
+            "customer_name": extract_name(principal) or "Müşteri",
+            "customer_phone": extract_phone(principal) or "",
+            "customer_email": principal.get("email") or "",
+        }
+    
     doc = {
         "user_id": uid,
         "status": "Hazırlanıyor",
@@ -536,6 +546,7 @@ def build_order_doc(
         "address": addr,
         "items": items,
         "totals": totals,
+        **customer_info,  # Müşteri bilgilerini ekle
         "shipment": {
             "provider": "Aras Kargo",
             "tracking_number": tracking_no,

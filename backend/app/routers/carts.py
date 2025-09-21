@@ -24,8 +24,8 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 
-from app.core.security import get_current_user
-from app.config import db
+from backend.app.core.security import get_current_user
+from backend.app.config import db
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
 

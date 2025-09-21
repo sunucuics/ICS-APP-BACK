@@ -6,7 +6,7 @@ Handles creation of payment requests and interpreting responses.
 """
 import iyzipay
 import json
-from app.config import settings
+from backend.app.config import settings
 
 # Prepare iyzico API options from settings
 iyzico_options = {

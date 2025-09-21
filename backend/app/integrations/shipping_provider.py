@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-from app.config import settings
+from backend.app.config import settings
 
 _NS = {"t": "http://tempuri.org/"}  # Aras SOAP namespace
 
@@ -271,7 +271,7 @@ def update_tracking_statuses(limit: int = 50) -> None:
     """
     try:
         # Dairesel import kaçınmak için fonksiyon içinde import ediyoruz
-        from app.config import db, settings
+        from backend.app.config import db, settings
         from firebase_admin import firestore
         from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 

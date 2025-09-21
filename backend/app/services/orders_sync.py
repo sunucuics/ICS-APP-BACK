@@ -2,9 +2,9 @@
 from __future__ import annotations
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-from app.config import db
-from app.integrations.shipping_provider import get_status_with_integration_code
-from app.schemas.order import OrderItem, OrderOut  # type hints only
+from backend.app.config import db
+from backend.app.integrations.shipping_provider import get_status_with_integration_code
+from backend.app.schemas.order import OrderItem, OrderOut  # type hints only
 
 OPEN_STATUSES = {"Sipariş Alındı", "Kargoya Verildi", "Yolda", "Dağıtımda"}
 

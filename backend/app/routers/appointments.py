@@ -9,9 +9,9 @@ from typing import List, Optional, Any
 from datetime import timedelta, datetime
 import logging
 
-from app.core.security import get_current_user, get_current_admin
-from app.config import db
-from app.schemas.appointment import (
+from backend.app.core.security import get_current_user, get_current_admin
+from backend.app.config import db
+from backend.app.schemas.appointment import (
     AppointmentOut, AppointmentStatus, AppointmentAdminOut,
     ServiceAvailability, ServiceBrief, AppointmentWithDetails
 )
@@ -124,8 +124,61 @@ def list_my_appointments(current_user: dict = Depends(get_current_user)):
 admin_router = APIRouter(prefix="/appointments", dependencies=[Depends(get_current_admin)])
 
 
+@admin_router.get("", response_model=List[AppointmentAdminOut])
+def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|cancelled)$")):
+    """
+    Admin endpoint – lists all appointments.
+    Optional **status** filter.
+    """
+    query = db.collection("appointments")
+    if status:
+        query = query.where("status", "==", status)
+    appt_docs = list(query.stream())
+    if not appt_docs:
+        return []
+
+    # user_id / service_id kümeleri
+    user_ids = { (d.to_dict() or {}).get("user_id") for d in appt_docs }
+    service_ids = { (d.to_dict() or {}).get("service_id") for d in appt_docs }
+    user_ids.discard(None)
+    service_ids.discard(None)
+
+    user_snaps = db.get_all([db.collection("users").document(uid) for uid in user_ids]) if user_ids else []
+    svc_snaps  = db.get_all([db.collection("services").document(sid) for sid in service_ids]) if service_ids else []
+
+    user_map = {s.id: s.to_dict() for s in user_snaps if s.exists}
+    svc_map  = {s.id: s.to_dict() for s in svc_snaps  if s.exists}
+
+    results = []
+    for doc in appt_docs:
+        d = doc.to_dict() or {}
+        uid = d.get("user_id")
+        sid = d.get("service_id")
+
+        results.append({
+            "id":     doc.id,
+            "start":  _coerce_dt(d.get("start")),
+            "end":    _coerce_dt(d.get("end")),
+            "status": d.get("status", "pending"),
+            "user": {
+                "id":    uid,
+                "name":  (user_map.get(uid) or {}).get("name"),
+                "phone": (user_map.get(uid) or {}).get("phone"),
+                "email": (user_map.get(uid) or {}).get("email"),
+                "addresses": (user_map.get(uid) or {}).get("addresses"),
+            },
+            "service": {
+                "id":    sid,
+                "title": (svc_map.get(sid) or {}).get("title"),
+                "price": (svc_map.get(sid) or {}).get("price"),
+            }
+        })
+
+    return results
+
+
 @admin_router.get("/", response_model=List[AppointmentAdminOut])
-def list_appointments(status: Optional[str] = Query(None, pattern="^(pending|approved|cancelled)$")):
+def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|cancelled)$")):
     """
     Admin endpoint – lists all appointments.
     Optional **status** filter.
@@ -230,6 +283,27 @@ def update_appointment_status_form(
     doc = ref.get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Appointment not found")
+    ref.update({"status": status})
+    return {"detail": f"Appointment {appointment_id} updated to {status}"}
+
+
+@admin_router.put("/{appointment_id}/status")
+def update_appointment_status_json(
+    appointment_id: str,
+    status_data: dict
+):
+    """
+    Admin – Randevu durumunu güncelle (JSON).
+    """
+    ref = db.collection("appointments").document(appointment_id)
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    
+    status = status_data.get("status")
+    if not status:
+        raise HTTPException(status_code=400, detail="Status field is required")
+    
     ref.update({"status": status})
     return {"detail": f"Appointment {appointment_id} updated to {status}"}
 

@@ -5,18 +5,18 @@ from firebase_admin import firestore
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from typing import Any, Dict, List, Optional
 import uuid
-from app.routers import users as users_router
+from backend.app.routers import users as users_router
 from fastapi.responses import JSONResponse
 from google.api_core.exceptions import FailedPrecondition
-from app.config import db, settings
-from app.schemas.order import OrderCreate, OrderOut, OrderItem , PickupBody
-from app.integrations.shipping_provider import (
+from backend.app.config import db, settings
+from backend.app.schemas.order import OrderCreate, OrderOut, OrderItem , PickupBody
+from backend.app.integrations.shipping_provider import (
     create_shipment_with_setorder,
     get_status_with_integration_code,
 )
-from app.core.security import get_current_user as get_principal
-from app.core.security import get_current_admin
-from app.services.orders_helpers import (
+from backend.app.core.security import get_current_user as get_principal
+from backend.app.core.security import get_current_admin
+from backend.app.services.orders_helpers import (
     _fetch_active_address,
     _call_users_current_address,
     _resolve_active_address,
@@ -43,7 +43,7 @@ from app.services.orders_helpers import (
     extract_phone,
     enrich_items_from_products,
 )
-from app.services.fulfillment import auto_after_create , attach_label, schedule_pickup
+from backend.app.services.fulfillment import auto_after_create , attach_label, schedule_pickup
 from datetime import date
 from google.cloud.firestore_v1.base_query import FieldFilter
 import inspect
@@ -148,6 +148,7 @@ def _create_order_impl(
         simulated=simulate,
         checkout_id=checkout_id,
         log_msg=log_msg,
+        principal=principal,
     )
     db.collection("orders").document(order_id).set(order_doc)
 
@@ -297,8 +298,19 @@ def sync_status_from_aras(order_id: str, principal=Depends(get_principal)):
 
 
 
+@admin_router.get("", response_model=List[OrderOut], dependencies=[Depends(get_current_admin)])
+def admin_list_orders_no_slash():
+    q = (
+        db.collection("orders")
+          .order_by("created_at", direction=firestore.Query.DESCENDING)
+          .stream()
+    )
+    # helpers dict döndürür; FastAPI bunu OrderOut'a parse eder
+    return [order_doc_to_out(doc) for doc in q]
+
+
 @admin_router.get("/", response_model=List[OrderOut], dependencies=[Depends(get_current_admin)])
-def admin_list_orders():
+def admin_list_orders_with_slash():
     q = (
         db.collection("orders")
           .order_by("created_at", direction=firestore.Query.DESCENDING)
@@ -431,3 +443,24 @@ def admin_mark_shipped(order_id: str):
         ref.update({"status": "Kargoya Verildi", "updated_at": SERVER_TIMESTAMP})
 
     return _doc_to_out(ref.get())
+
+
+@admin_router.put("/{order_id}/status", dependencies=[Depends(get_current_admin)])
+def update_order_status_json(
+    order_id: str,
+    status_data: dict
+):
+    """
+    Admin – Sipariş durumunu güncelle (JSON).
+    """
+    ref = db.collection("orders").document(order_id)
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+    
+    status = status_data.get("status")
+    if not status:
+        raise HTTPException(status_code=400, detail="Status field is required")
+    
+    ref.update({"status": status, "updated_at": SERVER_TIMESTAMP})
+    return {"detail": f"Order {order_id} updated to {status}"}

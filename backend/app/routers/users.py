@@ -70,9 +70,10 @@ Tüm işlemler `get_current_user` bağımlılığı ile kimlik doğrulama gerekt
 """
 from fastapi import APIRouter, Depends, HTTPException
 from uuid import uuid4
-from app.core.security import get_current_user
-from app.config import db
-from app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
+from backend.app.core.security import get_current_user
+from backend.app.core.auth import get_current_admin
+from backend.app.config import db
+from backend.app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -241,3 +242,73 @@ def get_current_address(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Default address not found")
 
     return AddressOut(**current)
+
+# Admin router for user management
+admin_router = APIRouter(prefix="/users", tags=["Admin: Users"], dependencies=[Depends(get_current_admin)])
+
+@admin_router.get("/", response_model=list[UserProfile])
+def list_users():
+    """
+    Admin - List all users
+    """
+    users_ref = db.collection("users")
+    docs = users_ref.stream()
+    users = []
+    for doc in docs:
+        user_data = doc.to_dict()
+        user_data["id"] = doc.id
+        users.append(UserProfile(**user_data))
+    return users
+
+@admin_router.get("", response_model=list[UserProfile])
+def list_users_no_slash():
+    """
+    Admin - List all users (no trailing slash)
+    """
+    return list_users()
+
+@admin_router.get("/{user_id}", response_model=UserProfile)
+def get_user_by_id(user_id: str):
+    """
+    Admin - Get user by ID
+    """
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_data = doc.to_dict()
+    user_data["id"] = doc.id
+    return UserProfile(**user_data)
+
+@admin_router.put("/{user_id}/role")
+def update_user_role(user_id: str, role: str):
+    """
+    Admin - Update user role
+    """
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_ref.update({"role": role})
+    return {"message": f"User {user_id} role updated to {role}"}
+
+@admin_router.delete("/{user_id}")
+def delete_user(user_id: str):
+    """
+    Admin - Delete user
+    """
+    user_ref = db.collection("users").document(user_id)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get user data before deletion for response
+    user_data = doc.to_dict()
+    user_data["id"] = doc.id
+    
+    # Delete the user document
+    user_ref.delete()
+    
+    return {"message": f"User {user_id} deleted successfully", "deleted_user": user_data}

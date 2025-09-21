@@ -2,9 +2,9 @@
 from __future__ import annotations
 from typing import List
 from fastapi import APIRouter, Depends, Path, status
-from app.schemas.featured import FeaturedExpandedDoc
-from app.services.featured_service import feature, unfeature, list_items
-from app.core.security import get_current_admin
+from backend.app.schemas.featured import FeaturedExpandedDoc
+from backend.app.services.featured_service import feature, unfeature, list_items
+from backend.app.core.security import get_current_admin
 
 admin_router = APIRouter(
     prefix="/featured",

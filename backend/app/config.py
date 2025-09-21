@@ -65,11 +65,18 @@ settings = Settings()
 
 # Initialize Firebase Admin SDK
 # We use a service account credential file for full access to Firestore/Storage.
-cred = credentials.Certificate(settings.firebase_cred_file)
-firebase_app = firebase_admin.initialize_app(cred, {
-    'projectId': settings.firebase_project_id,
-    'storageBucket': settings.firebase_storage_bucket
-})
+try:
+    cred = credentials.Certificate(settings.firebase_cred_file)
+    firebase_app = firebase_admin.initialize_app(cred, {
+        'projectId': settings.firebase_project_id,
+        'storageBucket': settings.firebase_storage_bucket
+    })
+except ValueError as e:
+    if "already exists" in str(e):
+        # Firebase app already initialized, get the default app
+        firebase_app = firebase_admin.get_app()
+    else:
+        raise
 # Create Firestore client and Storage bucket reference
 db = firestore.client()  # Firestore database client
 bucket = storage.bucket()  # Default storage bucket
