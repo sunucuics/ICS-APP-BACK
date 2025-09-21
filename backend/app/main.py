@@ -53,7 +53,7 @@ Tüm admin router’lar ilgili modüllerde `get_current_admin` ile korunur.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments , auth_delete , featured
+from app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments , auth_delete , featured, admin_dashboard
 from app.routers import categories as categories_router
 from app.routers import products as products_router
 from app.routers import services as services_router
@@ -100,6 +100,7 @@ app.include_router(comments_router.router)
 app.include_router(auth_delete.router)
 
 # Include admin routers (with prefix /admin)
+app.include_router(admin_dashboard.router, prefix="/admin")
 app.include_router(categories_router.admin_router, prefix="/admin")
 app.include_router(products_router.admin_router, prefix="/admin")
 app.include_router(services_router.admin_router, prefix="/admin")
