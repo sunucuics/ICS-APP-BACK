@@ -8,7 +8,7 @@ from typing import Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
 
-router = APIRouter(prefix="/settings", tags=["Admin: Settings"], dependencies=[Depends(get_current_admin)])
+router = APIRouter(prefix="/admin/settings", tags=["Admin: Settings"], dependencies=[Depends(get_current_admin)])
 
 @router.get("/")
 def get_settings_data():
@@ -70,6 +70,23 @@ def get_settings_data():
         for doc in email_templates_docs:
             template_data = doc.to_dict()
             template_data["id"] = doc.id
+            # Ensure required fields exist with defaults
+            if "name" not in template_data:
+                template_data["name"] = "Default Template"
+            if "subject" not in template_data:
+                template_data["subject"] = "Default Subject"
+            if "body" not in template_data:
+                template_data["body"] = "Default Body"
+            if "template_type" not in template_data:
+                template_data["template_type"] = "general"
+            if "variables" not in template_data:
+                template_data["variables"] = []
+            if "is_active" not in template_data:
+                template_data["is_active"] = True
+            if "created_at" not in template_data:
+                template_data["created_at"] = datetime.now().isoformat()
+            if "updated_at" not in template_data:
+                template_data["updated_at"] = datetime.now().isoformat()
             email_templates.append(template_data)
         
         return {
