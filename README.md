@@ -4,6 +4,19 @@
 
 Bu proje, ICS (İnşaat ve Çevre Sistemleri) uygulamasının backend API'sini içermektedir. Uygulama tamamen tamamlanmış ve production-ready durumdadır.
 
+## 🚀 Deploy
+
+Backend'i Google Cloud Run'a deploy etmek için:
+
+```bash
+./deploy.sh
+```
+
+Bu script otomatik olarak:
+1. Docker image build eder
+2. Google Cloud Run'a deploy eder
+3. Backend URL'ini gösterir
+
 ## 📋 Proje Özeti
 
 ICS App, inşaat ve çevre sistemleri alanında hizmet veren bir e-ticaret ve hizmet rezervasyon platformudur. Bu backend API, Flutter mobil uygulaması ve React admin paneli için gerekli tüm servisleri sağlar.
