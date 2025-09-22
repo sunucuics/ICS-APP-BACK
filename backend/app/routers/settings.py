@@ -13,14 +13,77 @@ router = APIRouter(prefix="/settings", tags=["Admin: Settings"], dependencies=[D
 @router.get("/")
 def get_settings_data():
     """
-    Get basic settings data
+    Get system settings data
     """
-    return {"message": "Settings management available", "endpoints": ["email-templates"]}
+    try:
+        # Get app settings
+        app_settings_ref = db.collection("app_settings").document("main")
+        app_settings_doc = app_settings_ref.get()
+        
+        if app_settings_doc.exists:
+            app_settings = app_settings_doc.to_dict()
+        else:
+            # Return default app settings
+            app_settings = {
+                "app_name": "ICS App",
+                "app_version": "1.0.0",
+                "maintenance_mode": False,
+                "maintenance_message": None,
+                "contact_email": "info@icsapp.com",
+                "contact_phone": "+90 555 123 4567",
+                "address": "Istanbul, Turkey",
+                "working_hours": "09:00 - 18:00",
+                "social_media": {
+                    "facebook": None,
+                    "instagram": None,
+                    "twitter": None,
+                    "linkedin": None,
+                    "youtube": None
+                },
+                "updated_at": datetime.now().isoformat()
+            }
+        
+        # Get payment settings
+        payment_settings_ref = db.collection("payment_settings").document("main")
+        payment_settings_doc = payment_settings_ref.get()
+        
+        if payment_settings_doc.exists:
+            payment_settings = payment_settings_doc.to_dict()
+        else:
+            # Return default payment settings
+            payment_settings = {
+                "iyzico_api_key": "",
+                "iyzico_secret_key": "",
+                "iyzico_base_url": "https://sandbox-api.iyzipay.com",
+                "test_mode": True,
+                "currency": "TRY",
+                "min_order_amount": 0.0,
+                "max_order_amount": None,
+                "updated_at": datetime.now().isoformat()
+            }
+        
+        # Get email templates
+        email_templates_ref = db.collection("email_templates")
+        email_templates_docs = email_templates_ref.stream()
+        
+        email_templates = []
+        for doc in email_templates_docs:
+            template_data = doc.to_dict()
+            template_data["id"] = doc.id
+            email_templates.append(template_data)
+        
+        return {
+            "appSettings": app_settings,
+            "paymentSettings": payment_settings,
+            "emailTemplates": email_templates
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching system settings: {str(e)}")
 
 @router.get("")
 def get_settings_data_no_slash():
     """
-    Get basic settings data (no trailing slash)
+    Get system settings data (no trailing slash)
     """
     return get_settings_data()
 
