@@ -58,7 +58,7 @@ Bu modül, **Firebase ID Token** doğrulaması ile kimlik denetimi yapan FastAPI
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth as firebase_auth
-from app import config
+from backend.app import config
 from backend.app.config import settings, db
 from firebase_admin import firestore
 from backend.app.schemas.principal import Principal

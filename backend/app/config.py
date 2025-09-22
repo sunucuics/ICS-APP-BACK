@@ -13,9 +13,19 @@ from typing import Optional
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
-    firebase_cred_file: str = Field(..., env='FIREBASE_CRED_FILE')
+    firebase_cred_file: str = Field('firebase_service_account.json', env='FIREBASE_CRED_FILE')
     firebase_project_id: str = Field(..., env='FIREBASE_PROJECT_ID')
     firebase_storage_bucket: str = Field(..., env='FIREBASE_STORAGE_BUCKET')
+    
+    # Firebase credentials from environment variables (for Cloud Run)
+    firebase_private_key_id: Optional[str] = Field(None, env='FIREBASE_PRIVATE_KEY_ID')
+    firebase_private_key: Optional[str] = Field(None, env='FIREBASE_PRIVATE_KEY')
+    firebase_client_email: Optional[str] = Field(None, env='FIREBASE_CLIENT_EMAIL')
+    firebase_client_id: Optional[str] = Field(None, env='FIREBASE_CLIENT_ID')
+    firebase_auth_uri: Optional[str] = Field(None, env='FIREBASE_AUTH_URI')
+    firebase_token_uri: Optional[str] = Field(None, env='FIREBASE_TOKEN_URI')
+    firebase_auth_provider_x509_cert_url: Optional[str] = Field(None, env='FIREBASE_AUTH_PROVIDER_X509_CERT_URL')
+    firebase_client_x509_cert_url: Optional[str] = Field(None, env='FIREBASE_CLIENT_X509_CERT_URL')
     iyzico_api_key: str = Field('', env='IYZICO_API_KEY')
     iyzico_secret_key: str = Field('', env='IYZICO_SECRET_KEY')
     iyzico_base_url: str = Field('https://sandbox-api.iyzipay.com', env='IYZICO_BASE_URL')
@@ -66,7 +76,35 @@ settings = Settings()
 # Initialize Firebase Admin SDK
 # We use a service account credential file for full access to Firestore/Storage.
 try:
-    cred = credentials.Certificate(settings.firebase_cred_file)
+    # Check if we have environment variables for Firebase credentials (Cloud Run)
+    if all([
+        settings.firebase_private_key_id,
+        settings.firebase_private_key,
+        settings.firebase_client_email,
+        settings.firebase_client_id,
+        settings.firebase_auth_uri,
+        settings.firebase_token_uri,
+        settings.firebase_auth_provider_x509_cert_url,
+        settings.firebase_client_x509_cert_url
+    ]):
+        # Use environment variables for Firebase credentials (Cloud Run)
+        cred_dict = {
+            "type": "service_account",
+            "project_id": settings.firebase_project_id,
+            "private_key_id": settings.firebase_private_key_id,
+            "private_key": settings.firebase_private_key,
+            "client_email": settings.firebase_client_email,
+            "client_id": settings.firebase_client_id,
+            "auth_uri": settings.firebase_auth_uri,
+            "token_uri": settings.firebase_token_uri,
+            "auth_provider_x509_cert_url": settings.firebase_auth_provider_x509_cert_url,
+            "client_x509_cert_url": settings.firebase_client_x509_cert_url
+        }
+        cred = credentials.Certificate(cred_dict)
+    else:
+        # Use service account file (local development)
+        cred = credentials.Certificate(settings.firebase_cred_file)
+    
     firebase_app = firebase_admin.initialize_app(cred, {
         'projectId': settings.firebase_project_id,
         'storageBucket': settings.firebase_storage_bucket

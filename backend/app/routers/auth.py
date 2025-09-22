@@ -97,6 +97,7 @@ async def register(
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
     firebase_uid: str = Form(..., description="Firebase UID"),
+    fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
 ):
     """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
     # 1) Telefon formatı
@@ -132,6 +133,10 @@ async def register(
         "created_at": gcf.SERVER_TIMESTAMP,  # depoda gerçek zaman mührü
         "is_guest": False,
     }
+    
+    # FCM token varsa ekle
+    if fcm_token:
+        profile_doc["fcm_token"] = fcm_token
     db.collection("users").document(uid).set(profile_doc)
 
     # 5) Kullanıcıyı hemen oturum açmış kabul etmek için Firebase'e sign-in yap
@@ -220,6 +225,7 @@ async def request_password_reset(
 async def login(
     email:    EmailStr = Form(..., description="E-posta"),
     password: str      = Form(..., min_length=6, description="Şifre (≥6 kr.)"),
+    fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
 ):
     """Form verisiyle Firebase’e proxy olur, id_token + refresh_token döndürür."""
     payload = {
@@ -235,6 +241,16 @@ async def login(
     if resp.status_code != 200:
         message = data.get("error", {}).get("message", "Invalid credentials")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=message)
+
+    # FCM token varsa kullanıcı profilini güncelle
+    if fcm_token:
+        try:
+            user_id = data["localId"]
+            db.collection("users").document(user_id).update({
+                "fcm_token": fcm_token
+            })
+        except Exception as e:
+            logging.warning(f"Failed to update FCM token: {e}")
 
     return LoginResponse(
         id_token      = data["idToken"],
