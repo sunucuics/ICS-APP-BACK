@@ -8,7 +8,7 @@ from typing import Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
 
-router = APIRouter(prefix="/admin/settings", tags=["Admin: Settings"], dependencies=[Depends(get_current_admin)])
+router = APIRouter(prefix="/settings", tags=["Admin: Settings"], dependencies=[Depends(get_current_admin)])
 
 @router.get("/")
 def get_settings_data():
