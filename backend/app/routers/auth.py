@@ -100,6 +100,8 @@ async def register(
     fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
 ):
     """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
+    # Debug: API key'i logla
+    logging.error(f"🔥 DEBUG REGISTER: FIREBASE_WEB_API_KEY = {settings.firebase_web_api_key}")
     # 1) Telefon formatı
     if not PHONE_PATTERN.fullmatch(phone):
         raise HTTPException(422, "Telefon biçimi '555 123 4567' olmalı")
@@ -213,7 +215,11 @@ async def login(
     password: str      = Form(..., min_length=6, description="Şifre (≥6 kr.)"),
     fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
 ):
-    """Form verisiyle Firebase’e proxy olur, id_token + refresh_token döndürür."""
+    """Form verisiyle Firebase'e proxy olur, id_token + refresh_token döndürür."""
+    # Debug: API key'i logla
+    logging.error(f"🔥 DEBUG: FIREBASE_WEB_API_KEY = {settings.firebase_web_api_key}")
+    logging.error(f"🔥 DEBUG: FIREBASE_SIGNIN_ENDPOINT = {FIREBASE_SIGNIN_ENDPOINT}")
+    
     payload = {
         "email": email,
         "password": password,
