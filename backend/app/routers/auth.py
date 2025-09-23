@@ -60,7 +60,7 @@ Amaç: Oturumu kapatmak.
 3. "Logged out" mesajı döndürülür.
 
 """
-from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , Header
+from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , Header , Request
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
@@ -89,93 +89,101 @@ PHONE_PATTERN = re.compile(r"^\d{3}\s\d{3}\s\d{4}$")   # 555 123 4567
     "/register",
     response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Yeni kullanıcı kaydı (Firebase UID ile)",
+    summary="Kayıt: Token'lı (client-first) veya tokensiz (server-first) profil oluştur",
+    description=(
+        "Authorization: Bearer <ID_TOKEN> varsa onu doğrular. "
+        "Yoksa Admin SDK ile Firebase kullanıcısı oluşturur ve Firestore profilini yazar."
+    ),
 )
 async def register(
+    request: Request,
     name: str = Form(..., min_length=1, description="Ad Soyad"),
     phone: str = Form(..., description="Telefon (555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
-    fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
-    authorization: str = Header(..., alias="Authorization", description="Firebase ID Token"),
+    fcm_token: str | None = Form(None, description="FCM Token (opsiyonel)"),
+    authorization: str | None = Header(None, alias="Authorization",
+                                       description="Bearer <Firebase ID Token> (opsiyonel)"),
 ):
-    """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
-    # Debug: API key'i logla
-    logging.error(f"🔥 DEBUG REGISTER: FIREBASE_WEB_API_KEY = {settings.firebase_web_api_key}")
-    
-    # 1) Authorization header'dan Firebase UID'yi al
-    try:
-        # "Bearer " prefix'ini kaldır
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(401, "Invalid authorization header format")
-        
-        token = authorization[7:]  # "Bearer " kısmını çıkar
-        decoded_token = firebase_auth.verify_id_token(token)
-        firebase_uid = decoded_token['uid']
-        logging.error(f"🔥 DEBUG REGISTER: Firebase UID from token: {firebase_uid}")
-        
-    except Exception as exc:
-        logging.error(f"🔥 DEBUG REGISTER: Token verification failed: {str(exc)}")
-        raise HTTPException(401, f"Invalid Firebase token: {str(exc)}")
-    
+    # 1) UID elde et: header varsa token doğrula; yoksa Admin SDK ile user yarat
+    uid: str | None = None
+    if authorization and authorization.startswith("Bearer "):
+        id_token = authorization[7:]
+        try:
+            decoded = firebase_auth.verify_id_token(id_token)
+            uid = decoded["uid"]
+        except Exception as exc:
+            raise HTTPException(401, f"Invalid Firebase token: {exc}")
+    else:
+        # Token yok → server-first kayıt
+        try:
+            user = firebase_auth.create_user(
+                email=email, password=password, display_name=name
+            )
+            uid = user.uid
+        except firebase_auth.EmailAlreadyExistsError:
+            # Hesap zaten varsa uid'yi çek
+            user = firebase_auth.get_user_by_email(email)
+            uid = user.uid
+        except Exception as exc:
+            raise HTTPException(400, f"Firebase kullanıcı oluşturma hatası: {exc}")
+
     # 2) Telefon formatı
     if not PHONE_PATTERN.fullmatch(phone):
         raise HTTPException(422, "Telefon biçimi '555 123 4567' olmalı")
 
-    # 3) Firebase kullanıcısının var olduğunu doğrula
-    try:
-        user_record = firebase_auth.get_user(firebase_uid)
-        if user_record.email != email:
-            raise HTTPException(400, "Firebase UID ile email eşleşmiyor")
-    except firebase_auth.UserNotFoundError:
-        raise HTTPException(400, "Firebase kullanıcısı bulunamadı")
-    except Exception as exc:
-        raise HTTPException(400, f"Firebase kullanıcı doğrulama hatası: {str(exc)}")
+    # 3) Email eşleşmesi
+    user_record = firebase_auth.get_user(uid)
+    if user_record.email and user_record.email.lower() != email.lower():
+        raise HTTPException(400, "Firebase UID ile email eşleşmiyor")
 
-    uid = firebase_uid
-
-    # 3) Firestore'da kullanıcı zaten var mı kontrol et
-    user_doc_ref = db.collection("users").document(uid)
-    user_doc = user_doc_ref.get()
-
-    if user_doc.exists:
+    # 4) Firestore'da var mı?
+    user_ref = db.collection("users").document(uid)
+    if user_ref.get().exists:
         raise HTTPException(400, "Bu kullanıcı zaten kayıtlı")
 
-    # 4) Firestore profilini yaz (created_at server-side timestamp)
+    # 5) Profil yaz
     profile_doc = {
         "name": name,
         "email": email,
         "phone": phone,
         "role": "customer",
         "addresses": [],
-        "created_at": gcf.SERVER_TIMESTAMP,  # depoda gerçek zaman mührü
+        "created_at": gcf.SERVER_TIMESTAMP,
         "is_guest": False,
     }
-    
-    # FCM token varsa ekle
     if fcm_token:
         profile_doc["fcm_token"] = fcm_token
-    db.collection("users").document(uid).set(profile_doc)
+    user_ref.set(profile_doc)
 
-    # 5) Response: profil (created_at henüz server tarafında yazıldığı için None döndürüyoruz)
+    # 6) Cevap (tokenlar)
+    # - Tokenlı çağrıda zaten client'ta token var → boş dön.
+    # - Token yoksa ve API key varsa, arka planda sign-in yapıp token döndürmeyi dener (opsiyonel).
+    id_tok, refresh_tok, exp = "", "", 3600
+    if not authorization and settings.firebase_web_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={settings.firebase_web_api_key}",
+                    json={"email": email, "password": password, "returnSecureToken": True},
+                )
+            if r.status_code == 200:
+                data = r.json()
+                id_tok = data["idToken"]
+                refresh_tok = data["refreshToken"]
+                exp = int(data["expiresIn"])
+            else:
+                logging.warning("Login proxy failed: %s %s", r.status_code, r.text)
+        except Exception as e:
+            logging.warning(f"Login proxy error: {e}")
+
     user_out = UserProfile(
-        id=uid,
-        name=name,
-        email=email,
-        phone=phone,
-        role="customer",
-        addresses=[],
-        created_at=None,
-        is_guest=False,
+        id=uid, name=name, email=email, phone=phone,
+        role="customer", addresses=[], created_at=None, is_guest=False
     )
-    
-    # Frontend zaten Firebase'de kullanıcı oluşturduğu için token'ları frontend'den alacağız
     return RegisterResponse(
-        user_id=uid,
-        user=user_out,
-        id_token="",  # Frontend'den alınacak
-        refresh_token="",  # Frontend'den alınacak
-        expires_in=3600,  # Firebase default
+        user_id=uid, user=user_out,
+        id_token=id_tok, refresh_token=refresh_tok, expires_in=exp
     )
 
 # Optionally, if we wanted to implement login via backend (not typical since client handles it, but for completeness):
