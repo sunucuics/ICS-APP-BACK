@@ -185,7 +185,6 @@ async def register(
         user_id=uid, user=user_out,
         id_token=id_tok, refresh_token=refresh_tok, expires_in=exp
     )
-
 # Optionally, if we wanted to implement login via backend (not typical since client handles it, but for completeness):
 # We could verify email/password by calling Firebase's REST API or custom token creation, but it's simpler to let front-end handle login.
 # Therefore, we do not implement a /login endpoint here. The user obtains JWT from Firebase client SDK.
