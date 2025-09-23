@@ -448,6 +448,15 @@ def get_my_appointments(current_user: dict = Depends(get_current_user)):
     results: list[AppointmentWithDetails] = []
     for ap in appointments:
         svc = service_map.get(ap["service_id"], {})
+        # Service bilgisi varsa ServiceBrief oluştur, yoksa None
+        service_brief = None
+        if svc:
+            service_brief = ServiceBrief(
+                id=ap["service_id"],
+                title=svc.get("title"),
+                price=svc.get("price"),
+            )
+        
         results.append(
             AppointmentWithDetails(
                 id=ap["id"],
@@ -457,11 +466,7 @@ def get_my_appointments(current_user: dict = Depends(get_current_user)):
                 end=ap["end"],
                 status=ap["status"],
                 notes=ap["notes"],
-                service=ServiceBrief(
-                    id=ap["service_id"],
-                    title=svc.get("title"),
-                    price=svc.get("price"),
-                ),
+                service=service_brief,
             )
         )
     results.sort(key=lambda x: x.start or datetime.min)
