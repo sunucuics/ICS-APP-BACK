@@ -96,17 +96,33 @@ async def register(
     phone: str = Form(..., description="Telefon (555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
-    firebase_uid: str = Form(..., description="Firebase UID"),
     fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
+    authorization: str = Header(..., alias="Authorization", description="Firebase ID Token"),
 ):
     """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
     # Debug: API key'i logla
     logging.error(f"🔥 DEBUG REGISTER: FIREBASE_WEB_API_KEY = {settings.firebase_web_api_key}")
-    # 1) Telefon formatı
+    
+    # 1) Authorization header'dan Firebase UID'yi al
+    try:
+        # "Bearer " prefix'ini kaldır
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Invalid authorization header format")
+        
+        token = authorization[7:]  # "Bearer " kısmını çıkar
+        decoded_token = firebase_auth.verify_id_token(token)
+        firebase_uid = decoded_token['uid']
+        logging.error(f"🔥 DEBUG REGISTER: Firebase UID from token: {firebase_uid}")
+        
+    except Exception as exc:
+        logging.error(f"🔥 DEBUG REGISTER: Token verification failed: {str(exc)}")
+        raise HTTPException(401, f"Invalid Firebase token: {str(exc)}")
+    
+    # 2) Telefon formatı
     if not PHONE_PATTERN.fullmatch(phone):
         raise HTTPException(422, "Telefon biçimi '555 123 4567' olmalı")
 
-    # 2) Firebase kullanıcısının var olduğunu doğrula
+    # 3) Firebase kullanıcısının var olduğunu doğrula
     try:
         user_record = firebase_auth.get_user(firebase_uid)
         if user_record.email != email:
