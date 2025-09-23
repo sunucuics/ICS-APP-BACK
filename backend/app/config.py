@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     debug: bool = Field(False, env='DEBUG')
     allowed_origins: str = Field('*', env='ALLOWED_ORIGINS')  # Comma-separated list or '*' for all
     firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
+    
+    def __post_init__(self):
+        """Validate Firebase Web API Key format"""
+        if not self.firebase_web_api_key or not self.firebase_web_api_key.startswith('AIza'):
+            raise ValueError("FIREBASE_WEB_API_KEY must be a valid Firebase Web API Key starting with 'AIza'")
     delete_account_secret: Optional[str] = None
     smtp_host: str = "localhost"
     smtp_port: int = 465

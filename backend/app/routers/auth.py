@@ -139,21 +139,7 @@ async def register(
         profile_doc["fcm_token"] = fcm_token
     db.collection("users").document(uid).set(profile_doc)
 
-    # 5) Kullanıcıyı hemen oturum açmış kabul etmek için Firebase'e sign-in yap
-    payload = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True,
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(FIREBASE_SIGNIN_ENDPOINT, json=payload, timeout=10)
-    data = resp.json()
-    if resp.status_code != 200:
-        # Bu çok nadir olur; yine de hatayı net verelim
-        message = data.get("error", {}).get("message", "SIGNIN_FAILED")
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"Giriş başarısız: {message}")
-
-    # 6) Response: profil (created_at henüz server tarafında yazıldığı için None döndürüyoruz)
+    # 5) Response: profil (created_at henüz server tarafında yazıldığı için None döndürüyoruz)
     user_out = UserProfile(
         id=uid,
         name=name,
@@ -164,19 +150,19 @@ async def register(
         created_at=None,
         is_guest=False,
     )
+    
+    # Frontend zaten Firebase'de kullanıcı oluşturduğu için token'ları frontend'den alacağız
     return RegisterResponse(
         user_id=uid,
         user=user_out,
-        id_token=data["idToken"],
-        refresh_token=data["refreshToken"],
-        expires_in=int(data["expiresIn"]),
+        id_token="",  # Frontend'den alınacak
+        refresh_token="",  # Frontend'den alınacak
+        expires_in=3600,  # Firebase default
     )
 
 # Optionally, if we wanted to implement login via backend (not typical since client handles it, but for completeness):
 # We could verify email/password by calling Firebase's REST API or custom token creation, but it's simpler to let front-end handle login.
 # Therefore, we do not implement a /login endpoint here. The user obtains JWT from Firebase client SDK.
-
-FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
 
 @router.post("/reset-password", summary="Request Password Reset")
 async def request_password_reset(
@@ -186,10 +172,10 @@ async def request_password_reset(
     Triggers Firebase to SEND the password reset email.
     Always returns a generic message (no user enumeration).
     """
-    if not FIREBASE_WEB_API_KEY:
+    if not settings.firebase_web_api_key:
         raise HTTPException(status_code=500, detail="Server misconfigured: missing FIREBASE_WEB_API_KEY")
 
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_WEB_API_KEY}"
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={settings.firebase_web_api_key}"
     payload = {
         "requestType": "PASSWORD_RESET",
         "email": email,
@@ -240,6 +226,7 @@ async def login(
     data = resp.json()
     if resp.status_code != 200:
         message = data.get("error", {}).get("message", "Invalid credentials")
+        logging.error(f"Firebase login failed: {message}, API Key: {settings.firebase_web_api_key[:10]}...")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=message)
 
     # FCM token varsa kullanıcı profilini güncelle
