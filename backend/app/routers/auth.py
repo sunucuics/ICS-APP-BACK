@@ -60,7 +60,7 @@ Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işl
 3. "Logged out" mesajı döndürülür.
 
 """
-from fastapi import APIRouter, Depends, HTTPException, status , Form , Query
+from fastapi import APIRouter, Depends, HTTPException, status , Form , Query, Header, Request
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
@@ -89,15 +89,16 @@ PHONE_PATTERN = re.compile(r"^\d{3}\s\d{3}\s\d{4}$")   # 555 123 4567
     "/register",
     response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Yeni kullanıcı kaydı (Firebase UID ile)",
+    summary="Firebase kullanıcısı için Firestore profil oluştur",
+    description="Firebase'de zaten oluşturulmuş kullanıcı için Firestore'da profil oluşturur. Authorization header'da Firebase ID Token gereklidir.",
 )
 async def register(
+    request: Request,
     name: str = Form(..., min_length=1, description="Ad Soyad"),
     phone: str = Form(..., description="Telefon (555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
     fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
-    authorization: str = Header(..., alias="Authorization", description="Firebase ID Token"),
 ):
     """Firebase'de oluşturulmuş kullanıcı için Firestore profilini oluşturur."""
     # Debug: API key'i logla
@@ -105,6 +106,10 @@ async def register(
     
     # 1) Authorization header'dan Firebase UID'yi al
     try:
+        authorization = request.headers.get("Authorization")
+        if not authorization:
+            raise HTTPException(401, "Authorization header is required")
+        
         # "Bearer " prefix'ini kaldır
         if not authorization.startswith("Bearer "):
             raise HTTPException(401, "Invalid authorization header format")
