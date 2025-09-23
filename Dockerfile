@@ -19,7 +19,6 @@ RUN pip install -r requirements.txt
 
 # Uygulama + opsiyonel dosyalar (alembic varsa gelir, yoksa sorun olmaz)
 COPY backend/ ./backend/
-COPY firebase_service_account.json ./backend/firebase_service_account.json
 COPY entrypoint.sh ./
 
 # Debug: Check if firebase service account file was copied
