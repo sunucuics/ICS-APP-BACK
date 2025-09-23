@@ -225,8 +225,8 @@ class AppointmentWithDetails(BaseModel):
     id: str
     service_id: str
     user_id: Optional[str]
-    start: datetime
-    end: datetime
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
     status: AppointmentStatus
     notes: Optional[str] = None
     service: Optional[ServiceBrief] = None
