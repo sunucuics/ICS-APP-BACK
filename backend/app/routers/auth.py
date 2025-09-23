@@ -9,15 +9,15 @@ Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işl
 ## Endpoint’ler
 
 ### POST /auth/register
-*Amaç:* Yeni kullanıcı kaydı oluşturmak.
+Amaç: Yeni kullanıcı kaydı oluşturmak.
 
-*Parametreler (Form-Data):*
+Parametreler (Form-Data):
 - name: Ad Soyad (min. 1 karakter)
 - phone: Telefon numarası (555 123 4567 formatında)
 - email: E-posta adresi
 - password: Şifre (min. 6 karakter)
 
-*İşleyiş:*
+İşleyiş:
 1. Telefon numarası format kontrolü yapılır.
 2. Firebase’de kullanıcı oluşturulur.
 3. Firestore’da users/{uid} dokümanı oluşturulur.
@@ -26,25 +26,25 @@ Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işl
 ---
 
 ### POST /auth/reset-password
-*Amaç:* Şifre sıfırlama bağlantısı göndermek.
+Amaç: Şifre sıfırlama bağlantısı göndermek.
 
-*Parametreler:*
+Parametreler:
 - email: Bağlantının gönderileceği e-posta.
 
-*İşleyiş:*
+İşleyiş:
 1. Firebase üzerinden şifre sıfırlama bağlantısı üretilir.
 2. Her durumda başarılı yanıt döndürülür (kullanıcı var/yok bilgisi verilmez).
 
 ---
 
 ### POST /auth/login
-*Amaç:* E-posta ve şifre ile giriş yapmak.
+Amaç: E-posta ve şifre ile giriş yapmak.
 
-*Parametreler (Form-Data):*
+Parametreler (Form-Data):
 - email: E-posta adresi
 - password: Şifre (min. 6 karakter)
 
-*İşleyiş:*
+İşleyiş:
 1. Firebase REST API’sine giriş isteği gönderilir.
 2. Başarılıysa id_token, refresh_token, expires_in, user_id döndürülür.
 3. Başarısızsa 401 Unauthorized döner.
@@ -52,15 +52,15 @@ Bu dosya, kullanıcıların kayıt, giriş, şifre sıfırlama ve çıkış işl
 ---
 
 ### POST /auth/logout
-*Amaç:* Oturumu kapatmak.
+Amaç: Oturumu kapatmak.
 
-*İşleyiş:*
+İşleyiş:
 1. get_current_user ile kimlik doğrulama yapılır.
 2. Firebase’de kullanıcının tüm refresh token’ları iptal edilir.
 3. "Logged out" mesajı döndürülür.
 
 """
-from fastapi import APIRouter, Depends, HTTPException, status , Form , Query
+from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , Header
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
