@@ -142,8 +142,8 @@ class AppointmentOut(BaseModel):
     id: str
     service_id: str
     user_id: Optional[str]
-    start: datetime
-    end: datetime
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
     status: AppointmentStatus
 
     # Pydantic v2
@@ -169,8 +169,8 @@ class AppointmentAdminOut(BaseModel):
     start: datetime
     end: datetime
     status: str
-    user: UserBrief
-    service: ServiceBrief
+    user: Optional[UserBrief] = None
+    service: Optional[ServiceBrief] = None
 
 
 # --------- Aylık Takvim / Müsaitlik Şemaları ---------
@@ -223,7 +223,7 @@ class AppointmentBookingRequest(BaseModel):
 class AppointmentWithDetails(BaseModel):
     """Detaylı randevu bilgisi"""
     id: str
-    service_id: str
+    service_id: Optional[str] = None    # <-- değişti
     user_id: Optional[str]
     start: Optional[datetime] = None
     end: Optional[datetime] = None
