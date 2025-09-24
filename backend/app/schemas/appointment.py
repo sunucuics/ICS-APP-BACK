@@ -136,7 +136,8 @@ class AppointmentStatus(str, Enum):
     pending = "pending"
     approved = "approved"
     cancelled = "cancelled"
-
+    confirmed = "confirmed"
+    completed = "completed"
 
 class AppointmentOut(BaseModel):
     id: str
