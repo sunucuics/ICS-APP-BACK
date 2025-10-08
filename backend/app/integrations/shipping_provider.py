@@ -1,102 +1,238 @@
-# app/integrations/shipping_provider.py
-"""
-Aras Kargo SOAP entegrasyonu (minimum).
-- create_shipment_with_setorder(receiver, integration_code): SetOrder çağrısı yapar.
-  Başarıda takip numarasını (InvoiceKey/Barcode) döndürür.
-"""
-
+# backend/app/integrations/shipping_provider.py
 from __future__ import annotations
-from datetime import date
-import re
-import uuid
-import xml.etree.ElementTree as ET
-from typing import Any, Dict, Optional, Tuple
+
+import os
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import xml.etree.ElementTree as ET
 
 from backend.app.config import settings
 
-_NS = {"t": "http://tempuri.org/"}  # Aras SOAP namespace
+logger = logging.getLogger("shipping.aras")
+
+# ---- ENV / Settings ----------------------------------------------------------
+
+_BASE = (settings.ARAS_BASE_URL or "").strip()
+_HINT = (settings.ARAS_SOAPACTION_HINT or os.getenv("ARAS_SOAPACTION_HINT", "")).strip()
+_TIMEOUT = float(os.getenv("ARAS_TIMEOUT", str(settings.ARAS_TIMEOUT or 60)))
+_DEBUG = bool(getattr(settings, "ARAS_DEBUG", False)) or os.getenv("ARAS_DEBUG", "0") == "1"
+_VER_CONF = (os.getenv("ARAS_SOAP_VERSION", "auto") or "auto").strip().lower()  # "1.1" | "1.2" | "auto"
+
+ARAS_PAYOR_TYPE_CODE = (os.getenv("ARAS_PAYOR_TYPE_CODE", "1") or "1").strip()  # 1: Gönderici öder
+ARAS_IS_WORLDWIDE = (os.getenv("ARAS_IS_WORLDWIDE", "0") or "0").strip()
+ARAS_IS_COD = (os.getenv("ARAS_IS_COD", "0") or "0").strip()
+ARAS_UNIT_ID = (os.getenv("ARAS_UNIT_ID", "1") or "1").strip()  # genelde 1
+ARAS_SENDER_ACCOUNT_ADDRESS_ID = (os.getenv("ARAS_SENDER_ACCOUNT_ADDRESS_ID", "") or "").strip()
+ARAS_DEFAULT_COUNTRY = (os.getenv("ARAS_DEFAULT_COUNTRY", "Türkiye") or "Türkiye").strip()
+
+ARAS_USERNAME = settings.ARAS_USERNAME
+ARAS_PASSWORD = settings.ARAS_PASSWORD
+ARAS_CUSTOMER_CODE = (settings.ARAS_CUSTOMER_CODE or "").strip()
 
 
-def _only_digits(s: Optional[str]) -> str:
-    """Telefon gibi alanları sadece rakama indirger (maks 11 hane)."""
-    if not s:
-        return ""
-    return re.sub(r"\D+", "", s)[:11]
+# ---- Error type --------------------------------------------------------------
+
+@dataclass
+class ShippingProviderError(Exception):
+    http_status: int
+    message: str
+    raw: Optional[str] = None
+    def __str__(self) -> str:
+        return f"{self.http_status} {self.message}"
 
 
-def _compose_address(addr: Dict[str, Any]) -> str:
-    """get_current_address çıktısını okunur tek satıra çevirir."""
-    parts = [
-        addr.get("neighborhood"),
-        addr.get("street"),
-        f"No:{addr.get('buildingNo')}" if addr.get("buildingNo") else None,
-        f"Kat:{addr.get('floor')}" if addr.get("floor") else None,
-        f"Daire:{addr.get('apartment')}" if addr.get("apartment") else None,
-        addr.get("district"),
-        addr.get("city"),
-        addr.get("zipCode"),
-    ]
-    return ", ".join([p for p in parts if p])
+def make_cargokey(order_id: str) -> str:
+    key = "".join(ch for ch in order_id if ch.isalnum())[:16].upper()
+    return key or "ORD000000000000"
 
 
-def create_shipment_with_setorder(
-    *,
-    receiver: Dict[str, Any],
-    integration_code: Optional[str] = None,
-) -> Tuple[bool, Optional[str], str]:
+# ---- Utilities ---------------------------------------------------------------
+
+def _normalize_base(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return u
+    if "?op=" in u:
+        u = u.split("?op=", 1)[0]
+    if u.endswith("?wsdl"):
+        u = u[:-5]
+    return u.rstrip("/")
+
+
+def _build_endpoint(base_url: str) -> str:
+    return _normalize_base(base_url)
+
+
+def _versions_to_try() -> List[str]:
+    if _VER_CONF in ("1.1", "1.2"):
+        return [_VER_CONF]
+    # auto → ÖNCE 1.2, sonra 1.1
+    return ["1.2", "1.1"]
+
+
+def _headers(soap_action: str, ver: str) -> Dict[str, str]:
+    if ver == "1.2":
+        return {"Content-Type": f'application/soap+xml; charset=utf-8; action="{soap_action}"'}
+    return {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f"\"{soap_action}\""}
+
+
+def _post_soap(url: str, soap_action: str, xml: str, ver: str) -> requests.Response:
+    headers = _headers(soap_action, ver)
+    resp = requests.post(url, data=xml.encode("utf-8"), headers=headers, timeout=int(_TIMEOUT))
+    if _DEBUG:
+        logger.info(
+            "ARAS POST url=%s status=%s ver=%s ctype=%s soapaction=%s",
+            getattr(resp.request, "url", url),
+            resp.status_code, ver,
+            resp.request.headers.get("Content-Type"),
+            resp.request.headers.get("SOAPAction"),
+        )
+    return resp
+
+
+def _post_soap_multitry(action_name: str, xml: str) -> Tuple[requests.Response, List[Tuple[str, str, int]]]:
     """
-    Aras 'SetOrder' ile gönderi oluşturur.
-
-    Parametreler
-    ----------
-    receiver:
-      {
-        "name": "Alıcı Ad Soyad",
-        "phone": "5xx...",
-        "address": {  # get_current_address çıktısı
-          "label": "...",
-          "name": "...",
-          "city": "...",
-          "zipCode": "...",
-          "district": "...",
-          "neighborhood": "...",
-          "street": "...",
-          "buildingNo": "...",
-          "floor": "...",
-          "apartment": "...",
-          "note": "...",
-          "id": "..."
-        }
-      }
-    integration_code:
-      Bizim sistemdeki sipariş benzersiz kodu (yoksa otomatik UUID üretir).
-      Aras tarafında sonradan sorgulamak için çok kullanışlıdır.
-
-    Dönüş
-    -----
-    (success: bool, tracking_number: Optional[str], message: str)
+    Deneme stratejisi:
+      - Birden çok SOAPAction varyasyonu (ipucu + tempuri...) dener.
+      - Birden çok URL varyasyonu (case farkları, ?op=Action, eski env anahtarları) dener.
+      - SOAP 1.1 → 1.2 (veya yalnızca istenen) versiyon(lar)ını dener.
+    Başarı kriteri:
+      - İlk 200 dönen yanıt ya da 404 + "İşlem sonucu alındı" metni görüldüğünde döner.
+    Devam (kombinasyon değiştirme) kriterleri:
+      - 404 (genel)
+      - 500 ve SOAPAction/Action tanınmadı veya trailing slash format hatası
+      - 415 (Unsupported Media Type) → muhtemelen yanlış SOAP versiyonu
     """
-    if not settings.ARAS_USERNAME or not settings.ARAS_PASSWORD:
-        return (False, None, "ARAS kimlik bilgileri (.env) eksik.")
+    trials: List[Tuple[str, str, int]] = []
 
-    url = settings.ARAS_BASE_URL
+    # 1) SOAPAction adayları (önce ipucu)
+    actions: List[str] = []
+    if _HINT:
+        actions.append(_HINT)
+    for a in (
+        f"http://tempuri.org/{action_name}",
+        f"http://tempuri.org/Service/{action_name}",
+        f"http://tempuri.org/ArasCargoService/{action_name}",
+        action_name,  # çıplak
+    ):
+        if a not in actions:
+            actions.append(a)
 
-    addr = receiver.get("address") or {}
-    receiver_name = receiver.get("name") or addr.get("name") or "Müşteri"
-    phone = _only_digits(receiver.get("phone")) or _only_digits(addr.get("phone"))
-    # telefon hiç yoksa boş string gönderiyoruz; mümkünse kullanıcı profilinden telefon yazdırın.
+    # 2) URL adayları (önce canonical base, sonra legacy env anahtarları)
+    bases: List[str] = []
+    if _BASE:
+        bases.append(_BASE)
+    for envkey in ("ARAS_SERVICE_URL", "ARAS_ENDPOINT"):
+        alt = (os.getenv(envkey, "") or "").strip()
+        if alt and alt not in bases:
+            bases.append(alt)
 
-    city = addr.get("city") or ""
-    town = addr.get("district") or ""
-    neighborhood = addr.get("neighborhood") or ""
-    street = addr.get("street") or ""
+    urls: List[str] = []
+    for b in bases:
+        b = _normalize_base(b)
+        if not b:
+            continue
+        # temel .asmx
+        urls.append(b)
+        # case varyantları (ArasCargoService)
+        urls.append(b.replace("/arascargoservice/", "/ArasCargoService/"))
+        # bazı kurulumlar '?op=Action' seviyor
+        if b.lower().endswith(".asmx"):
+            urls.append(f"{b}?op={action_name}")
+        # tek dosya adı → dizin/alt-dosya varyasyonları
+        if b.lower().endswith("/arascargoservice.asmx"):
+            urls.append(b.replace("/arascargoservice.asmx", "/arascargoservice/arascargoservice.asmx"))
+            urls.append(b.replace("/arascargoservice.asmx", "/ArasCargoService/ArasCargoService.asmx"))
 
-    receiver_address = _compose_address(addr)
-    integ_code = integration_code or str(uuid.uuid4())
+    # tekrarları kaldır (sıra korunur)
+    urls = list(dict.fromkeys(urls).keys())
+    actions = list(dict.fromkeys(actions).keys())
 
-    soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+    last_resp: Optional[requests.Response] = None
+
+    for url in urls:
+        for action in actions:
+            for ver in _versions_to_try():
+                try:
+                    resp = _post_soap(url, action, xml, ver)
+                    trials.append((url, f"{action} (v{ver})", resp.status_code))
+
+                    text = resp.text or ""
+                    low = text.lower()
+
+                    # --- Özel başarı: 404 + "İşlem sonucu alındı." (bazı eski Aras kurulumları)
+                    if resp.status_code == 404 and ("işlem sonucu alındı" in low or "islem sonucu alindi" in low):
+                        return resp, trials
+
+                    # --- Devam edilmesi gereken tipik hatalar
+                    if resp.status_code in (404, 415 , 400):
+                        last_resp = resp
+                        continue
+
+                    if resp.status_code == 500:
+                        # SOAPAction header değeri/Action ismi tanınmadı
+                        if "did not recognize the value of http header soapaction" in low:
+                            last_resp = resp
+                            continue
+                        if "the action" in low and "was not recognized" in low:
+                            last_resp = resp
+                            continue
+                        # Trailing slash / format hatası
+                        if "request format is unrecognized for url unexpectedly ending in '/'" in low:
+                            last_resp = resp
+                            continue
+
+                    # --- Diğer tüm durumlarda (200 veya 500'de farklı fault vb.) bu yanıtı döndür
+                    return resp, trials
+
+                except requests.RequestException:
+                    trials.append((url, f"{action} (v{ver})", -1))
+                    last_resp = None
+                    continue
+
+    # Tüm kombinasyonlar tükendi → elde kalan en son yanıta dön
+    if last_resp is not None:
+        return last_resp, trials
+
+    # Ağa hiç ulaşılamadıysa sentetik yanıt
+    class Dummy:
+        status_code = 599
+        text = "Network error"
+        ok = False
+    return Dummy(), trials  # type: ignore
+
+
+
+# ---- SOAP ENVELOPES ----------------------------------------------------------
+
+def _soap_envelope_setorder(order: Dict[str, Any]) -> str:
+    """
+    SetOrder body (tek sipariş). Resmi örnekteki alan adlarıyla bire bir uyumlu.
+    Minimum: ReceiverName, ReceiverAddress, ReceiverPhone1, ReceiverCityName, ReceiverTownName,
+             PieceCount, IntegrationCode (+ UserName/Password).
+    Sahada çoğu hesap PayorTypeCode, IsCod, IsWorldWide, UnitID, (bazı hesaplar SenderAccountAddressId) bekliyor.
+    """
+    # Opsiyonelleri güvenli varsayılanlarla doldur
+    payor = ARAS_PAYOR_TYPE_CODE or "1"
+    is_cod = ARAS_IS_COD or "0"
+    is_world = ARAS_IS_WORLDWIDE or "0"
+    unit_id = ARAS_UNIT_ID or "1"
+    sender_addr_id = ARAS_SENDER_ACCOUNT_ADDRESS_ID  # boş ise hiç basmayacağız
+
+    # İsteğe bağlı alanları boş string geçiyoruz (IIS/SOAP 1.1 sorun çıkarmasın diye)
+    trading = order.get("tradingWaybillNumber", "") or ""
+    invoice_no = order.get("invoiceNumber", "") or ""
+    special1 = order.get("orgReceiverCustId", "") or ""  # siz zaten bunu yolluyordunuz
+
+    # Ülke adı boşsa TR ver
+    country = order.get("country") or ARAS_DEFAULT_COUNTRY
+
+    optional_sender = f"<SenderAccountAddressId>{sender_addr_id}</SenderAccountAddressId>" if sender_addr_id else ""
+
+    return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -104,245 +240,200 @@ def create_shipment_with_setorder(
     <SetOrder xmlns="http://tempuri.org/">
       <orderInfo>
         <Order>
-          <UserName>{settings.ARAS_USERNAME}</UserName>
-          <Password>{settings.ARAS_PASSWORD}</Password>
+          <UserName>{ARAS_USERNAME}</UserName>
+          <Password>{ARAS_PASSWORD}</Password>
 
-          <ReceiverName>{receiver_name}</ReceiverName>
-          <ReceiverAddress>{receiver_address}</ReceiverAddress>
-          <ReceiverPhone1>{phone}</ReceiverPhone1>
+          <TradingWaybillNumber>{trading}</TradingWaybillNumber>
+          <InvoiceNumber>{invoice_no}</InvoiceNumber>
+
+          <ReceiverName>{order['receiverCustName']}</ReceiverName>
+          <ReceiverAddress>{order['receiverAddress']}</ReceiverAddress>
+          <ReceiverPhone1>{order['receiverPhone1']}</ReceiverPhone1>
           <ReceiverPhone2></ReceiverPhone2>
           <ReceiverPhone3></ReceiverPhone3>
+          <ReceiverCityName>{order['cityName']}</ReceiverCityName>
+          <ReceiverTownName>{order['townName']}</ReceiverTownName>
 
-          <ReceiverCityName>{city}</ReceiverCityName>
-          <ReceiverTownName>{town}</ReceiverTownName>
-          <ReceiverDistrictName>{neighborhood}</ReceiverDistrictName>
-          <ReceiverStreetName>{street}</ReceiverStreetName>
+          <VolumetricWeight></VolumetricWeight>
+          <Weight></Weight>
+          <PieceCount>{int(order.get('cargoCount', 1))}</PieceCount>
 
-          <VolumetricWeight>1</VolumetricWeight>
-          <Weight>1</Weight>
-          <PieceCount>1</PieceCount>
+          <SpecialField1>{special1}</SpecialField1>
+          <SpecialField2></SpecialField2>
+          <SpecialField3></SpecialField3>
 
-          <CodAmount>0</CodAmount>
-          <IntegrationCode>{integ_code}</IntegrationCode>
-          <Description>Sipariş</Description>
+          <CodAmount></CodAmount>
+          <CodCollectionType></CodCollectionType>
+          <CodBillingType></CodBillingType>
 
-          <Country>Turkey</Country>
-          <CountryCode>TR</CountryCode>
+          <IntegrationCode>{order['CargoKey']}</IntegrationCode>
+          <Description>{order.get('description','')}</Description>
 
-          <PayorTypeCode>1</PayorTypeCode>  <!-- 1: Ücreti Gönderici -->
-          <IsWorldWide>0</IsWorldWide>
-          <IsCod>false</IsCod>
+          <TaxNumber></TaxNumber>
+          <TtDocumentId></TtDocumentId>
+          <TaxOffice></TaxOffice>
+          <PrivilegeOrder></PrivilegeOrder>
 
-          <PieceDetails>
-            <PieceDetail xsi:nil="true" />
-          </PieceDetails>
+          <Country>{country}</Country>
+          <CountryCode></CountryCode>
+          <CityCode></CityCode>
+          <TownCode></TownCode>
+          <ReceiverDistrictName></ReceiverDistrictName>
+          <ReceiverQuarterName></ReceiverQuarterName>
+          <ReceiverAvenueName></ReceiverAvenueName>
+          <ReceiverStreetName></ReceiverStreetName>
+
+          <PayorTypeCode>{payor}</PayorTypeCode>
+          <IsWorldWide>{is_world}</IsWorldWide>
+          <IsCod>{is_cod}</IsCod>
+          <UnitID>{unit_id}</UnitID>
+
+          <PieceDetails></PieceDetails>
+          {optional_sender}
         </Order>
       </orderInfo>
-      <userName>{settings.ARAS_USERNAME}</userName>
-      <password>{settings.ARAS_PASSWORD}</password>
+      <userName>{ARAS_USERNAME}</userName>
+      <password>{ARAS_PASSWORD}</password>
     </SetOrder>
   </soap:Body>
-</soap:Envelope>"""
+</soap:Envelope>""".strip()
 
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": "\"http://tempuri.org/SetOrder\"",
-    }
 
-    try:
-        resp = requests.post(url, data=soap_body.encode("utf-8"), headers=headers, timeout=settings.ARAS_TIMEOUT)
-    except Exception as e:
-        return (False, None, f"Aras bağlantı hatası: {e}")
 
-    if resp.status_code != 200:
-        # Servis bazen SOAP Fault döndürebilir; metni kısaltarak log/mesaj veriyoruz.
-        return (False, None, f"Aras HTTP {resp.status_code}: {resp.text[:200]}")
 
-    # SOAP yanıtını çöz
-    try:
-        root = ET.fromstring(resp.content)
-        result_code = root.find(".//t:ResultCode", _NS)
-        result_msg = root.find(".//t:ResultMessage", _NS)
-
-        if result_code is None:
-            return (False, None, "Aras yanıtı beklenen formatta değil.")
-
-        if result_code.text != "0":
-            msg = result_msg.text if result_msg is not None else "Bilinmeyen hata"
-            return (False, None, f"Aras SetOrder hata: {msg}")
-
-        # Takip bilgisi: çoğunlukla InvoiceKey, bazen BarcodeNumber alanında gelebilir
-        invoice_key = root.find(".//t:InvoiceKey", _NS)
-        barcode = root.find(".//t:BarcodeNumber", _NS)
-        tracking = (invoice_key.text if invoice_key is not None else None) or \
-                   (barcode.text if barcode is not None else None)
-
-        # Test ortamında bazen anında barkod dönmeyebilir → integration_code'u geçici takip olarak döndür
-        if not tracking:
-            tracking = integ_code
-
-        return (True, tracking, "Gönderi oluşturuldu.")
-
-    except Exception as e:
-        return (False, None, f"Aras yanıt parse hatası: {e}")
-
-# app/integrations/shipping_provider.py  (DOSYANIN SONUNA EKLE)
-
-def get_status_with_integration_code(integration_code: str) -> Tuple[bool, Optional[str], bool, Optional[str]]:
-    """
-    Aras 'GetOrderWithIntegrationCode' ile durum sorgular.
-    Dönüş: (ok, status_text, delivered_bool, tracking_no_maybe)
-
-    delivered_bool: True ise 'Teslim Edildi' sayabilirsin.
-    tracking_no_maybe: Barkod/InvoiceKey bulursa döndürür (bizde yoksa güncelleyebilirsin).
-    """
-    if not settings.ARAS_USERNAME or not settings.ARAS_PASSWORD:
-        return (False, None, False, None)
-
-    url = settings.ARAS_BASE_URL
-    soap_q = f"""<?xml version="1.0" encoding="utf-8"?>
+def _soap_envelope_getcargoinfo(integration_code: str) -> str:
+    return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <GetOrderWithIntegrationCode xmlns="http://tempuri.org/">
-      <userName>{settings.ARAS_USERNAME}</userName>
-      <password>{settings.ARAS_PASSWORD}</password>
+    <GetCargoInfo xmlns="http://tempuri.org/">
+      <username>{ARAS_USERNAME}</username>
+      <password>{ARAS_PASSWORD}</password>
+      <customerCode>{ARAS_CUSTOMER_CODE}</customerCode>
       <integrationCode>{integration_code}</integrationCode>
-    </GetOrderWithIntegrationCode>
+    </GetCargoInfo>
   </soap:Body>
-</soap:Envelope>"""
+</soap:Envelope>""".strip()
 
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": "\"http://tempuri.org/GetOrderWithIntegrationCode\"",
-    }
 
+# ---- XML parse helpers -------------------------------------------------------
+
+def _parse_setorder_response(xml_text: str) -> Dict[str, Any]:
+    """SetOrderResponse → SetOrderResult → OrderResultInfo[...]"""
+    out = {"message": "", "result_code": None, "invoice_key": None, "org_id": None}
     try:
-        resp = requests.post(url, data=soap_q.encode("utf-8"), headers=headers, timeout=settings.ARAS_TIMEOUT)
-    except Exception as e:
-        return (False, f"Bağlantı hatası: {e}", False, None)
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        out["message"] = (xml_text or "")[:200]
+        return out
 
-    if resp.status_code != 200:
-        return (False, f"HTTP {resp.status_code}", False, None)
+    def find_text(*suffixes: str) -> Optional[str]:
+        for node in root.iter():
+            if any(node.tag.endswith(s) for s in suffixes):
+                if node.text and node.text.strip():
+                    return node.text.strip()
+        return None
 
+    out["result_code"] = find_text("ResultCode", "ErrorCode", "Code")
+    out["message"] = find_text("ResultMessage", "Message", "Description") or ""
+    out["invoice_key"] = find_text("InvoiceKey", "InvoiceNo")
+    out["org_id"] = find_text("OrgReceiverCustId")
+    return out
+
+
+def _parse_getcargoinfo(xml_text: str) -> Optional[Dict[str, Any]]:
+    """
+    GetCargoInfoResult/IrsDataDataTable döner; kolon isimleri versiyona göre değişebilir.
+    Etiket uçlarında tanıdık anahtarları arıyoruz.
+    """
     try:
-        root = ET.fromstring(resp.content)
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
 
-        # Olası alan isimleri: LastStatusName / StatusName / OperationStatus / DeliveryStatus / Status ...
-        cand_tags = ["LastStatusName", "StatusName", "OperationStatus", "DeliveryStatus", "Status"]
-        status_text = None
-        for tag in cand_tags:
-            el = root.find(f".//t:{tag}", _NS)
-            if el is not None and (el.text or "").strip():
-                status_text = el.text.strip()
-                break
+    out: Dict[str, Any] = {}
+    for node in root.iter():
+        tag = node.tag
+        txt = (node.text or "").strip()
+        if not txt:
+            continue
+        if tag.endswith(("TrackingNumber", "TrackingNo", "Barcode")):
+            out["TrackingNumber"] = txt
+        elif tag.endswith(("CargoKey", "IntegrationCode")):
+            out["CargoKey"] = txt
+        elif tag.endswith(("InvoiceKey", "InvoiceNo")):
+            out["InvoiceKey"] = txt
+        elif tag.endswith(("WaybillNo", "WayBill")):
+            out["WaybillNo"] = txt
+        elif tag.endswith(("Status", "LastStatus", "SonDurum")):
+            out["Status"] = txt
+    return out or None
 
-        # Teslim bilgisini sezgisel tespit (bazı hesaplarda açıkça IsDelivered/DeliveryDate gelebilir)
-        delivered = False
-        is_delivered_el = root.find(".//t:IsDelivered", _NS)
-        if is_delivered_el is not None and (is_delivered_el.text or "").strip() in ("1", "true", "True"):
-            delivered = True
-        # Metin bazlı sezgi
-        if (status_text or "").lower().find("teslim") != -1:
-            delivered = True
 
-        # Takip numarası yakalama (varsa)
+# ---- Public API --------------------------------------------------------------
+
+async def create_shipment_with_setdispatch(order: Dict[str, Any]) -> Dict[str, Any]:
+    """NOTE: Artık SetOrder çağırıyor; fonksiyon adı geriye dönük uyumluluk için aynı."""
+    xml = _soap_envelope_setorder(order)
+    resp, trials = _post_soap_multitry("SetOrder", xml)
+    text = resp.text or ""
+    low = text.lower()
+
+    if resp.status_code == 599:
+        raise ShippingProviderError(599, "Aras ağına bağlanılamadı", raw=str(trials))
+
+    parsed = _parse_setorder_response(text)
+    code = (parsed.get("result_code") or "").strip()
+    msg = (parsed.get("message") or "").lower()
+
+    # Başarı kabulü
+    if code == "0" or "başar" in msg or "basar" in msg:
         tracking = None
-        for tag in ("BarcodeNumber", "InvoiceKey"):
-            el = root.find(f".//t:{tag}", _NS)
-            if el is not None and (el.text or "").strip():
-                tracking = el.text.strip()
-                break
 
-        return (True, status_text, delivered, tracking)
+        # (Opsiyonel) tracking no çek: GetCargoInfo
+        if ARAS_CUSTOMER_CODE and order.get("CargoKey"):
+            try:
+                soap = _soap_envelope_getcargoinfo(order["CargoKey"])
+                r2, _ = _post_soap_multitry("GetCargoInfo", soap)
+                if getattr(r2, "ok", False):
+                    gi = _parse_getcargoinfo(r2.text)
+                    tracking = (gi or {}).get("TrackingNumber")
+            except Exception:
+                pass
 
-    except Exception as e:
-        return (False, f"Parse hatası: {e}", False, None)
+        return {
+            "tracking_number": tracking or f"AR{order['CargoKey']}",
+            "cargo_key": order["CargoKey"],
+            "invoice_key": parsed.get("invoice_key"),
+            "waybill_no": None,
+            "message": parsed.get("message") or "Aras: Başarılı",
+            "raw_xml": text[:4000],
+            "trials": trials[-10:],
+        }
 
-# --- Takip Job'u: Teslim durumlarını güncelle --------------------------------
-def update_tracking_statuses(limit: int = 50) -> None:
-    """
-    Firestore'da 'Kargoya Verildi' durumundaki siparişleri tarar,
-    Aras 'GetOrderWithIntegrationCode' ile sorgular ve 'Teslim Edildi' olduysa günceller.
-    Ayrıca yeni barkod/InvoiceKey dönerse tracking_number'ı da günceller.
-
-    limit: Bu çağrıda en fazla kaç sipariş bakılacak (APScheduler periyodik çağırır).
-    """
-    try:
-        # Dairesel import kaçınmak için fonksiyon içinde import ediyoruz
-        from backend.app.config import db, settings
-        from firebase_admin import firestore
-        from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-
-        # Güvenlik: TEST’teyken Aras TEST endpointi kullanılır.
-        # Canlıya geçince .env'de ARAS_ENV=PROD yapacaksın; istersen burada da ek kilit tut.
-        # if settings.ARAS_ENV.upper() not in ("TEST", "PROD"):
-        #     print("[ARAS] ARAS_ENV uygun değil, job atlandı.")
-        #     return
-
-        # Sadece "Kargoya Verildi" siparişleri senkronize edelim
-        q = (
-            db.collection("orders")
-            .where("status", "==", "Kargoya Verildi")
-            .order_by("updated_at", direction=firestore.Query.ASCENDING)
-            .limit(limit)
-            .stream()
+    # WSDL 'action not recognized' vs. diğer hatalar
+    if resp.status_code in (500, 400):
+        raise ShippingProviderError(
+            resp.status_code,
+            f"Aras hata: {parsed.get('message') or (text[:200] or 'Boş gövde')} | last={trials[-1] if trials else None}",
+            text[:4000],
         )
+    if resp.status_code == 404:
+        raise ShippingProviderError(404, "Aras hata: Not Found (muhtemelen yanlış endpoint/action)", str(trials))
 
-        checked = 0
-        updated = 0
-        for snap in q:
-            checked += 1
-            data = snap.to_dict() or {}
-            integ = data.get("integration_code")
-            if not integ:
-                continue
-
-            ok, status_text, delivered, new_track = get_status_with_integration_code(integ)
-            if not ok:
-                # Aras geçici hata verebilir; loglayıp devam
-                print(f"[ARAS] Sorgu hatası (order={snap.id}): {status_text}")
-                continue
-
-            patch = {"updated_at": SERVER_TIMESTAMP}
-            touch = False
-
-            if delivered and data.get("status") != "Teslim Edildi":
-                patch["status"] = "Teslim Edildi"
-                touch = True
-
-            if new_track and new_track != data.get("tracking_number"):
-                patch["tracking_number"] = new_track
-                touch = True
-
-            if status_text:
-                patch["_last_aras_status"] = status_text
-                # tek başına status_text değişse de updated_at güncellenmesi faydalı
-
-            if touch:
-                snap.reference.update(patch)
-                updated += 1
-
-        print(f"[ARAS] Tracking job: kontrol={checked}, guncellenen={updated}")
-
-    except Exception as e:
-        # Job hiçbir zaman uygulamayı çökertmesin; hatayı logla
-        print(f"[ARAS] Tracking job exception: {e}")
+    raise ShippingProviderError(resp.status_code, f"Aras hata: {parsed.get('message') or text[:200]}", text[:4000])
 
 
-def get_label_pdf(integration_code: str) -> Tuple[bool, Optional[str], Optional[bytes], str]:
-    """
-    Aras Label/Print API: integration_code (veya takip no) ile PDF döner.
-    Dönüş: (ok, filename, pdf_bytes, msg)
-    """
-    # TODO: Aras endpoint çağırın, bytes alın.
-    raise NotImplementedError
-
-def request_pickup(integration_code: str, pickup_date: date, time_window: str) -> Tuple[bool, Optional[str]]:
-    """
-    Aras Pickup API: belirtilen tarihte ve zaman aralığında kurye talebi.
-    Dönüş: (ok, pickup_ref) — pickup_ref: Aras tarafındaki referans.
-    """
-    # TODO: Aras endpoint çağırın.
-    raise NotImplementedError
+async def get_status_with_integration_code(integration_code: str) -> Optional[Dict[str, Any]]:
+    if not integration_code:
+        return None
+    xml = _soap_envelope_getcargoinfo(integration_code)
+    resp, _ = _post_soap_multitry("GetCargoInfo", xml)
+    if not getattr(resp, "ok", False):
+        return None
+    found = _parse_getcargoinfo(resp.text)
+    if not found:
+        return None
+    found["_matched_by"] = "IntegrationCode"
+    return found
