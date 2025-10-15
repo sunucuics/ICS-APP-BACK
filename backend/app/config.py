@@ -45,12 +45,13 @@ class Settings(BaseSettings):
     ARAS_SERVICE_URL: str = ""  # legacy ad
     ARAS_SOAPACTION_HINT: str = ""
     EXPOSE_SHIPPING_DEBUG: bool = False
-    ARAS_TIMEOUT: int = 60
+    ARAS_TIMEOUT: int = 20
     ARAS_TRACKING_LINK_TEMPLATE: Optional[str] = None
     aras_base_url: Optional[str] = Field(None, env="ARAS_BASE_URL")
     ARAS_ENDPOINT: str = "https://appls-srv.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
     ARAS_DEBUG: bool = Field(False, env="ARAS_DEBUG")
-
+    ARAS_TEST_URL: str = "https://customerservicestest.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
+    ARAS_LIVE_URL: str = "https://customerws.araskargo.com.tr/arascargoservice.asmx"
     # App misc
     debug: bool = Field(False, env="DEBUG")
     allowed_origins: str = Field("*", env="ALLOWED_ORIGINS")

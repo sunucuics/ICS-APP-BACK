@@ -53,7 +53,11 @@ Tüm admin router’lar ilgili modüllerde `get_current_admin` ile korunur.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config import settings
-from backend.app.routers import auth, users, categories, products, services, carts, orders, appointments, discounts, comments , auth_delete , featured, admin_dashboard, analytics, notifications, settings as settings_router
+from backend.app.routers import (auth, users, categories, products,
+                                 services, carts, orders, appointments,
+                                 discounts, comments , auth_delete , featured,
+                                 admin_dashboard, analytics, notifications,
+                                 settings as settings_router , shipping as shipping_router)
 from backend.app.routers import categories as categories_router
 from backend.app.routers import products as products_router
 from backend.app.routers import services as services_router
@@ -96,6 +100,8 @@ app.include_router(products_router.router)
 app.include_router(services_router.router)
 app.include_router(carts.router)
 app.include_router(orders_router.router)
+app.include_router(shipping_router.router)
+
 app.include_router(appointments_router.router)
 app.include_router(comments_router.router)
 app.include_router(auth_delete.router)

@@ -1,4 +1,4 @@
-# backend/app/integrations/aras_query_service.py
+# backend/app/integrations/aras_wsdl.py
 
 import os
 import requests
@@ -17,17 +17,29 @@ def _post_soap(method: str, body: str) -> requests.Response:
                      xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
       <soap12:Body>{body}</soap12:Body>
     </soap12:Envelope>"""
-    resp = requests.post(ARAS_SVC_URL, data=envelope.encode("utf-8"), headers=headers, timeout=timeout)
-    return resp
+    return requests.post(ARAS_SVC_URL, data=envelope.encode("utf-8"), headers=headers, timeout=timeout)
 
-def get_query_json(login_info: str, query_info: str) -> str:
-    body = f"""
+def call_setdataxml(login_info: str, query_info: str) -> str:
+    xml = f"""
+    <SetDataXML xmlns="http://tempuri.org/">
+      <loginInfo>{login_info}</loginInfo>
+      <queryInfo>{query_info}</queryInfo>
+    </SetDataXML>
+    """.strip()
+    resp = _post_soap("SetDataXML", xml)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.text)
+    el = root.find(".//SetDataXMLResult") or root.find(".//t:SetDataXMLResult", {"t":"http://tempuri.org/"})
+    return el.text if el is not None else ""
+
+def call_getqueryjson(login_info: str, query_info: str) -> str:
+    xml = f"""
     <GetQueryJSON xmlns="http://tempuri.org/">
       <loginInfo>{login_info}</loginInfo>
       <queryInfo>{query_info}</queryInfo>
     </GetQueryJSON>
     """.strip()
-    resp = _post_soap("GetQueryJSON", body)
+    resp = _post_soap("GetQueryJSON", xml)
     resp.raise_for_status()
     root = ET.fromstring(resp.text)
     el = root.find(".//GetQueryJSONResult") or root.find(".//t:GetQueryJSONResult", {"t":"http://tempuri.org/"})
