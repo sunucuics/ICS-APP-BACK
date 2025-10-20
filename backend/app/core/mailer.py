@@ -43,19 +43,64 @@ async def mailer_send(
 
     def _send_blocking():
         if email_debug:
-            log.info("[MAIL] host=%s port=%s starttls=%s from=%s to=%s subject=%s",
-                     host, port, use_starttls, from_addr, to, subject)
-        ctx = ssl.create_default_context()
-        if use_starttls and port != 465:
-            with smtplib.SMTP(host, port) as s:
-                s.ehlo(); s.starttls(context=ctx); s.ehlo()
-                s.login(user, pwd); s.send_message(msg)
-        else:
-            with smtplib.SMTP_SSL(host, port, context=ctx) as s:
-                s.login(user, pwd); s.send_message(msg)
+            log.info(
+                "[MAIL] host=%s port=%s starttls=%s from=%s to=%s subject=%s",
+                host, port, use_starttls, from_addr, to, subject
+            )
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _send_blocking)
+        ctx = ssl.create_default_context()
+
+        def _send_starttls(p: int):
+            with smtplib.SMTP(host, p, timeout=40) as s:
+                if email_debug:
+                    s.set_debuglevel(1)  # SMTP konuşmasını logla (DEBUG modda)
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+                s.login(user, pwd)
+                s.send_message(msg)
+
+        def _send_ssl(p: int):
+            with smtplib.SMTP_SSL(host, p, context=ctx, timeout=40) as s:
+                if email_debug:
+                    s.set_debuglevel(1)
+                s.login(user, pwd)
+                s.send_message(msg)
+
+        # --- Preflight: hedef porta erişim var mı? (DNS/port/firewall ayrımı) ---
+        import socket
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.close()
+            primary_ok = True
+        except Exception as e:
+            primary_ok = False
+            if email_debug:
+                log.warning("SMTP preflight failed host=%s port=%s err=%s", host, port, e)
+
+        if not primary_ok:
+            # 587 kapalıysa genelde 465 açıktır; onu da yoklayalım
+            try:
+                sock = socket.create_connection((host, 465), timeout=5)
+                sock.close()
+                if email_debug:
+                    log.info("SMTP 465 reachable; forcing SSL:465 fallback")
+                _send_ssl(465)
+                return
+            except Exception as e2:
+                log.error("SMTP 465 preflight failed host=%s err=%s", host, e2)
+                # ikisi de başarısızsa yine de aşağıdaki ana akışa düşüp gerçek hatayı görelim
+
+        # --- Normal akış + otomatik fallback ---
+        try:
+            if use_starttls and port != 465:
+                _send_starttls(port)
+            else:
+                _send_ssl(port or 465)
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            log.warning("SMTP %s:%s unreachable (%s). Falling back to SSL:465", host, port, e)
+            _send_ssl(465)
+
 
 # -------- HTML ŞABLONLARI --------
 def _brand() -> str:
@@ -139,12 +184,11 @@ def _items_block(items: Optional[list], totals: Optional[dict]) -> str:
 def _address_block(address: Optional[dict]) -> str:
     if not isinstance(address, dict) or not address:
         return ""
-    # Farklı şema isimlerini de toplayalım
     keys_in_order = [
         "title", "full_name", "name",
         "line1", "line2", "neighborhood", "district", "street",
-        "building", "apartment", "no",
-        "postcode", "postal_code",
+        "building", "buildingNo", "apartment", "no",
+        "postcode", "postal_code", "zipCode",  # <- eklendi
         "city", "state", "country",
         "full_address", "address"
     ]

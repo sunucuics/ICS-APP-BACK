@@ -10,7 +10,7 @@ from typing import Optional
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
-from pydantic import Field
+from pydantic import Field , AliasChoices
 from pydantic_settings import BaseSettings
 
 
@@ -33,9 +33,13 @@ class Settings(BaseSettings):
     firebase_client_x509_cert_url: Optional[str] = Field(None, env="FIREBASE_CLIENT_X509_CERT_URL")
 
     # Iyzico
-    iyzico_api_key: str = Field("", env="IYZICO_API_KEY")
-    iyzico_secret_key: str = Field("", env="IYZICO_SECRET_KEY")
-    iyzico_base_url: str = Field("https://sandbox-api.iyzipay.com", env="IYZICO_BASE_URL")
+    paytr_merchant_id: str   = Field(validation_alias=AliasChoices("PAYTR_MERCHANT_ID", "paytr_merchant_id"))
+    paytr_merchant_key: str  = Field(validation_alias=AliasChoices("PAYTR_MERCHANT_KEY", "paytr_merchant_key"))
+    paytr_merchant_salt: str = Field(validation_alias=AliasChoices("PAYTR_MERCHANT_SALT", "paytr_merchant_salt"))
+    paytr_ok_url: str        = Field(default="https://example.com/payment/success", validation_alias=AliasChoices("PAYTR_OK_URL","paytr_ok_url"))
+    paytr_fail_url: str      = Field(default="https://example.com/payment/fail",    validation_alias=AliasChoices("PAYTR_FAIL_URL","paytr_fail_url"))
+    paytr_test_mode: str     = Field(default="1", validation_alias=AliasChoices("PAYTR_TEST_MODE","paytr_test_mode"))
+
 
     # App misc
     # App misc

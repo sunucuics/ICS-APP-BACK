@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import asyncio, inspect, os, requests
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from google.cloud.firestore_v1.field_path import FieldPath
 from pydantic import BaseModel
 from firebase_admin import firestore
+from typing import Set, Iterable
 
 from backend.app.config import db, settings
 from backend.app.core.security import get_current_user, get_current_admin
@@ -72,6 +74,50 @@ _PREFIX = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
 def _prefixed(name: str) -> str:
     return f"{_PREFIX}{name}" if _PREFIX else name
 _CARTS = _prefixed("carts")
+
+def _unit_price_from_product(p: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(p, dict):
+        return 0.0
+    for key in ("final_price", "price"):
+        v = p.get(key, None)
+        try:
+            if v is not None and str(v).strip() != "":
+                return float(v)
+        except Exception:
+            continue
+    return 0.0
+
+def _fetch_products_by_ids_from_db(product_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    ids = [pid for pid in set(product_ids) if pid]
+    if not ids:
+        return {}
+    idx: Dict[str, Dict[str, Any]] = {}
+    try:
+        for i in range(0, len(ids), 10):
+            batch = ids[i:i+10]
+            q = (db.collection_group("items")
+                   .where("is_deleted", "==", False)
+                   .where(FieldPath.document_id(), "in", batch))
+            for snap in q.stream():
+                d = snap.to_dict() or {}
+                d["id"] = snap.id
+                idx[snap.id] = d
+    except Exception as e:
+        log.warning("DB fallback query failed (index?) — continuing without it: %s", e)
+        # Burada API'den gelenlerle yetinip yolumuza devam ediyoruz.
+    return idx
+
+
+def _product_index(product_ids: Set[str], request: Request) -> Dict[str, Dict[str, Any]]:
+    # 1) HTTP API
+    api_products = _fetch_products_via_api(request)
+    idx = _index_products_by_id(api_products)
+
+    # 2) Eksikler varsa DB fallback
+    missing = [pid for pid in product_ids if pid not in idx]
+    if missing:
+        idx.update(_fetch_products_by_ids_from_db(missing))
+    return idx
 
 # --- Yardımcılar --------------------------------------------------------------
 def _now():
@@ -177,8 +223,9 @@ def _money_from_product(p: Optional[Dict[str, Any]]) -> Decimal:
 def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
     """
     carts/{uid} dokümanındaki {product_id, qty} satırlarını alır,
-    /products ile eşleştirip {name, price, image_url} doldurur.
+    /products ile eşleştirip {name, price, final_price, image_url} doldurur.
     Subcollection (carts/{uid}/items) desteği de vardır.
+    /products API boş kalırsa Firestore collection_group('items') fallback kullanır.
     """
     items_raw: List[Dict[str, Any]] = []
     cref = db.collection(_CARTS).document(user_id)
@@ -202,10 +249,15 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
     if not items_raw:
         return []
 
-    # Katalogu /products'tan çek ve id->product index'i kur
-    products = _fetch_products_via_api(request)
-    catalog = _index_products_by_id(products)
+    # 3) Ürün indeksini kur (API + DB fallback)
+    wanted_ids: set[str] = set()
+    for it in items_raw:
+        pid = str((it or {}).get("product_id") or (it or {}).get("id") or "").strip()
+        if pid:
+            wanted_ids.add(pid)
+    catalog = _product_index(wanted_ids, request)  # _product_index ve _unit_price_from_product yardımcıları gerekir.
 
+    # 4) Zenginleştirilmiş satırlar
     out: List[Dict[str, Any]] = []
     for it in items_raw:
         pid = str((it or {}).get("product_id") or (it or {}).get("id") or "").strip()
@@ -214,32 +266,62 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
             continue
 
         p = catalog.get(pid)
-        name = (p or {}).get("title") or (p or {}).get("name") or (it or {}).get("name") or ""
-        price = float(_money_from_product(p)) if p else float((it or {}).get("price") or 0)
+
+        # İsim önceliği: product.title/name -> item.name -> pid
+        name = (
+            (p or {}).get("title")
+            or (p or {}).get("name")
+            or (it or {}).get("name")
+            or pid
+        )
+
+        # Fiyat önceliği: product.final_price > 0 -> product.price > 0 -> item.final_price/price -> 0
+        unit = _unit_price_from_product(p)
+        if unit <= 0:
+            try:
+                unit = float((it or {}).get("final_price") or (it or {}).get("price") or 0)
+            except Exception:
+                unit = 0.0
+
+        # Görsel: product.images[0] -> item.image_url -> None
         img = None
         if p and isinstance(p.get("images"), list) and p["images"]:
             img = p["images"][0]
-        elif it.get("image_url"):
+        elif (it or {}).get("image_url"):
             img = it["image_url"]
 
-        out.append({"product_id": pid, "name": name, "qty": qty, "price": price, "image_url": img})
+        out.append({
+            "product_id": pid,
+            "name": name,
+            "qty": qty,
+            "price": unit,        # toplamlar için birim fiyat
+            "final_price": unit,  # final_price alanını da dolduruyoruz
+            "image_url": img
+        })
 
     return out
 
+
 def _calc_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    subtotal = sum((i.get("qty", 0) or 0) * float(i.get("price", 0) or 0) for i in items)
+    def _unit(it: Dict[str, Any]) -> float:
+        try:
+            v = it.get("final_price", None)
+            if v is None or str(v).strip() == "":
+                v = it.get("price", 0)
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    subtotal = sum((it.get("qty", 0) or 0) * _unit(it) for it in items)
     cur = (getattr(settings, "currency", None) or "TRY").upper()
-    return {"subtotal": round(subtotal, 2), "grand_total": round(subtotal, 2), "currency": cur}
+    grand = round(subtotal, 2)
+    return {"subtotal": grand, "grand_total": grand, "currency": cur}
+
 
 def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (List[Dict[str, Any]], Dict[str, Any]):
-    """
-    Siparişin items listesini /products ile eşleştirir:
-    - name: p.title/name -> item.name -> product_id fallback
-    - price/final_price: item'dakini kullan, yoksa p.final_price/price
-    """
     items = list(order_doc.get("items") or [])
-    products = _fetch_products_via_api(request)
-    idx = _index_products_by_id(products)
+    wanted_ids = {str((it or {}).get("product_id") or (it or {}).get("id") or "").strip() for it in items}
+    idx = _product_index({pid for pid in wanted_ids if pid}, request)
 
     out: List[Dict[str, Any]] = []
     for it in items:
@@ -248,15 +330,15 @@ def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (Lis
         p = idx.get(pid)
 
         name = (it.get("name") or it.get("title") or (p or {}).get("title") or (p or {}).get("name") or pid)
-        # fiyatı öncelik sırasıyla belirle
-        final_price = it.get("final_price")
-        price = it.get("price")
-        if final_price in (None, "", 0, 0.0) and p is not None:
-            final_price = p.get("final_price")
-        if (price in (None, "", 0, 0.0)) and p is not None:
-            price = p.get("price")
 
-        # image varsa taşıyalım (isteğe bağlı)
+        # fiyatları final_price>0 -> price -> item içi fallback
+        unit = _unit_price_from_product(p)
+        if unit <= 0:
+            try:
+                unit = float(it.get("final_price") or it.get("price") or 0)
+            except Exception:
+                unit = 0.0
+
         img = it.get("image_url")
         if not img and p and isinstance(p.get("images"), list) and p["images"]:
             img = p["images"][0]
@@ -265,13 +347,20 @@ def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (Lis
             "product_id": pid,
             "name": name,
             "qty": qty,
-            "price": price,
-            "final_price": final_price,
+            "price": unit,
+            "final_price": unit,
             "image_url": img
         })
 
-    totals = order_doc.get("totals") or _calc_totals(out)
+    # DOC totals 0'sa (veya yoksa) yeniden hesapla
+    tdoc = order_doc.get("totals") or {}
+    try:
+        grand_in_doc = float(tdoc.get("grand_total", -1))
+    except Exception:
+        grand_in_doc = -1
+    totals = _calc_totals(out) if (grand_in_doc <= 0) else tdoc
     return out, totals
+
 
 
 def _build_customer(user_id: str) -> Dict[str, Any]:
@@ -386,16 +475,30 @@ async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
 # -----------------------------------------------------------------------------
 # ADMIN — Kargoya verilecekler / ship / deliver / cancel / delete
 # -----------------------------------------------------------------------------
-@admin_router.get("/queue", summary="Kargoya verilecek siparişler (status=preparing)")
+@admin_router.get("/queue", summary="Kargoya verilecekler ve kargoya verilenler")
 async def list_ship_queue(_: Dict = Depends(get_current_admin)):
-    q = (
-        db.collection("orders")
-        .where("status", "==", "preparing")
-        .where("is_deleted", "==", False)
+    base = db.collection("orders").where("is_deleted", "==", False)
+
+    preparing_q = (
+        base.where("status", "==", "preparing")
         .order_by("created_at", direction=firestore.Query.ASCENDING)
         .stream()
     )
-    return [_merge_doc_id(d) for d in q]
+    shipped_q = (
+        base.where("status", "==", "shipped")
+        .order_by("created_at", direction=firestore.Query.ASCENDING)
+        .stream()
+    )
+
+    preparing = [_merge_doc_id(d) for d in preparing_q]
+    shipped   = [_merge_doc_id(d) for d in shipped_q]
+
+    return {
+        "preparing": preparing,
+        "shipped": shipped,
+        "count": {"preparing": len(preparing), "shipped": len(shipped)},
+    }
+
 
 class AdminShipRequest(BaseModel):
     tracking_number: str

@@ -16,6 +16,7 @@ from backend.app.routers import shipping_manual as orders_router
 from backend.app.routers import appointments as appointments_router
 from backend.app.routers import comments as comments_router
 from backend.app.routers import users as users_router
+from backend.app.routers import paytr
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -43,6 +44,7 @@ app.add_middleware(
 # Include public routers
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(paytr.router)
 app.include_router(categories_router.router)
 app.include_router(products_router.router)
 app.include_router(services_router.router)
