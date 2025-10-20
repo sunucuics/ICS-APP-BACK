@@ -37,21 +37,6 @@ class Settings(BaseSettings):
     iyzico_secret_key: str = Field("", env="IYZICO_SECRET_KEY")
     iyzico_base_url: str = Field("https://sandbox-api.iyzipay.com", env="IYZICO_BASE_URL")
 
-    # Aras
-    ARAS_ENV: str = "prod"
-    ARAS_USERNAME: str = ""
-    ARAS_PASSWORD: str = ""
-    ARAS_CUSTOMER_CODE: Optional[str] = None
-    ARAS_SERVICE_URL: str = ""  # legacy ad
-    ARAS_SOAPACTION_HINT: str = ""
-    EXPOSE_SHIPPING_DEBUG: bool = False
-    ARAS_TIMEOUT: int = 20
-    ARAS_TRACKING_LINK_TEMPLATE: Optional[str] = None
-    aras_base_url: Optional[str] = Field(None, env="ARAS_BASE_URL")
-    ARAS_ENDPOINT: str = "https://appls-srv.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
-    ARAS_DEBUG: bool = Field(False, env="ARAS_DEBUG")
-    ARAS_TEST_URL: str = "https://customerservicestest.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
-    ARAS_LIVE_URL: str = "https://customerws.araskargo.com.tr/arascargoservice.asmx"
     # App misc
     debug: bool = Field(False, env="DEBUG")
     allowed_origins: str = Field("*", env="ALLOWED_ORIGINS")
@@ -66,40 +51,11 @@ class Settings(BaseSettings):
     smtp_from: Optional[str] = None
     smtp_use_starttls: bool = False  # 587 için true
 
-    # Shipping options
-    AUTO_LABEL: bool = False
-    AUTO_PICKUP: bool = False
-    PICKUP_TIME_WINDOW: str = "13:00-17:00"
-    PICKUP_DAYS_OFFSET: int = 0
-    LABEL_PUBLIC: bool = False
-    LABEL_URL_EXPIRES_HOURS: int = 24
-    ARAS_WEBHOOK_SECRET: str = ""
-    ARAS_SOAP_VERSION: str = Field("auto", env="ARAS_SOAP_VERSION")
+
 
     class Config:
         env_file = ".env"
         case_sensitive = False
-
-    @property
-    def ARAS_BASE_URL(self) -> str:
-        """
-        Env'de ARAS_BASE_URL verilmişse onu ( ?op= / ?wsdl kırpıp ) kullan;
-        verilmemişse ARAS_ENV'e göre doğru .asmx'i döndür.
-        """
-        url = (self.aras_base_url or "").strip()
-        if url:
-            if "?op=" in url:
-                url = url.split("?op=", 1)[0]
-            if url.endswith("?wsdl"):
-                url = url[:-5]
-            return url.rstrip("/")
-
-        # ARAS_ENV'e göre default
-        if self.ARAS_ENV.upper() in ("TEST", "SANDBOX"):
-            return "https://customerservicestest.araskargo.com.tr/arascargoservice/arascargoservice.asmx"
-        # customerws (prod)
-        # Not: bazı kurulumlarda /arascargoservice.asmx dizin ismi farklı olabilir, integrations bunu varyant olarak dener.
-        return "https://customerws.araskargo.com.tr/arascargoservice.asmx"
 
     def model_post_init(self, __context):
         """Validate Firebase Web API Key format"""

@@ -1,78 +1,26 @@
-"""
-# `app/main.py` — Ana Uygulama Dokümantasyonu
-
-## Genel Bilgi
-Bu dosya, FastAPI uygulamasının başlangıç noktasıdır.
-Router’lar eklenir, CORS ayarları yapılır, admin ve public endpoint’ler bağlanır, arka planda çalışan scheduler yapılandırılır.
-
----
-
-## Uygulama Başlatma
-- `FastAPI` örneği başlatılır (`title`, `description`, `version`).
-- CORS ayarları `settings.allowed_origins` üzerinden yapılır (liste veya `*`).
-
----
-
-## Router Dahil Etme
-**Public Router’lar:**
-- `/auth`
-- `/users`
-- `/categories`
-- `/products`
-- `/services`
-- `/carts`
-- `/orders`
-- `/appointments`
-- `/comments`
-
-**Admin Router’lar (prefix `/admin`):**
-- `/categories`
-- `/products`
-- `/services`
-- `/orders`
-- `/appointments`
-- `/discounts`
-- `/comments`
-
-Tüm admin router’lar ilgili modüllerde `get_current_admin` ile korunur.
-
----
-
-## Arka Plan Scheduler
-- **Kütüphane:** APScheduler (`BackgroundScheduler`)
-- **İş:** `update_tracking_statuses` (kargo takip durumlarını günceller)
-- **Periyot:** 30 dakikada bir (sadece `settings.tracking_api_key` varsa çalışır)
-
-**Olaylar:**
-- `startup`: Scheduler başlatılır.
-- `shutdown`: Scheduler kapatılır.
-
----
-
-"""
+# app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config import settings
-from backend.app.routers import (auth, users, categories, products,
-                                 services, carts, orders, appointments,
-                                 discounts, comments , auth_delete , featured,
-                                 admin_dashboard, analytics, notifications,
-                                 settings as settings_router , shipping as shipping_router)
+from backend.app.routers import (
+    auth, users, categories, products,
+    services, carts, appointments,
+    discounts, comments, auth_delete, featured,
+    admin_dashboard, analytics, notifications,
+    settings as settings_router
+)
 from backend.app.routers import categories as categories_router
 from backend.app.routers import products as products_router
 from backend.app.routers import services as services_router
-from backend.app.routers import orders as orders_router
+from backend.app.routers import shipping_manual as orders_router
 from backend.app.routers import appointments as appointments_router
 from backend.app.routers import comments as comments_router
 from backend.app.routers import users as users_router
 
-from firebase_admin import firestore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from backend.app.services.orders_sync import sync_open_orders_once  # job fonksiyonun
 
 # Tek bir scheduler instance'ı oluştur
 scheduler = AsyncIOScheduler()
-scheduler.add_job(sync_open_orders_once, "interval", minutes=10, id="orders-sync", replace_existing=True)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -99,8 +47,9 @@ app.include_router(categories_router.router)
 app.include_router(products_router.router)
 app.include_router(services_router.router)
 app.include_router(carts.router)
+
+# YENİ: public sipariş/kargo uçları shipping_manual içinden gelir
 app.include_router(orders_router.router)
-app.include_router(shipping_router.router)
 
 app.include_router(appointments_router.router)
 app.include_router(comments_router.router)
@@ -111,7 +60,10 @@ app.include_router(admin_dashboard.router, prefix="/admin")
 app.include_router(categories_router.admin_router, prefix="/admin")
 app.include_router(products_router.admin_router, prefix="/admin")
 app.include_router(services_router.admin_router, prefix="/admin")
+
+# YENİ: admin sipariş/kargo uçları da shipping_manual içinden gelir
 app.include_router(orders_router.admin_router, prefix="/admin")
+
 app.include_router(appointments_router.admin_router, prefix="/admin")
 app.include_router(discounts.router, prefix="/admin")  # all routes in discounts are admin-protected via dependencies
 app.include_router(comments_router.admin_router, prefix="/admin")
@@ -122,24 +74,18 @@ app.include_router(notifications.router, prefix="/admin")
 app.include_router(settings_router.router, prefix="/admin")
 
 
-
 @app.on_event("startup")
 async def _startup_scheduler():
     if not scheduler.running:
         scheduler.start()
     # Job'u güvenle ekle (varsa üstüne yaz)
-    scheduler.add_job(
-        sync_open_orders_once,
-        "interval",
-        minutes=2,
-        id="orders-sync",
-        replace_existing=True,
-    )
+
 
 @app.on_event("shutdown")
 async def _shutdown_scheduler():
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
 
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
@@ -150,6 +96,7 @@ async def healthz():
         "scheduler": "running" if scheduler.running else "stopped",
         "firebase": "initialized" if firebase_admin._apps else "not_initialized"
     }
+
 
 # (opsiyonel) readiness: dış servislere bağlanmayı da burada deneyebilirsin
 @app.get("/readyz", include_in_schema=False)
