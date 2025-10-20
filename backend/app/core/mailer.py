@@ -79,10 +79,16 @@ def _fmt_money(v: float) -> str:
     s = f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"{s} {_currency_symbol()}"
 
+def _to_float(v) -> float:
+    try: return float(v)
+    except Exception: return 0.0
+
 def _unit_price(item: dict) -> float:
-    if item.get("final_price") is not None:
-        return float(item.get("final_price") or 0)
-    return float(item.get("price") or 0)
+    # final_price > 0 ise onu kullan, değilse price'a düş
+    fp = item.get("final_price", None)
+    if fp is not None and _to_float(fp) > 0:
+        return _to_float(fp)
+    return _to_float(item.get("price"))
 
 def _items_block(items: Optional[list], totals: Optional[dict]) -> str:
     items = items or []
@@ -133,14 +139,26 @@ def _items_block(items: Optional[list], totals: Optional[dict]) -> str:
 def _address_block(address: Optional[dict]) -> str:
     if not isinstance(address, dict) or not address:
         return ""
-    lines = [
-        address.get("line1"),
-        address.get("line2"),
-        f"{address.get('postal_code','')} {address.get('city','')}".strip(),
-        address.get("state"),
-        address.get("country"),
+    # Farklı şema isimlerini de toplayalım
+    keys_in_order = [
+        "title", "full_name", "name",
+        "line1", "line2", "neighborhood", "district", "street",
+        "building", "apartment", "no",
+        "postcode", "postal_code",
+        "city", "state", "country",
+        "full_address", "address"
     ]
-    shown = "<br/>".join([str(x) for x in lines if x])
+    parts = []
+    for k in keys_in_order:
+        v = address.get(k)
+        if v:
+            parts.append(str(v))
+    # benzersiz + boş olmayanları satır satır yaz
+    seen, lines = set(), []
+    for p in parts:
+        if p not in seen:
+            lines.append(p); seen.add(p)
+    shown = "<br/>".join(lines)
     return (
         "<div style='margin-top:16px;padding:12px;border:1px solid #eef2f7;border-radius:10px'>"
         "<div style='font-weight:600;margin-bottom:6px'>Teslimat adresi</div>"

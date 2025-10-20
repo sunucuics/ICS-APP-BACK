@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
 import asyncio, inspect, os, requests
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from firebase_admin import firestore
@@ -232,6 +231,48 @@ def _calc_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     cur = (getattr(settings, "currency", None) or "TRY").upper()
     return {"subtotal": round(subtotal, 2), "grand_total": round(subtotal, 2), "currency": cur}
 
+def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (List[Dict[str, Any]], Dict[str, Any]):
+    """
+    Siparişin items listesini /products ile eşleştirir:
+    - name: p.title/name -> item.name -> product_id fallback
+    - price/final_price: item'dakini kullan, yoksa p.final_price/price
+    """
+    items = list(order_doc.get("items") or [])
+    products = _fetch_products_via_api(request)
+    idx = _index_products_by_id(products)
+
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        pid = str(it.get("product_id") or it.get("id") or "").strip()
+        qty = int(it.get("qty") or it.get("quantity") or 0)
+        p = idx.get(pid)
+
+        name = (it.get("name") or it.get("title") or (p or {}).get("title") or (p or {}).get("name") or pid)
+        # fiyatı öncelik sırasıyla belirle
+        final_price = it.get("final_price")
+        price = it.get("price")
+        if final_price in (None, "", 0, 0.0) and p is not None:
+            final_price = p.get("final_price")
+        if (price in (None, "", 0, 0.0)) and p is not None:
+            price = p.get("price")
+
+        # image varsa taşıyalım (isteğe bağlı)
+        img = it.get("image_url")
+        if not img and p and isinstance(p.get("images"), list) and p["images"]:
+            img = p["images"][0]
+
+        out.append({
+            "product_id": pid,
+            "name": name,
+            "qty": qty,
+            "price": price,
+            "final_price": final_price,
+            "image_url": img
+        })
+
+    totals = order_doc.get("totals") or _calc_totals(out)
+    return out, totals
+
 
 def _build_customer(user_id: str) -> Dict[str, Any]:
     usnap = db.collection("users").document(user_id).get()
@@ -364,7 +405,7 @@ class AdminCancelRequest(BaseModel):
     reason: Optional[str] = None
 
 @admin_router.patch("/{order_id}/ship", summary="Siparişi 'shipped' yap ve e-posta gönder")
-async def mark_shipped(order_id: str, body: AdminShipRequest, admin: Dict = Depends(get_current_admin)):
+async def mark_shipped(order_id: str, body: AdminShipRequest,request: Request, admin: Dict = Depends(get_current_admin) ,):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -400,17 +441,18 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, admin: Dict = Depe
     # Mail
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
+    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
     to_email = _customer_email_from_order(merged)
+
     if to_email:
         try:
             html = tpl_shipped_html(
-                full_name,
-                order_id,
-                items=merged.get("items") or [],
-                totals=merged.get("totals") or {},
+                full_name, order_id,
+                items=items_enriched,
+                totals=totals_enriched,
                 address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
                 tracking_number=(merged.get("shipping") or {}).get("tracking_number", ""),
-                tracking_url=(merged.get("shipping") or {}).get("tracking_url"),  # varsa ekle
+                tracking_url=(merged.get("shipping") or {}).get("tracking_url"),
             )
             await mailer_send(
                 to=to_email,
@@ -419,14 +461,14 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, admin: Dict = Depe
                 sender_name="ICS",
             )
             ref.update({"email_flags.shipped_sent": True})
-        except Exception as e:
+        except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
     merged["id"] = order_id
     return merged
 
 @admin_router.patch("/{order_id}/deliver", summary="Siparişi 'delivered' yap ve e-posta gönder")
-async def mark_delivered(order_id: str, admin: Dict = Depends(get_current_admin)):
+async def mark_delivered(order_id: str,request: Request, admin: Dict = Depends(get_current_admin),):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -456,13 +498,14 @@ async def mark_delivered(order_id: str, admin: Dict = Depends(get_current_admin)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
+    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
+
     if to_email:
         try:
             html = tpl_delivered_html(
-                full_name,
-                order_id,
-                items=merged.get("items") or [],
-                totals=merged.get("totals") or {},
+                full_name, order_id,
+                items=items_enriched,
+                totals=totals_enriched,
                 address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
             )
             await mailer_send(
@@ -472,14 +515,14 @@ async def mark_delivered(order_id: str, admin: Dict = Depends(get_current_admin)
                 sender_name="ICS",
             )
             ref.update({"email_flags.delivered_sent": True})
-        except Exception as e:
+        except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
     merged["id"] = order_id
     return merged
 
 @admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap ve e-posta gönder")
-async def cancel_order(order_id: str, body: AdminCancelRequest, admin: Dict = Depends(get_current_admin)):
+async def cancel_order(order_id: str, body: AdminCancelRequest,    request: Request,  admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -508,14 +551,15 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, admin: Dict = De
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
+    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
+
     if to_email:
         try:
             html = tpl_canceled_html(
-                full_name,
-                order_id,
+                full_name, order_id,
                 reason=body.reason,
-                items=merged.get("items") or [],
-                totals=merged.get("totals") or {},
+                items=items_enriched,
+                totals=totals_enriched,
                 address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
             )
             await mailer_send(
@@ -525,7 +569,7 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, admin: Dict = De
                 sender_name="ICS",
             )
             ref.update({"email_flags.canceled_sent": True})
-        except Exception as e:
+        except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
     merged["id"] = order_id

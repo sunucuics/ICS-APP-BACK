@@ -38,18 +38,24 @@ class Settings(BaseSettings):
     iyzico_base_url: str = Field("https://sandbox-api.iyzipay.com", env="IYZICO_BASE_URL")
 
     # App misc
+    # App misc
     debug: bool = Field(False, env="DEBUG")
     allowed_origins: str = Field("*", env="ALLOWED_ORIGINS")
     firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
 
-    # Mail
+    # Mail  ✅ ENV bağlama eklendi + opsiyonel alanlar
     delete_account_secret: Optional[str] = None
-    smtp_host: str = "localhost"
-    smtp_port: int = 465
-    smtp_user: Optional[str] = None
-    smtp_password: Optional[str] = None
-    smtp_from: Optional[str] = None
-    smtp_use_starttls: bool = False  # 587 için true
+    smtp_host: str = Field("localhost", env="SMTP_HOST")
+    smtp_port: int = Field(465, env="SMTP_PORT")
+    smtp_user: Optional[str] = Field(None, env="SMTP_USER")
+    smtp_password: Optional[str] = Field(None, env="SMTP_PASSWORD")
+    smtp_from: Optional[str] = Field(None, env="SMTP_FROM")
+    smtp_use_starttls: bool = Field(False, env="SMTP_USE_STARTTLS")
+    email_debug: bool = Field(False, env="EMAIL_DEBUG")
+    brand_name: Optional[str] = Field("ICS", env="BRAND_NAME")
+    frontend_base_url: Optional[str] = Field("", env="FRONTEND_BASE_URL")
+
+    debug_mail_token: Optional[str] = Field(None, env="DEBUG_MAIL_TOKEN")
 
 
 
