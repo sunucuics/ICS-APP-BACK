@@ -1,4 +1,4 @@
-# backend/app/routers/paytr.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -7,50 +7,51 @@ import hmac
 import base64
 import hashlib
 import ipaddress
-from typing import List, Optional
+from decimal import Decimal
+from typing import List, Optional, Dict, Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, validator, EmailStr
+from firebase_admin import firestore
+
+from backend.app.config import db  # Firestore client (initialize elsewhere)
 
 router = APIRouter(prefix="/paytr", tags=["paytr"])
 
-# --- ENV (testte 1, canlıda 0) ---
+# =========================== ENV ===========================
 PAYTR_MERCHANT_ID = os.getenv("PAYTR_MERCHANT_ID", "")
 PAYTR_MERCHANT_KEY = os.getenv("PAYTR_MERCHANT_KEY", "")
 PAYTR_MERCHANT_SALT = os.getenv("PAYTR_MERCHANT_SALT", "")
 PAYTR_OK_URL = os.getenv("PAYTR_OK_URL", "https://example.com/payment/success")
 PAYTR_FAIL_URL = os.getenv("PAYTR_FAIL_URL", "https://example.com/payment/fail")
-PAYTR_TEST_MODE = os.getenv("PAYTR_TEST_MODE", "1")  # "1" or "0"
+PAYTR_TEST_MODE = "1" if os.getenv("PAYTR_TEST_MODE", "1") in ("1", "true", "True") else "0"
 
 PAYTR_TOKEN_URL = "https://www.paytr.com/odeme/api/get-token"
 PAYTR_IFRAME_URL = "https://www.paytr.com/odeme/guvenli/{}"
 
-
-# ----------------------------- Schemas -----------------------------
-
+# ========================== Schemas =========================
 class BasketItem(BaseModel):
     name: str = Field(..., max_length=100)
     price: float  # örn 18.00
     quantity: int = Field(..., ge=1)
 
-
 class CreateTokenIn(BaseModel):
-    merchant_oid: str = Field(..., max_length=64)        # benzersiz sipariş no
+    merchant_oid: str = Field(..., max_length=64)  # benzersiz sipariş no
     email: EmailStr
     user_name: str = Field(..., max_length=60)
     user_address: str = Field(..., max_length=400)
     user_phone: str = Field(..., max_length=20)
-    payment_amount: float                                  # örn 34.56
-    currency: str = "TL"                                   # TL/TRY, USD, EUR, GBP, RUB
+    payment_amount: float                          # örn 34.56 (TL)
+    currency: str = "TL"                           # TL/TRY, USD, EUR, GBP, RUB
     basket: List[BasketItem]
-    user_ip: Optional[str] = None                          # gönderilmezse sunucudan alınır
-    no_installment: int = 0                                # 0|1
-    max_installment: int = 0                               # 0,2..12
-    timeout_limit: int = 30                                # dakika
-    lang: str = "tr"                                       # tr|en
-    debug_on: int = 1                                      # testte 1
+    user_ip: Optional[str] = None                  # gönderilmezse sunucudan alınır
+    no_installment: int = 0                        # 0|1
+    max_installment: int = 0                       # 0,2..12
+    timeout_limit: int = 30                        # dakika
+    lang: str = "tr"                               # tr|en
+    debug_on: int = 1                              # testte 1
 
     @validator("payment_amount")
     def _gt_zero(cls, v: float) -> float:
@@ -83,14 +84,11 @@ class CreateTokenIn(BaseModel):
                 raise ValueError("user_ip invalid")
         return v
 
-
 class CreateTokenOut(BaseModel):
     token: str
     iframe_url: str
 
-
-# ----------------------------- Helpers -----------------------------
-
+# ======================== Helpers ===========================
 def _require_env() -> None:
     if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
         raise HTTPException(500, "PAYTR credentials missing in environment")
@@ -98,7 +96,6 @@ def _require_env() -> None:
 def _client_ip(req: Request, override: Optional[str]) -> str:
     if override:
         return override.split(",")[0].strip()
-    # yaygın header zinciri
     for h in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
         v = req.headers.get(h)
         if v:
@@ -106,7 +103,7 @@ def _client_ip(req: Request, override: Optional[str]) -> str:
     return (req.client.host or "").split(",")[0].strip()
 
 def _basket_to_base64(basket: List[BasketItem]) -> str:
-    # Dokümandaki format: [['Ürün', '18.00', 1], ...] → base64(JSON)
+    # format: [['Ürün', '18.00', 1], ...] → base64(JSON)
     arr = [[it.name, f"{it.price:.2f}", it.quantity] for it in basket]
     js = json.dumps(arr, ensure_ascii=False, separators=(",", ":"))
     return base64.b64encode(js.encode("utf-8")).decode()
@@ -114,9 +111,11 @@ def _basket_to_base64(basket: List[BasketItem]) -> str:
 def _hmac_b64_sha256(key: str, msg: bytes) -> str:
     return base64.b64encode(hmac.new(key.encode(), msg, hashlib.sha256).digest()).decode()
 
+def _s(d: Dict[str, Any], key: str) -> str:
+    v = d.get(key)
+    return "" if v is None else str(v)
 
-# ------------------------- 1) Token Oluştur -------------------------
-
+# ================== 1) iFrame Token Oluştur =================
 @router.post("/token", response_model=CreateTokenOut)
 async def create_token(payload: CreateTokenIn, request: Request):
     """
@@ -128,7 +127,7 @@ async def create_token(payload: CreateTokenIn, request: Request):
     if not user_ip:
         raise HTTPException(400, "user_ip required")
 
-    # PayTR payment_amount = int(kuruş)
+    # PayTR payment_amount kuruş cinsinden (int)
     payment_amount_int = int(round(payload.payment_amount * 100))
     if payment_amount_int <= 0:
         raise HTTPException(400, "payment_amount must be > 0")
@@ -142,6 +141,7 @@ async def create_token(payload: CreateTokenIn, request: Request):
         f"{payload.max_installment}{payload.currency}{PAYTR_TEST_MODE}"
     ).encode()
 
+    # DİKKAT: Token için SALT kullanılmaz (yalnızca callback doğrulamasında kullanılır)
     paytr_token_hmac = _hmac_b64_sha256(PAYTR_MERCHANT_KEY, hash_str + PAYTR_MERCHANT_SALT.encode())
 
     data = {
@@ -151,7 +151,7 @@ async def create_token(payload: CreateTokenIn, request: Request):
         "email": payload.email,
         "payment_amount": payment_amount_int,
         "paytr_token": paytr_token_hmac,
-        "user_basket": user_basket_b64,     # string olarak
+        "user_basket": user_basket_b64,
         "debug_on": payload.debug_on,
         "no_installment": payload.no_installment,
         "max_installment": payload.max_installment,
@@ -180,22 +180,22 @@ async def create_token(payload: CreateTokenIn, request: Request):
     token = res["token"]
     return CreateTokenOut(token=token, iframe_url=PAYTR_IFRAME_URL.format(token))
 
-
-# --------------- 2) Callback (Bildirim URL / IPN) -------------------
-
+# ============ 2) Callback (Bildirim URL / IPN) =============
 @router.post("/callback", response_class=PlainTextResponse)
 async def paytr_callback(request: Request):
     """
-    PayTR ödeme sonucu bildirimi (asenkron). "OK" dönülmezse PayTR tekrar dener.
+    PAYTR ödeme sonucu bildirimi (server-side). Başarılı işlemde yalnızca 'OK' dön.
     Doğrulama: base64(hmac_sha256(merchant_oid + merchant_salt + status + total_amount, merchant_key))
     """
     _require_env()
 
     form = await request.form()
-    merchant_oid = form.get("merchant_oid", "")
-    status_ = form.get("status", "")               # "success" | "failed"
-    total_amount = form.get("total_amount", "")    # "3456" (kuruş string)
-    given_hash = form.get("hash", "")
+    post: Dict[str, Any] = dict(form)
+
+    merchant_oid = _s(post, "merchant_oid")
+    status_      = _s(post, "status")          # "success" | "failed"
+    total_amount = _s(post, "total_amount")    # x100 (ör. 34.56 TL => "3456")
+    given_hash   = _s(post, "hash")
 
     calc = base64.b64encode(
         hmac.new(
@@ -206,14 +206,64 @@ async def paytr_callback(request: Request):
     ).decode()
 
     if calc != given_hash:
-        # Hatalı doğrulamada "OK" göndermiyoruz; PayTR yeniden dener.
+        # "OK" DÖNME! PayTR tekrar dener; sipariş sonuçlanmaz.
         return PlainTextResponse("BAD HASH", status_code=200)
 
-    # --- İş akışı (örnek) ---
-    # 1) order = Orders.get_by_oid(merchant_oid)
-    # 2) if int(total_amount) == int(order.total * 100):
-    # 3)   if status_ == "success": order.set_paid(); stok/kargo/mail tetikle
-    #      else: order.set_failed(reason=...)
-    # 4) işlemleri idempotent yap (aynı bildirim tekrar gelirse zarar vermesin)
+    # ---------- İdempotent sipariş güncelle ----------
+    order_ref = db.collection("orders").document(merchant_oid)
+    snap = order_ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        if (data.get("payment", {}).get("provider") == "paytr" and
+            data.get("payment", {}).get("status") in {"paid", "failed"}):
+            # Zaten sonuçlanmış -> tekrar işlem yapmadan OK
+            return PlainTextResponse("OK", status_code=200)
 
+    # Opsiyonel: beklenen tutarla karşılaştırma (kuruş bazında)
+    # expected_cents = int(round((snap.to_dict() or {}).get("total_amount", 0) * 100)) if snap.exists else None
+    # if expected_cents is not None and expected_cents != int(total_amount or "0"):
+    #     # Uyuşmazlık: yine de OK politikası bozulmasın; kayıt altına alın.
+    #     pass
+
+    paytr_info = {
+        "merchant_oid": merchant_oid,
+        "status": status_,
+        "total_amount": (Decimal(total_amount) / Decimal(100)) if total_amount else Decimal("0"),
+        "failed_reason_code": _s(post, "failed_reason_code"),
+        "failed_reason_msg": _s(post, "failed_reason_msg"),
+        "payment_type": _s(post, "payment_type"),
+        "currency": _s(post, "currency"),
+        "payment_amount_sent": (Decimal(_s(post, "payment_amount")) / Decimal(100))
+                               if _s(post, "payment_amount") else None,
+        "test_mode": _s(post, "test_mode") in {"1", "true", "True"},
+        "raw": None,  # hassas veri saklamamak için kapattık; istersen post bırakabilirsin.
+    }
+
+    if status_ == "success":
+        updates = {
+            "status": "paid",
+            "payment": {
+                "provider": "paytr",
+                "status": "paid",
+                "received_total": paytr_info["total_amount"],
+                "currency": paytr_info["currency"] or "TL",
+                "payment_type": paytr_info["payment_type"] or "card",
+                "reported_at": firestore.SERVER_TIMESTAMP,
+                "paytr": paytr_info,
+            },
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+    else:
+        updates = {
+            "status": "payment_failed",
+            "payment": {
+                "provider": "paytr",
+                "status": "failed",
+                "reported_at": firestore.SERVER_TIMESTAMP,
+                "paytr": paytr_info,
+            },
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+
+    order_ref.set(updates, merge=True)
     return PlainTextResponse("OK", status_code=200)
