@@ -9,7 +9,8 @@ import hashlib
 import ipaddress
 from decimal import Decimal
 from typing import List, Optional, Dict, Any
-
+import time
+from functools import lru_cache
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -32,6 +33,7 @@ PAYTR_TOKEN_URL = "https://www.paytr.com/odeme/api/get-token"
 PAYTR_IFRAME_URL = "https://www.paytr.com/odeme/guvenli/{}"
 
 # ========================== Schemas =========================
+
 class BasketItem(BaseModel):
     name: str = Field(..., max_length=100)
     price: float  # örn 18.00
@@ -88,7 +90,55 @@ class CreateTokenOut(BaseModel):
     token: str
     iframe_url: str
 
+class QuoteOut(BaseModel):
+    amount: float
+    currency: str = "TL"
+    offers: Dict[str, Dict[str, Dict[str, float]]]  # bank -> months(str) -> {monthly,total,rate}
+
+class QuoteParams(BaseModel):
+    amount: float = Field(..., gt=0, description="TL cinsinden")
+    # örn: sadece 3/6/9 istiyorsan [3,6,9] gönder; boşsa rates ne dönerse onu işleriz
+    months: Optional[List[int]] = None
+
+
 # ======================== Helpers ===========================
+
+PAYTR_RATES_URL = "https://www.paytr.com/odeme/taksit-oranlari"
+
+def _hmac_b64_sha256_bytes(key_bytes: bytes, msg: bytes) -> str:
+    return base64.b64encode(hmac.new(key_bytes, msg, hashlib.sha256).digest()).decode()
+
+@lru_cache(maxsize=1)
+def _cached_rates(ts_bucket: int) -> Dict[str, Any]:
+    """
+    PayTR taksit oranlarını getirir. lru_cache ile basit 1 saat cache.
+    """
+    if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
+        raise RuntimeError("PAYTR credentials missing")
+
+    request_id = str(int(time.time()))
+    msg = f"{PAYTR_MERCHANT_ID}{request_id}{PAYTR_MERCHANT_SALT}".encode("utf-8")
+    paytr_token = _hmac_b64_sha256_bytes(PAYTR_MERCHANT_KEY.encode("utf-8"), msg)
+
+    data = {
+        "merchant_id": PAYTR_MERCHANT_ID,
+        "request_id": request_id,
+        "paytr_token": paytr_token,
+    }
+
+    import requests  # httpx sync gerekirken burada requests basit olsun
+    r = requests.post(PAYTR_RATES_URL, data=data, timeout=15)
+    r.raise_for_status()
+    res = r.json()
+    if res.get("status") != "success":
+        raise RuntimeError(f"PAYTR rates error: {res.get('err_no')} {res.get('err_msg')}")
+    return res
+
+def get_rates_cached() -> Dict[str, Any]:
+    # 1 saatlik kova (cache anahtarı)
+    bucket = int(time.time() // 3600)
+    return _cached_rates(bucket)
+
 def _require_env() -> None:
     if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
         raise HTTPException(500, "PAYTR credentials missing in environment")
@@ -114,6 +164,17 @@ def _hmac_b64_sha256(key: str, msg: bytes) -> str:
 def _s(d: Dict[str, Any], key: str) -> str:
     v = d.get(key)
     return "" if v is None else str(v)
+
+
+def compute_monthly_total(amount_tl: float, total_rate_percent: float, months: int) -> Dict[str, float]:
+    """
+    Basit hesap: toplam = tutar * (1 + oran/100); aylık = toplam / ay
+    Banka/hesap tanımına göre farklı bir alan dönüyorsa buna göre güncellersin.
+    """
+    total = round(amount_tl * (1.0 + (total_rate_percent or 0.0) / 100.0), 2)
+    monthly = round(total / max(1, months), 2)
+    return {"monthly": monthly, "total": total}
+
 
 # ================== 1) iFrame Token Oluştur =================
 @router.post("/token", response_model=CreateTokenOut)
@@ -267,3 +328,56 @@ async def paytr_callback(request: Request):
 
     order_ref.set(updates, merge=True)
     return PlainTextResponse("OK", status_code=200)
+
+
+# ============ 0) Installment quote (frontend'in kullanacağı) ============
+@router.get("/installment/quote", response_model=QuoteOut)
+async def installment_quote(amount: float, months: Optional[str] = None):
+    """
+    Frontend: /paytr/installment/quote?amount=349.90&months=3,6,9,12
+    Dönen JSON: bankalara göre 3/6/9/12 aylık & toplam tutarlar
+    """
+    try:
+        rates = get_rates_cached()
+    except Exception as e:
+        raise HTTPException(502, f"PAYTR rates error: {e}")
+
+    # months parse
+    wanted_months: Optional[List[int]] = None
+    if months:
+        try:
+            wanted_months = [int(x) for x in months.split(",") if x.strip()]
+        except Exception:
+            raise HTTPException(400, "invalid months query (use e.g. months=3,6,9,12)")
+
+    offers: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+    # Örnek beklenen yapı (değişebilir): rates['data'][bank_code]['installments'][ '3': 9.57, '6': 15.68, ... ]
+    data = rates.get("data") or rates  # hesabına göre kök değişebiliyor
+
+    for bank, payload in (data or {}).items():
+        installments = payload.get("installments") or payload  # farklı şema olasılığı
+        bank_offers: Dict[str, Dict[str, float]] = {}
+        # Her taksit adedini gez
+        for m_key, rate in (installments or {}).items():
+            try:
+                m = int(m_key)
+            except Exception:
+                continue
+            if wanted_months and m not in wanted_months:
+                continue
+            # rate yüzdesi float gibi kabul ediyoruz
+            try:
+                r = float(rate)
+            except Exception:
+                r = 0.0
+            vals = compute_monthly_total(amount, r, m)
+            vals["rate"] = round(r, 4)
+            bank_offers[str(m)] = vals
+        if bank_offers:
+            offers[bank] = bank_offers
+
+    if not offers:
+        raise HTTPException(404, "no installment offers")
+
+    return QuoteOut(amount=round(float(amount), 2), currency="TL", offers=offers)

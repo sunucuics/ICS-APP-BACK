@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>PayTR Direct API – Test Formu</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;max-width:720px;margin:24px auto;padding:0 12px;line-height:1.45}
+    .row{margin-bottom:10px;display:flex;gap:8px}
+    .col{flex:1}
+    input,select,button{padding:10px;width:100%;box-sizing:border-box}
+    fieldset{border:1px solid #e5e5e5;border-radius:8px;padding:12px;margin:0 0 16px}
+    legend{padding:0 6px;color:#666}
+    .hint{color:#777;font-size:13px}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <h2>PayTR Direct API – Test Ödeme</h2>
+  <p class="hint">
+    Bu sayfa <strong>test</strong> içindir. Kart verileri, Direct API gereği <strong>doğrudan PayTR'a</strong> gönderilir;
+    sunucunuza uğramaz. Formdaki gizli alanlar, sayfa açılınca
+    <code>/paytr/direct/init</code>'ten alınır. :contentReference[oaicite:2]{index=2}
+  </p>
+
+  <!-- Kullanıcının göreceği alanlar -->
+  <fieldset>
+    <legend>Sipariş</legend>
+    <div class="row">
+      <div class="col">
+        <label>Order No (merchant_oid)
+          <input id="o_merchant_oid" value="ORDER123" autocomplete="off">
+        </label>
+      </div>
+      <div class="col">
+        <label>Tutar (TL)
+          <input id="o_amount" type="number" step="0.01" value="349.90">
+        </label>
+      </div>
+      <div class="col">
+        <label>Taksit
+          <select id="o_installment">
+            <option value="0">Tek Çekim (0)</option>
+            <option value="2">2 Taksit</option>
+            <option value="3">3 Taksit</option>
+            <option value="6" selected>6 Taksit</option>
+            <option value="9">9 Taksit</option>
+            <option value="12">12 Taksit</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>Müşteri E-posta
+          <input id="o_email" value="customer@example.com">
+        </label>
+      </div>
+      <div class="col">
+        <label>İsim Soyisim
+          <input id="o_name" value="Ali Koyuncu">
+        </label>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>Adres
+          <input id="o_address" value="İstanbul, Türkiye">
+        </label>
+      </div>
+      <div class="col">
+        <label>Telefon
+          <input id="o_phone" value="+905321234567">
+        </label>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col"><button id="btnInit" type="button">Form Alanlarını /direct/init ile Yükle</button></div>
+    </div>
+    <p class="hint">
+      İsterseniz “BIN Sorgulama + Taksit Oranları” akışıyla kart ailesini (<code>card_type</code>) belirleyip
+      taksit seçeneklerini dinamik gösterebilirsiniz. :contentReference[oaicite:3]{index=3}
+    </p>
+  </fieldset>
+
+  <!-- PayTR'a gidecek gerçek form -->
+  <form id="paytrForm" method="post" action="https://www.paytr.com/odeme">
+    <!-- /paytr/direct/init cevap alanları (gizli) -->
+    <input type="hidden" name="merchant_id" id="merchant_id">
+    <input type="hidden" name="user_ip" id="user_ip">
+    <input type="hidden" name="merchant_oid" id="merchant_oid">
+    <input type="hidden" name="email" id="email">
+    <input type="hidden" name="payment_type" id="payment_type">
+    <input type="hidden" name="payment_amount" id="payment_amount">
+    <input type="hidden" name="currency" id="currency">
+    <input type="hidden" name="test_mode" id="test_mode">
+    <input type="hidden" name="non_3d" id="non_3d">
+    <input type="hidden" name="client_lang" id="client_lang">
+    <input type="hidden" name="merchant_ok_url" id="merchant_ok_url">
+    <input type="hidden" name="merchant_fail_url" id="merchant_fail_url">
+    <input type="hidden" name="user_name" id="user_name">
+    <input type="hidden" name="user_address" id="user_address">
+    <input type="hidden" name="user_phone" id="user_phone">
+    <input type="hidden" name="user_basket" id="user_basket">
+    <input type="hidden" name="debug_on" id="debug_on">
+    <input type="hidden" name="installment_count" id="installment_count">
+    <input type="hidden" name="paytr_token" id="paytr_token">
+    <input type="hidden" name="card_type" id="card_type"><!-- opsiyonel -->
+
+    <!-- Kart alanları (DOĞRUDAN PayTR'a gider) -->
+    <fieldset>
+      <legend>Kart Bilgileri (Test)</legend>
+      <div class="row">
+        <div class="col">
+          <label>Kart Üzerindeki İsim
+            <input name="cc_owner" value="PAYTR TEST" required>
+          </label>
+        </div>
+        <div class="col">
+          <label>Kart Numarası
+            <input name="card_number" value="9792030394440796" required>
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>SKT Ay
+            <input name="expiry_month" value="12" required>
+          </label>
+        </div>
+        <div class="col">
+          <label>SKT Yıl
+            <input name="expiry_year" value="30" required>
+          </label>
+        </div>
+        <div class="col">
+          <label>CVV
+            <input name="cvv" value="000" required>
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col"><button type="submit">PayTR’a Gönder ve Öde</button></div>
+      </div>
+      <p class="hint">Test kartlarını kullanın; canlı kart denemeyin. :contentReference[oaicite:4]{index=4}</p>
+    </fieldset>
+  </form>
+
+  <script>
+    async function loadInit() {
+      const payload = {
+        merchant_oid: document.getElementById('o_merchant_oid').value,
+        email: document.getElementById('o_email').value,
+        payment_amount: parseFloat(document.getElementById('o_amount').value || '0').toFixed(2),
+        payment_type: 'card',
+        installment_count: parseInt(document.getElementById('o_installment').value, 10),
+        currency: 'TL',
+        non_3d: 0,
+        client_lang: 'tr',
+        user_name: document.getElementById('o_name').value,
+        user_address: document.getElementById('o_address').value,
+        user_phone: document.getElementById('o_phone').value,
+        basket: [{ name: 'Örnek Ürün', price: parseFloat(document.getElementById('o_amount').value || '0'), quantity: 1 }],
+        card_type: 'bonus',   // İsterseniz BIN servisiyle dinamik belirleyin. :contentReference[oaicite:5]{index=5}
+        user_ip: null,
+        debug_on: 1
+      };
+
+      const res = await fetch('/paytr/direct/init', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        alert('Init başarısız');
+        return;
+      }
+      const data = await res.json();
+      const fields = data.fields || {};
+      for (const [k, v] of Object.entries(fields)) {
+        const el = document.getElementById(k);
+        if (el) el.value = v;
+      }
+      alert('Form alanları yüklendi. Şimdi “PayTR’a Gönder ve Öde”ye basabilirsiniz.');
+    }
+
+    document.getElementById('btnInit').addEventListener('click', loadInit);
+  </script>
+</body>
+</html>

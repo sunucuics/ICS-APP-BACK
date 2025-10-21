@@ -1,5 +1,5 @@
 # app/main.py
-from fastapi import FastAPI
+from fastapi import FastAPI , Request
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config import settings
 from backend.app.routers import (
@@ -17,11 +17,14 @@ from backend.app.routers import appointments as appointments_router
 from backend.app.routers import comments as comments_router
 from backend.app.routers import users as users_router
 from backend.app.routers import paytr
-
+from backend.app.payments.paytr_direct import router as paytr_direct_router
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Tek bir scheduler instance'ı oluştur
 scheduler = AsyncIOScheduler()
+templates = Jinja2Templates(directory="backend/app/templates")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -30,6 +33,11 @@ app = FastAPI(
     version="1.0.0",
     redirect_slashes=False
 )
+
+@app.get("/paytr/direct/form", response_class=HTMLResponse)
+def paytr_direct_form(request: Request):
+    # statik HTML ise Jinja şart değil; yine de Request gerekir
+    return templates.TemplateResponse("paytr_direct_form.html", {"request": request})
 
 # Configure CORS (allow front-end domain or all origins as specified)
 allow_origins = [origin.strip() for origin in settings.allowed_origins.split(',')] if settings.allowed_origins else ["*"]
@@ -44,9 +52,12 @@ app.add_middleware(
 # Include public routers
 app.include_router(auth.router)
 app.include_router(users.router)
-app.include_router(paytr.router)
+
+#app.include_router(paytr.router)
 
 app.include_router(categories_router.router)
+app.include_router(paytr_direct_router)
+
 app.include_router(products_router.router)
 app.include_router(services_router.router)
 app.include_router(carts.router)
