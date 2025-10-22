@@ -712,3 +712,22 @@ async def dev_create_order(_: Dict = Depends(get_current_admin)):
     }
     ref.set(payload)
     return {"id": ref.id, **payload}
+
+
+@admin_router.post("/_email-test", summary="SMTP health check (admin)")
+async def email_test(_: Dict = Depends(get_current_admin)):
+    """
+    SMTP yapılandırmasını ve port erişimini test etmek için baseline mail gönderir.
+    Konu: 'ICS SMTP Test' Gövde: basit HTML.
+    """
+    to = getattr(settings, "smtp_test_to", None) or getattr(settings, "smtp_from", None) or getattr(settings, "smtp_user", None)
+    if not to:
+        raise HTTPException(status_code=400, detail="smtp_test_to/smtp_from/smtp_user tanımlı değil")
+
+    html = "<h3>ICS SMTP Test</h3><p>Bu bir deneme mesajıdır.</p>"
+    try:
+        await mailer_send(to=to, subject="ICS SMTP Test", html=html, sender_name="ICS")
+        return {"ok": True, "to": to}
+    except Exception as e:
+        # İstisnayı döndür ki sebebi ekranda görülsün
+        raise HTTPException(status_code=502, detail=f"SMTP error: {e.__class__.__name__}: {e}")

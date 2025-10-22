@@ -1,6 +1,6 @@
 # backend/app/core/mailer.py
 from __future__ import annotations
-import asyncio, smtplib, ssl, logging, re, textwrap
+import asyncio, smtplib, ssl, logging, re, textwrap , socket
 from email.message import EmailMessage
 from typing import Optional
 from backend.app.config import settings
@@ -20,86 +20,117 @@ def _plain_from_html(html: str) -> str:
     return textwrap.dedent(txt).strip()
 
 async def mailer_send(
-    *, to: str, subject: str, html: str,
-    sender_name: Optional[str] = None, reply_to: Optional[str] = None
+    *,
+    to: str,
+    subject: str,
+    html: str,
+    sender_name: Optional[str] = None,
+    reply_to: Optional[str] = None
 ) -> None:
+    """
+    Güvenli ve dayanıklı SMTP gönderici.
+    - STARTTLS (587) ve SSL (465) akıllı seçim + otomatik 465 fallback.
+    - DNS/port preflight ile ağ sorunlarını hızlı teşhis eder.
+    - SMTP yanıt kodlarını yüzeye çıkarır; prod'da kolay debug için EMAIL_DEBUG ile ayrıntılı loglar verir.
+    """
     host = getattr(settings, "smtp_host", None)
     port = int(getattr(settings, "smtp_port", 0) or 0)
     user = getattr(settings, "smtp_user", None)
     pwd  = getattr(settings, "smtp_password", None)
     from_addr = getattr(settings, "smtp_from", None) or user
-    use_starttls = _as_bool(getattr(settings, "smtp_use_starttls", True))
-    email_debug  = _as_bool(getattr(settings, "email_debug", False))
-    if not (host and port and user and pwd and from_addr):
-        raise RuntimeError("SMTP config eksik: smtp_host/port/user/password/from ayarlarını doldurun.")
+    use_starttls = bool(str(getattr(settings, "smtp_use_starttls", True)).strip().lower() in {"1","true","yes","on"})
+    email_debug  = bool(str(getattr(settings, "email_debug", False)).strip().lower() in {"1","true","yes","on"})
 
+    # Konfigürasyon doğrulama
+    if not (host and port and user and pwd and from_addr):
+        raise RuntimeError(
+            f"SMTP config eksik: host={host} port={port} user={bool(user)} "
+            f"pwd={bool(pwd)} from={from_addr}"
+        )
+
+    # Mesaj kurulumu
     msg = EmailMessage()
     msg["To"] = to
     msg["From"] = f"{sender_name} <{from_addr}>" if sender_name else from_addr
     msg["Subject"] = subject
-    if reply_to: msg["Reply-To"] = reply_to
+    if reply_to:
+        msg["Reply-To"] = reply_to
+
+    # HTML + düz metin
+    def _plain_from_html(h: str) -> str:
+        # Basit, bağımsız bir düz metin dönüştürücü (mevcut helper yoksa)
+        import re, textwrap
+        txt = re.sub(r"<br\s*/?>", "\n", h, flags=re.I)
+        txt = re.sub(r"<[^>]+>", "", txt)
+        return textwrap.dedent(txt).strip()
+
     msg.set_content(_plain_from_html(html))
     msg.add_alternative(html, subtype="html")
 
-    def _send_blocking():
-        if email_debug:
-            log.info(
-                "[MAIL] host=%s port=%s starttls=%s from=%s to=%s subject=%s",
-                host, port, use_starttls, from_addr, to, subject
-            )
+    # Tek yerde TLS bağlamı
+    ctx = ssl.create_default_context()
 
-        ctx = ssl.create_default_context()
-
-        def _send_starttls(p: int):
-            with smtplib.SMTP(host, p, timeout=40) as s:
-                if email_debug:
-                    s.set_debuglevel(1)  # SMTP konuşmasını logla (DEBUG modda)
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.ehlo()
-                s.login(user, pwd)
-                s.send_message(msg)
-
-        def _send_ssl(p: int):
-            with smtplib.SMTP_SSL(host, p, context=ctx, timeout=40) as s:
-                if email_debug:
-                    s.set_debuglevel(1)
-                s.login(user, pwd)
-                s.send_message(msg)
-
-        # --- Preflight: hedef porta erişim var mı? (DNS/port/firewall ayrımı) ---
-        import socket
-        try:
-            sock = socket.create_connection((host, port), timeout=5)
-            sock.close()
-            primary_ok = True
-        except Exception as e:
-            primary_ok = False
+    def _send_starttls(_port: int):
+        with smtplib.SMTP(host, _port, timeout=40) as s:
             if email_debug:
-                log.warning("SMTP preflight failed host=%s port=%s err=%s", host, port, e)
+                s.set_debuglevel(1)
+            s.ehlo()
+            s.starttls(context=ctx)
+            s.ehlo()
+            s.login(user, pwd)
+            s.send_message(msg)
 
-        if not primary_ok:
-            # 587 kapalıysa genelde 465 açıktır; onu da yoklayalım
-            try:
-                sock = socket.create_connection((host, 465), timeout=5)
-                sock.close()
-                if email_debug:
-                    log.info("SMTP 465 reachable; forcing SSL:465 fallback")
-                _send_ssl(465)
-                return
-            except Exception as e2:
-                log.error("SMTP 465 preflight failed host=%s err=%s", host, e2)
-                # ikisi de başarısızsa yine de aşağıdaki ana akışa düşüp gerçek hatayı görelim
+    def _send_ssl(_port: int):
+        with smtplib.SMTP_SSL(host, _port, context=ctx, timeout=40) as s:
+            if email_debug:
+                s.set_debuglevel(1)
+            s.login(user, pwd)
+            s.send_message(msg)
 
-        # --- Normal akış + otomatik fallback ---
-        try:
+    # Preflight: verilen porta çıkış var mı?
+    if email_debug:
+        log.info("[MAIL] host=%s port=%s starttls=%s from=%s to=%s subject=%s",
+                 host, port, use_starttls, from_addr, to, subject)
+        log.info("[MAIL] preflight: %s:%s erişim denemesi…", host, port)
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        primary_reachable = True
+    except Exception as e:
+        primary_reachable = False
+        if email_debug:
+            log.warning("Preflight FAILED %s:%s → %s", host, port, e)
+
+    # Ana akış + fallback
+    try:
+        if primary_reachable:
+            # Port erişilebilir; doğru protokolle dene
             if use_starttls and port != 465:
                 _send_starttls(port)
             else:
                 _send_ssl(port or 465)
-        except (ConnectionRefusedError, TimeoutError, OSError) as e:
-            log.warning("SMTP %s:%s unreachable (%s). Falling back to SSL:465", host, port, e)
+        else:
+            # Verilen port kapalıysa önce 465 SSL deneriz
+            if email_debug:
+                log.info("Primary port unreachable. Trying SSL:465 fallback…")
+            sock = socket.create_connection((host, 465), timeout=5)
+            sock.close()
             _send_ssl(465)
+    except (ConnectionRefusedError, TimeoutError, OSError) as e:
+        # Ağ tabanlı hatalarda doğrudan 465'e düş
+        if email_debug:
+            log.warning("SMTP %s:%s unreachable (%s). Forcing SSL:465…", host, port, e)
+        _send_ssl(465)
+    except smtplib.SMTPResponseException as e:
+        # Sunucu yanıt kodu/hatasını yüzeye çıkar
+        code = getattr(e, "smtp_code", None)
+        err  = getattr(e, "smtp_error", None)
+        log.error("SMTP response error: code=%s msg=%s", code, err)
+        raise
+    except Exception:
+        log.exception("SMTP unknown error")
+        raise
+
 
 
 # -------- HTML ŞABLONLARI --------
