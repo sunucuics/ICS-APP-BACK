@@ -128,6 +128,70 @@ def _merge_doc_id(doc_snap) -> Dict[str, Any]:
     data["id"] = doc_snap.id
     return data
 
+def _get_product_via_api(request: Request, product_id: str) -> Optional[Dict[str, Any]]:
+    base = str(request.base_url).rstrip("/")
+    headers = {}
+    auth = request.headers.get("authorization")
+    if auth: headers["Authorization"] = auth
+    for url in (f"{base}/products/{product_id}", f"{base}/products/?id={product_id}"):
+        try:
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and str(data.get("id", "")) == str(product_id):
+                    return data
+                if isinstance(data, list):
+                    for p in data:
+                        if str(p.get("id","")) == str(product_id):
+                            return p
+        except Exception:
+            pass
+    return None
+
+def _parse_money(v) -> float:
+    try:
+        s = str(v).strip().replace(",", ".")
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
+def _unit_price_from_product(p: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(p, dict): return 0.0
+    for key in ("final_price", "price"):
+        val = _parse_money(p.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def _get_product_from_db(product_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        q = db.collection_group("items").where(FieldPath.document_id(), "==", product_id)
+        for snap in q.stream():
+            d = snap.to_dict() or {}
+            d["id"] = snap.id
+            return d
+    except Exception:
+        pass
+    return None
+
+def _fetch_products_current(request: Request, ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    wanted = [pid for pid in set(ids) if pid]
+    if not wanted: return out
+    for pid in wanted:
+        p = _get_product_via_api(request, pid)
+        if p: out[pid] = p
+    missing = [pid for pid in wanted if pid not in out]
+    for pid in missing:
+        p = _get_product_from_db(pid)
+        if p: out[pid] = p
+    still = [pid for pid in wanted if pid not in out]
+    if still:
+        out.update(_fetch_products_by_ids_from_db(still))
+    return out
+
+
 def _ensure_transition(current: str, target: str):
     valid = {
         "preparing": {"shipped", "canceled"},
@@ -250,55 +314,38 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
         return []
 
     # 3) Ürün indeksini kur (API + DB fallback)
+    # ... items_raw vs toplandıktan sonra:
     wanted_ids: set[str] = set()
     for it in items_raw:
         pid = str((it or {}).get("product_id") or (it or {}).get("id") or "").strip()
-        if pid:
-            wanted_ids.add(pid)
-    catalog = _product_index(wanted_ids, request)  # _product_index ve _unit_price_from_product yardımcıları gerekir.
+        if pid: wanted_ids.add(pid)
 
-    # 4) Zenginleştirilmiş satırlar
-    out: List[Dict[str, Any]] = []
+    catalog = _fetch_products_current(request, wanted_ids)
+
+    out = []
     for it in items_raw:
         pid = str((it or {}).get("product_id") or (it or {}).get("id") or "").strip()
         qty = int((it or {}).get("qty") or (it or {}).get("quantity") or 0)
-        if not pid or qty <= 0:
-            continue
-
+        if not pid or qty <= 0: continue
         p = catalog.get(pid)
 
-        # İsim önceliği: product.title/name -> item.name -> pid
         name = (
-            (p or {}).get("title")
-            or (p or {}).get("name")
-            or (it or {}).get("name")
-            or pid
+                (p or {}).get("title") or (p or {}).get("name") or (p or {}).get("label")
+                or (it or {}).get("name") or (it or {}).get("title")
+                or (p or {}).get("sku") or pid
         )
 
-        # Fiyat önceliği: product.final_price > 0 -> product.price > 0 -> item.final_price/price -> 0
         unit = _unit_price_from_product(p)
         if unit <= 0:
-            try:
-                unit = float((it or {}).get("final_price") or (it or {}).get("price") or 0)
-            except Exception:
-                unit = 0.0
+            unit = _parse_money((it or {}).get("final_price") or (it or {}).get("price"))
 
-        # Görsel: product.images[0] -> item.image_url -> None
         img = None
         if p and isinstance(p.get("images"), list) and p["images"]:
             img = p["images"][0]
         elif (it or {}).get("image_url"):
             img = it["image_url"]
 
-        out.append({
-            "product_id": pid,
-            "name": name,
-            "qty": qty,
-            "price": unit,        # toplamlar için birim fiyat
-            "final_price": unit,  # final_price alanını da dolduruyoruz
-            "image_url": img
-        })
-
+        out.append({"product_id": pid, "name": name, "qty": qty, "price": unit, "final_price": unit, "image_url": img})
     return out
 
 
@@ -321,38 +368,30 @@ def _calc_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (List[Dict[str, Any]], Dict[str, Any]):
     items = list(order_doc.get("items") or [])
     wanted_ids = {str((it or {}).get("product_id") or (it or {}).get("id") or "").strip() for it in items}
-    idx = _product_index({pid for pid in wanted_ids if pid}, request)
+    idx = _fetch_products_current(request, {pid for pid in wanted_ids if pid})
 
-    out: List[Dict[str, Any]] = []
+    out = []
     for it in items:
         pid = str(it.get("product_id") or it.get("id") or "").strip()
         qty = int(it.get("qty") or it.get("quantity") or 0)
         p = idx.get(pid)
 
-        name = (it.get("name") or it.get("title") or (p or {}).get("title") or (p or {}).get("name") or pid)
+        name = (
+                (p or {}).get("title") or (p or {}).get("name") or (p or {}).get("label")
+                or it.get("name") or it.get("title")
+                or (p or {}).get("sku") or pid
+        )
 
-        # fiyatları final_price>0 -> price -> item içi fallback
         unit = _unit_price_from_product(p)
         if unit <= 0:
-            try:
-                unit = float(it.get("final_price") or it.get("price") or 0)
-            except Exception:
-                unit = 0.0
+            unit = _parse_money(it.get("final_price") or it.get("price"))
 
         img = it.get("image_url")
         if not img and p and isinstance(p.get("images"), list) and p["images"]:
             img = p["images"][0]
 
-        out.append({
-            "product_id": pid,
-            "name": name,
-            "qty": qty,
-            "price": unit,
-            "final_price": unit,
-            "image_url": img
-        })
+        out.append({"product_id": pid, "name": name, "qty": qty, "price": unit, "final_price": unit, "image_url": img})
 
-    # DOC totals 0'sa (veya yoksa) yeniden hesapla
     tdoc = order_doc.get("totals") or {}
     try:
         grand_in_doc = float(tdoc.get("grand_total", -1))
@@ -360,7 +399,6 @@ def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (Lis
         grand_in_doc = -1
     totals = _calc_totals(out) if (grand_in_doc <= 0) else tdoc
     return out, totals
-
 
 
 def _build_customer(user_id: str) -> Dict[str, Any]:
@@ -508,7 +546,7 @@ class AdminCancelRequest(BaseModel):
     reason: Optional[str] = None
 
 @admin_router.patch("/{order_id}/ship", summary="Siparişi 'shipped' yap ve e-posta gönder")
-async def mark_shipped(order_id: str, body: AdminShipRequest,request: Request, admin: Dict = Depends(get_current_admin) ,):
+async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -541,25 +579,22 @@ async def mark_shipped(order_id: str, body: AdminShipRequest,request: Request, a
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail
+    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
-    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
     to_email = _customer_email_from_order(merged)
 
     if to_email:
         try:
             html = tpl_shipped_html(
-                full_name, order_id,
-                items=items_enriched,
-                totals=totals_enriched,
-                address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
+                full_name,
+                order_id,
                 tracking_number=(merged.get("shipping") or {}).get("tracking_number", ""),
                 tracking_url=(merged.get("shipping") or {}).get("tracking_url"),
             )
             await mailer_send(
                 to=to_email,
-                subject=f"#{order_id} siparişiniz kargoya verildi",
+                subject="Siparişiniz kargoya verildi",
                 html=html,
                 sender_name="ICS",
             )
@@ -570,8 +605,9 @@ async def mark_shipped(order_id: str, body: AdminShipRequest,request: Request, a
     merged["id"] = order_id
     return merged
 
+
 @admin_router.patch("/{order_id}/deliver", summary="Siparişi 'delivered' yap ve e-posta gönder")
-async def mark_delivered(order_id: str,request: Request, admin: Dict = Depends(get_current_admin),):
+async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -597,23 +633,17 @@ async def mark_delivered(order_id: str,request: Request, admin: Dict = Depends(g
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail
+    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
-    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
 
     if to_email:
         try:
-            html = tpl_delivered_html(
-                full_name, order_id,
-                items=items_enriched,
-                totals=totals_enriched,
-                address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
-            )
+            html = tpl_delivered_html(full_name, order_id)
             await mailer_send(
                 to=to_email,
-                subject=f"#{order_id} siparişiniz teslim edildi",
+                subject="Siparişiniz teslim edildi",
                 html=html,
                 sender_name="ICS",
             )
@@ -624,8 +654,9 @@ async def mark_delivered(order_id: str,request: Request, admin: Dict = Depends(g
     merged["id"] = order_id
     return merged
 
+
 @admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap ve e-posta gönder")
-async def cancel_order(order_id: str, body: AdminCancelRequest,    request: Request,  admin: Dict = Depends(get_current_admin)):
+async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
     ref = db.collection("orders").document(order_id)
 
@@ -650,24 +681,17 @@ async def cancel_order(order_id: str, body: AdminCancelRequest,    request: Requ
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail
+    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
-    items_enriched, totals_enriched = _enrich_items_for_email(merged, request)
 
     if to_email:
         try:
-            html = tpl_canceled_html(
-                full_name, order_id,
-                reason=body.reason,
-                items=items_enriched,
-                totals=totals_enriched,
-                address=(customer.get("address") if isinstance(customer.get("address"), dict) else None),
-            )
+            html = tpl_canceled_html(full_name, order_id, reason=body.reason)
             await mailer_send(
                 to=to_email,
-                subject=f"#{order_id} siparişiniz iptal edildi",
+                subject="Siparişiniz iptal edildi",
                 html=html,
                 sender_name="ICS",
             )
@@ -677,6 +701,7 @@ async def cancel_order(order_id: str, body: AdminCancelRequest,    request: Requ
 
     merged["id"] = order_id
     return merged
+
 
 @admin_router.delete("/{order_id}", summary="Siparişi soft delete yap (is_deleted=true)")
 async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):

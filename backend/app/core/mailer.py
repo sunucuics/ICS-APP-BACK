@@ -156,8 +156,13 @@ def _fmt_money(v: float) -> str:
     return f"{s} {_currency_symbol()}"
 
 def _to_float(v) -> float:
-    try: return float(v)
-    except Exception: return 0.0
+    try:
+        if v is None: return 0.0
+        s = str(v).strip().replace(",", ".")
+        return float(s or 0)
+    except Exception:
+        return 0.0
+
 
 def _unit_price(item: dict) -> float:
     # final_price > 0 ise onu kullan, değilse price'a düş
@@ -245,9 +250,9 @@ def _address_block(address: Optional[dict]) -> str:
 def tpl_shipped_html(
     customer_name: str,
     order_id: str,
-    items: Optional[list] = None,
-    totals: Optional[dict] = None,
-    address: Optional[dict] = None,
+    items: Optional[list] = None,     # artık kullanılmıyor
+    totals: Optional[dict] = None,    # artık kullanılmıyor
+    address: Optional[dict] = None,   # artık kullanılmıyor
     tracking_number: str = "",
     tracking_url: Optional[str] = None,
 ) -> str:
@@ -257,23 +262,22 @@ def tpl_shipped_html(
 <table role="presentation" width="100%" style="max-width:680px;margin:auto;background:#fff;border-radius:12px;overflow:hidden">
 <tr><td style="padding:24px 24px 0;font-size:20px;font-weight:700">{_brand()}</td></tr>
 <tr><td style="padding:16px 24px 0">
-  <h2 style="margin:0 0 8px">Kargonuz yola çıktı 🚚</h2>
+  <h2 style="margin:0 0 8px">Siparişiniz kargoya verildi 🚚</h2>
   <p style="margin:0 0 4px">Merhaba {customer_name or ''}, siparişiniz kargoya verildi.</p>
   <p style="margin:0 0 8px">Takip numaranız: <b>{tracking_number}</b></p>
   {tlink}
-  <p style="margin:12px 0">Sipariş detayları: <a href="{order_link}">{order_link}</a></p>
-  {_items_block(items, totals)}
-  {_address_block(address)}
+  <p style="margin:12px 0">Son durumu uygulama/hesabınızdan takip edebilirsiniz: <a href="{order_link}">{order_link}</a></p>
 </td></tr>
 <tr><td style="padding:16px 24px 24px;color:#6b7280;font-size:12px">Bu e-posta otomatik gönderildi; yine de yanıtlayarak bize ulaşabilirsiniz.</td></tr>
 </table></body></html>"""
 
+
 def tpl_delivered_html(
     customer_name: str,
     order_id: str,
-    items: Optional[list] = None,
-    totals: Optional[dict] = None,
-    address: Optional[dict] = None,
+    items: Optional[list] = None,     # artık kullanılmıyor
+    totals: Optional[dict] = None,    # artık kullanılmıyor
+    address: Optional[dict] = None,   # artık kullanılmıyor
 ) -> str:
     order_link = _order_link(order_id)
     return f"""<!doctype html><html><body style="font-family:system-ui;-webkit-font-smoothing:antialiased;background:#f6f9fc;padding:24px">
@@ -282,20 +286,19 @@ def tpl_delivered_html(
 <tr><td style="padding:16px 24px 0">
   <h2 style="margin:0 0 8px">Teslim edildi ✅</h2>
   <p style="margin:0 8px 8px 0">Merhaba {customer_name or ''}, siparişiniz başarıyla teslim edilmiştir.</p>
-  <p style="margin:12px 0">Sipariş detayları: <a href="{order_link}">{order_link}</a></p>
-  {_items_block(items, totals)}
-  {_address_block(address)}
+  <p style="margin:12px 0">Detaylar için uygulama/hesabınız: <a href="{order_link}">{order_link}</a></p>
 </td></tr>
 <tr><td style="padding:16px 24px 24px;color:#6b7280;font-size:12px">Bizi tercih ettiğiniz için teşekkür ederiz.</td></tr>
 </table></body></html>"""
+
 
 def tpl_canceled_html(
     customer_name: str,
     order_id: str,
     reason: Optional[str] = None,
-    items: Optional[list] = None,
-    totals: Optional[dict] = None,
-    address: Optional[dict] = None,
+    items: Optional[list] = None,     # artık kullanılmıyor
+    totals: Optional[dict] = None,    # artık kullanılmıyor
+    address: Optional[dict] = None,   # artık kullanılmıyor
 ) -> str:
     order_link = _order_link(order_id)
     reason_html = f"<p style='margin:8px 0'>İptal nedeni: {reason}</p>" if reason else ""
@@ -306,10 +309,7 @@ def tpl_canceled_html(
   <h2 style="margin:0 0 8px">Siparişiniz iptal edildi ❗</h2>
   <p style="margin:0 0 8px">Merhaba {customer_name or ''}, siparişiniz iptal edilmiştir.</p>
   {reason_html}
-  <p style="margin:12px 0">Detaylar: <a href="{order_link}">{order_link}</a></p>
-  {_items_block(items, totals)}
-  {_address_block(address)}
+  <p style="margin:12px 0">Detaylar için uygulama/hesabınız: <a href="{order_link}">{order_link}</a></p>
 </td></tr>
 <tr><td style="padding:16px 24px 24px;color:#6b7280;font-size:12px">Sorularınız için bu e-postaya yanıt verebilirsiniz.</td></tr>
 </table></body></html>"""
-
