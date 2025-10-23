@@ -9,7 +9,7 @@ import hashlib
 from typing import List, Dict, Optional, Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request , Form
+from fastapi import APIRouter, HTTPException, Request , Form , Query
 from starlette.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, Field, EmailStr, validator
 
@@ -289,3 +289,47 @@ async def paytr_fail():
     <h1>Ödeme Başarısız</h1>
     <p>İşlem tamamlanamadı. Lütfen tekrar deneyin.</p>
     """, status_code=200)
+
+def map_bank_to_card_type(bank_name: str | None) -> str | None:
+    if not bank_name:
+        return None
+    name = bank_name.lower()
+    if "garanti" in name: return "bonus"
+    if "iş" in name or "is bank" in name: return "maximum"
+    if "akbank" in name: return "axess"
+    if "yapı kredi" in name or "yapi kredi" in name: return "world"
+    if "halk" in name: return "paraf"
+    if "finans" in name or "qnb" in name: return "cardfinans"
+    if "ziraat" in name or "vakıf" in name: return "combo"
+    if "kuveyt" in name: return "saglamkart"
+    return None
+
+
+@router.get("/bin-info")
+async def get_card_info(bin_number: str = Query(..., min_length=6, max_length=6)):
+    """
+    Kart numarasının ilk 6 hanesinden (BIN) bankayı ve PayTR card_type değerini bulur.
+    Örnek: /paytr/bin-info?bin_number=450712
+    """
+    try:
+        url = f"https://www.paytr.com/odeme/api/installments?bin={bin_number}&amount=1000"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail="PayTR bağlantı hatası")
+            data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"BIN sorgusu başarısız: {e}")
+
+    # PayTR yanıtındaki banka adını bulmaya çalışalım
+    bank_name = None
+    if isinstance(data, dict):
+        bank_name = data.get("bank_name") or data.get("bank") or data.get("bankname")
+
+    card_type = map_bank_to_card_type(bank_name)
+    return {
+        "bin": bin_number,
+        "bank_name": bank_name,
+        "card_type": card_type,
+        "raw_response": data
+    }
