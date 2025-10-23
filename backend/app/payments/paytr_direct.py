@@ -304,32 +304,92 @@ def map_bank_to_card_type(bank_name: str | None) -> str | None:
     if "kuveyt" in name: return "saglamkart"
     return None
 
-
 @router.get("/bin-info")
-async def get_card_info(bin_number: str = Query(..., min_length=6, max_length=6)):
+async def get_card_info_bin_detail(bin_number: str = Query(..., min_length=6, max_length=8)):
     """
-    Kart numarasının ilk 6 hanesinden (BIN) bankayı ve PayTR card_type değerini bulur.
-    Örnek: /paytr/bin-info?bin_number=450712
+    PayTR /bin-detail uyumlu BIN sorgusu.
+    - bin_number: ilk 6 veya 8 hane (tercihen 8 hane)
+    - Dönen JSON içinde PayTR alanları ve mapped `card_type` yer alır.
     """
+    # sanitize
+    bin_number = bin_number.strip()
+    if not bin_number.isdigit():
+        raise HTTPException(status_code=400, detail="bin_number must be numeric")
+
+    # --- build paytr_token according to doc: hash_str = bin_number + merchant_id + merchant_salt
     try:
-        url = f"https://www.paytr.com/odeme/api/installments?bin={bin_number}&amount=1000"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail="PayTR bağlantı hatası")
-            data = resp.json()
+        merchant_id = PAYTR_MERCHANT_ID  # from env in your module
+        merchant_salt = PAYTR_MERCHANT_SALT
+        merchant_key_str = PAYTR_MERCHANT_KEY
+        if not (merchant_id and merchant_salt and merchant_key_str):
+            raise RuntimeError("PAYTR env vars missing (merchant_id/key/salt)")
+
+        # merchant_key must be bytes for HMAC; env gives string -> encode utf-8
+        merchant_key_bytes = merchant_key_str.encode("utf-8")
+
+        hash_str = f"{bin_number}{merchant_id}{merchant_salt}"
+        digest = hmac.new(merchant_key_bytes, hash_str.encode("utf-8"), hashlib.sha256).digest()
+        paytr_token = base64.b64encode(digest).decode("utf-8")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"BIN sorgusu başarısız: {e}")
+        raise HTTPException(status_code=500, detail=f"token generation failed: {e}")
 
-    # PayTR yanıtındaki banka adını bulmaya çalışalım
-    bank_name = None
-    if isinstance(data, dict):
-        bank_name = data.get("bank_name") or data.get("bank") or data.get("bankname")
+    # --- call PayTR bin-detail endpoint
+    url = "https://www.paytr.com/odeme/api/bin-detail"
+    payload = {
+        "merchant_id": merchant_id,
+        "bin_number": bin_number,
+        "paytr_token": paytr_token
+    }
 
-    card_type = map_bank_to_card_type(bank_name)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # use form POST as examples in PayTR docs show params form-style
+            r = await client.post(url, data=payload)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to contact PayTR: {e}")
+
+    # network / status handling
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"PayTR returned {r.status_code}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="invalid json from PayTR")
+
+    # PayTR response: check status
+    status = data.get("status")
+    if status == "error":
+        err = data.get("err_msg", "unknown")
+        raise HTTPException(status_code=502, detail=f"PayTR BIN detail error: {err}")
+    if status == "failed":
+        # BIN not known (e.g. foreign card) -> return that info
+        return {"bin": bin_number, "status": "failed", "raw_response": data}
+
+    # status == success -> extract fields
+    # expected fields: cardType, businessCard, bank, brand, schema, bankCode, allow_non3d ...
+    cardType = data.get("cardType")      # credit|debit
+    businessCard = data.get("businessCard")
+    bank = data.get("bank")
+    brand = data.get("brand")            # axess, bonus,...
+    schema = data.get("schema")
+    bankCode = data.get("bankCode")
+    allow_non3d = data.get("allow_non3d")
+
+    mapped_card_type = map_bank_to_card_type(bank) or (brand if brand in {
+        "advantage","axess","combo","bonus","cardfinans","maximum","paraf","world","saglamkart"
+    } else None)
+
     return {
         "bin": bin_number,
-        "bank_name": bank_name,
-        "card_type": card_type,
+        "status": "success",
+        "cardType": cardType,
+        "businessCard": businessCard,
+        "bank": bank,
+        "brand": brand,
+        "schema": schema,
+        "bankCode": bankCode,
+        "allow_non3d": allow_non3d,
+        "card_type_mapped": mapped_card_type,
         "raw_response": data
     }
