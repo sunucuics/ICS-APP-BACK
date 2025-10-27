@@ -428,13 +428,19 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
     customer = _build_customer(user_id)
 
     ref = db.collection("orders").document()
-    payload: Dict[str, Any] = {
+    payload = {
         "user_id": user_id,
-        "created_at": now,
-        "updated_at": now,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
         "is_deleted": False,
         "status": "preparing",
-        "status_history": [{"status": "preparing", "at": now, "by": user_id}],
+        "status_history": [
+            {
+                "status": "preparing",
+                "at": firestore.SERVER_TIMESTAMP,
+                "by": user_id,
+            }
+        ],
         "customer": customer,
         "shipping": {"provider": "MANUAL"},
         "items": items,
@@ -565,15 +571,21 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, 
             "shipping": {
                 "provider": body.provider,
                 "tracking_number": body.tracking_number,
-                "shipped_at": now,
+                "shipped_at": firestore.SERVER_TIMESTAMP,
                 "delivered_at": (doc.get("shipping") or {}).get("delivered_at"),
             },
-            "updated_at": now,
+            "updated_at": firestore.SERVER_TIMESTAMP,
             "status_history": firestore.ArrayUnion([
-                {"status": "shipped", "at": now, "by": admin_id, "meta": {"tracking_number": body.tracking_number}}
+                {
+                    "status": "shipped",
+                    "at": firestore.SERVER_TIMESTAMP,
+                    "by": admin_id,
+                    "meta": {"tracking_number": body.tracking_number},
+                }
             ]),
         }
         tx.update(ref, update)
+
         return {**doc, **update}
 
     tx = db.transaction()
@@ -618,15 +630,23 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
         doc = snap.to_dict() or {}
         _ensure_transition(doc.get("status") or "preparing", "delivered")
-        now = _now()
         update = {
             "status": "delivered",
-            "shipping": {**(doc.get("shipping") or {}), "delivered_at": now},
-            "updated_at": now,
+            "shipping": {
+                **(doc.get("shipping") or {}),
+                "delivered_at": firestore.SERVER_TIMESTAMP,
+            },
+            "updated_at": firestore.SERVER_TIMESTAMP,
             "status_history": firestore.ArrayUnion([
-                {"status": "delivered", "at": now, "by": admin_id, "meta": {}}
+                {
+                    "status": "delivered",
+                    "at": firestore.SERVER_TIMESTAMP,
+                    "by": admin_id,
+                    "meta": {},
+                }
             ]),
         }
+
         tx.update(ref, update)
         return {**doc, **update}
 
@@ -667,14 +687,19 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
         doc = snap.to_dict() or {}
         _ensure_transition(doc.get("status") or "preparing", "canceled")
-        now = _now()
         update = {
             "status": "canceled",
-            "updated_at": now,
+            "updated_at": firestore.SERVER_TIMESTAMP,
             "status_history": firestore.ArrayUnion([
-                {"status": "canceled", "at": now, "by": admin_id, "meta": {"reason": body.reason}}
+                {
+                    "status": "canceled",
+                    "at": firestore.SERVER_TIMESTAMP,
+                    "by": admin_id,
+                    "meta": {"reason": body.reason},
+                }
             ]),
         }
+
         tx.update(ref, update)
         return {**doc, **update}
 
@@ -709,7 +734,10 @@ async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
-    ref.update({"is_deleted": True, "updated_at": _now()})
+    ref.update({
+        "is_deleted": True,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
     return {"ok": True}
 
 @admin_router.post("/dev", summary="Test amaçlı örnek sipariş oluştur (sadece admin)")

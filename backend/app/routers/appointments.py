@@ -170,7 +170,6 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
             "service": {
                 "id":    sid,
                 "title": (svc_map.get(sid) or {}).get("title"),
-                "price": (svc_map.get(sid) or {}).get("price"),
             }
         })
 
@@ -223,7 +222,6 @@ def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(
             "service": {
                 "id":    sid,
                 "title": (svc_map.get(sid) or {}).get("title"),
-                "price": (svc_map.get(sid) or {}).get("price"),
             }
         })
 

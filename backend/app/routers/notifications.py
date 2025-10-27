@@ -2,7 +2,7 @@
 Notifications router for admin notification management
 """
 from fastapi import APIRouter, Depends, HTTPException
-from backend.app.core.auth import get_current_admin
+from backend.app.core.security import get_current_admin
 from backend.app.config import db
 from typing import List, Dict, Any
 from pydantic import BaseModel
@@ -10,6 +10,11 @@ from datetime import datetime
 import firebase_admin
 from firebase_admin import messaging
 import os
+from backend.app.schemas.notification import (
+    NotificationTemplateBase,
+    NotificationTemplateOut
+)
+from firebase_admin import firestore
 
 router = APIRouter(prefix="/notifications", tags=["Admin: Notifications"], dependencies=[Depends(get_current_admin)])
 
@@ -49,60 +54,60 @@ class NotificationCampaign(BaseModel):
 
 @router.get("/templates")
 def get_notification_templates():
-    """
-    Get all notification templates
-    """
     try:
-        templates_ref = db.collection("notification_templates")
-        docs = templates_ref.stream()
-        
-        templates = []
-        for doc in docs:
-            template_data = doc.to_dict()
-            template_data["id"] = doc.id
-            templates.append(template_data)
-        
-        return templates
+        docs = db.collection("notification_templates").stream()
+        out = []
+        for d in docs:
+            raw = d.to_dict() or {}
+            # backward compat: migrate "content" -> "body"
+            if "body" not in raw and "content" in raw:
+                raw["body"] = raw["content"]
+            out.append(NotificationTemplateOut(
+                id=d.id,
+                name=raw.get("name",""),
+                subject=raw.get("subject"),
+                body=raw.get("body",""),
+                type=raw.get("type","email"),
+                is_active=bool(raw.get("is_active", True)),
+                created_at=raw.get("created_at"),
+                updated_at=raw.get("updated_at"),
+            ).dict())
+        return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching templates: {str(e)}")
 
 @router.post("/templates")
-def create_notification_template(template: NotificationTemplate):
-    """
-    Create a new notification template
-    """
+def create_notification_template(template: NotificationTemplateBase):
     try:
-        template_data = template.dict()
-        template_data["created_at"] = datetime.now()
-        template_data["updated_at"] = datetime.now()
-        
-        # Remove id from data since Firestore will generate it
-        if "id" in template_data:
-            del template_data["id"]
-        
-        doc_ref = db.collection("notification_templates").document()
-        doc_ref.set(template_data)
-        
-        return {"id": doc_ref.id, "message": "Template created successfully"}
+        data = {
+            "name": template.name,
+            "subject": template.subject,
+            "body": template.body,
+            "type": template.type,
+            "is_active": template.is_active,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        ref = db.collection("notification_templates").document()
+        ref.set(data)
+
+        return {"id": ref.id, "message": "Template created successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
 
 @router.put("/templates/{template_id}")
-def update_notification_template(template_id: str, template: NotificationTemplate):
-    """
-    Update a notification template
-    """
+def update_notification_template(template_id: str, template: NotificationTemplateBase):
     try:
-        template_data = template.dict()
-        template_data["updated_at"] = datetime.now()
-        
-        # Remove id from data
-        if "id" in template_data:
-            del template_data["id"]
-        
-        doc_ref = db.collection("notification_templates").document(template_id)
-        doc_ref.update(template_data)
-        
+        data = {
+            "name": template.name,
+            "subject": template.subject,
+            "body": template.body,
+            "type": template.type,
+            "is_active": template.is_active,
+            "updated_at": datetime.now(),
+        }
+        db.collection("notification_templates").document(template_id).update(data)
+
         return {"message": "Template updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating template: {str(e)}")
@@ -146,15 +151,14 @@ def create_notification_campaign(campaign: NotificationCampaign):
     """
     try:
         campaign_data = campaign.dict()
-        campaign_data["created_at"] = datetime.now()
-        
-        # Remove id from data since Firestore will generate it
         if "id" in campaign_data:
             del campaign_data["id"]
-        
+
+        campaign_data["created_at"] = firestore.SERVER_TIMESTAMP
+
         doc_ref = db.collection("notification_campaigns").document()
         doc_ref.set(campaign_data)
-        
+
         return {"id": doc_ref.id, "message": "Campaign created successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
@@ -166,14 +170,13 @@ def update_notification_campaign(campaign_id: str, campaign: NotificationCampaig
     """
     try:
         campaign_data = campaign.dict()
-        
-        # Remove id from data
         if "id" in campaign_data:
             del campaign_data["id"]
-        
-        doc_ref = db.collection("notification_campaigns").document(campaign_id)
-        doc_ref.update(campaign_data)
-        
+
+        campaign_data["updated_at"] = firestore.SERVER_TIMESTAMP
+
+        db.collection("notification_campaigns").document(campaign_id).update(campaign_data)
+
         return {"message": "Campaign updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")

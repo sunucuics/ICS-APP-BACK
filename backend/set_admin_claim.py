@@ -47,7 +47,7 @@ def set_admin_claim(user_email: str):
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python set_admin_claim.py <user_email>")
-        print("Example: python set_admin_claim.py efehanh0@gmail.com")
+        print("Example: python set_admin_claim.py")
         sys.exit(1)
     
     user_email = sys.argv[1]

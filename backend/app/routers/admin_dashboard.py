@@ -4,7 +4,7 @@ Handles admin dashboard statistics and overview data
 """
 
 from fastapi import APIRouter, Depends, HTTPException
-from backend.app.core.auth import get_current_admin
+from backend.app.core.security import get_current_admin
 from backend.app.schemas.principal import Principal
 from firebase_admin import firestore
 from typing import Dict, Any

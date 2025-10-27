@@ -2,15 +2,21 @@
 Settings router for admin settings management
 """
 from fastapi import APIRouter, Depends, HTTPException
-from backend.app.core.auth import get_current_admin
+from backend.app.core.security import get_current_admin
 from backend.app.config import db
 from typing import Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
+from backend.app.schemas.notification import (
+    NotificationTemplateBase,
+    NotificationTemplateOut
+)
+from backend.app.schemas.settings import BackupSettings
+from firebase_admin import firestore
 
 router = APIRouter(prefix="/settings", tags=["Admin: Settings"], dependencies=[Depends(get_current_admin)])
 
-@router.get("/")
+@router.get("/settings/overview")
 def get_settings_data():
     """
     Get system settings data
@@ -29,8 +35,8 @@ def get_settings_data():
                 "app_version": "1.0.0",
                 "maintenance_mode": False,
                 "maintenance_message": None,
-                "contact_email": "info@icsapp.com",
-                "contact_phone": "+90 555 123 4567",
+                "contact_email": None,
+                "contact_phone": None,
                 "address": "Istanbul, Turkey",
                 "working_hours": "09:00 - 18:00",
                 "social_media": {
@@ -125,7 +131,7 @@ class AppSettings(BaseModel):
     allow_registration: bool = True
     require_email_verification: bool = True
 
-@router.get("/")
+@router.get("/settings/app")
 def get_app_settings():
     """
     Get application settings
@@ -144,18 +150,17 @@ def get_app_settings():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching settings: {str(e)}")
 
-@router.put("/")
+@router.put("/settings/app")
 def update_app_settings(settings: AppSettings):
     """
     Update application settings
     """
     try:
         settings_data = settings.dict()
-        settings_data["updated_at"] = datetime.now()
-        
-        settings_ref = db.collection("app_settings").document("main")
-        settings_ref.set(settings_data, merge=True)
-        
+        settings_data["updated_at"] = firestore.SERVER_TIMESTAMP
+
+        db.collection("app_settings").document("main").set(settings_data, merge=True)
+
         return {"message": "Settings updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating settings: {str(e)}")
@@ -168,57 +173,72 @@ def get_email_templates():
     try:
         templates_ref = db.collection("email_templates")
         docs = templates_ref.stream()
-        
+
         templates = []
         for doc in docs:
-            template_data = doc.to_dict()
-            template_data["id"] = doc.id
-            templates.append(template_data)
-        
+            data = doc.to_dict() or {}
+            # normalize field names in case old docs still have "content"
+            if "body" not in data and "content" in data:
+                data["body"] = data["content"]
+            item = NotificationTemplateOut(
+                id=doc.id,
+                name=data.get("name", ""),
+                subject=data.get("subject"),
+                body=data.get("body", ""),
+                type=data.get("type", "email"),  # default "email" for backward compat
+                is_active=bool(data.get("is_active", True)),
+                created_at=data.get("created_at"),
+                updated_at=data.get("updated_at"),
+            )
+            templates.append(item.dict())
         return templates
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching email templates: {str(e)}")
 
 @router.post("/email-templates")
-def create_email_template(template: EmailTemplate):
+def create_email_template(template: NotificationTemplateBase):
     """
-    Create a new email template
+    Create a new email/push/SMS template
     """
     try:
-        template_data = template.dict()
-        template_data["created_at"] = datetime.now()
-        template_data["updated_at"] = datetime.now()
-        
-        # Remove id from data since Firestore will generate it
-        if "id" in template_data:
-            del template_data["id"]
-        
+        data = {
+            "name": template.name,
+            "subject": template.subject,
+            "body": template.body,
+            "type": template.type,
+            "is_active": template.is_active,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+
         doc_ref = db.collection("email_templates").document()
-        doc_ref.set(template_data)
-        
-        return {"id": doc_ref.id, "message": "Email template created successfully"}
+        doc_ref.set(data)
+
+        return {"id": doc_ref.id, "message": "Template created successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating email template: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
+
 
 @router.put("/email-templates/{template_id}")
-def update_email_template(template_id: str, template: EmailTemplate):
+def update_email_template(template_id: str, template: NotificationTemplateBase):
     """
-    Update an email template
+    Update an email/push/SMS template
     """
     try:
-        template_data = template.dict()
-        template_data["updated_at"] = datetime.now()
-        
-        # Remove id from data
-        if "id" in template_data:
-            del template_data["id"]
-        
-        doc_ref = db.collection("email_templates").document(template_id)
-        doc_ref.update(template_data)
-        
-        return {"message": "Email template updated successfully"}
+        data = {
+            "name": template.name,
+            "subject": template.subject,
+            "body": template.body,
+            "type": template.type,
+            "is_active": template.is_active,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        db.collection("email_templates").document(template_id).update(data)
+
+        return {"message": "Template updated successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating email template: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating template: {str(e)}")
 
 @router.delete("/email-templates/{template_id}")
 def delete_email_template(template_id: str):
@@ -235,36 +255,36 @@ def delete_email_template(template_id: str):
 
 @router.get("/backup")
 def get_backup_settings():
-    """
-    Get backup settings
-    """
     try:
         backup_ref = db.collection("backup_settings").document("main")
         doc = backup_ref.get()
-        
+
         if doc.exists:
-            return doc.to_dict()
+            data = doc.to_dict() or {}
         else:
-            return {
+            data = {
                 "auto_backup": False,
                 "backup_frequency": "daily",
                 "backup_retention_days": 30,
-                "last_backup": None
+                "last_backup": None,
             }
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching backup settings: {str(e)}")
 
+
 @router.put("/backup")
-def update_backup_settings(backup_settings: Dict[str, Any]):
+def update_backup_settings(backup_settings: BackupSettings):
     """
     Update backup settings
     """
     try:
-        backup_settings["updated_at"] = datetime.now()
-        
-        backup_ref = db.collection("backup_settings").document("main")
-        backup_ref.set(backup_settings, merge=True)
-        
+        data = backup_settings.dict()
+        data["updated_at"] = firestore.SERVER_TIMESTAMP
+
+        db.collection("backup_settings").document("main").set(data, merge=True)
+
         return {"message": "Backup settings updated successfully"}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating backup settings: {str(e)}")

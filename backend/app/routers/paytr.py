@@ -302,7 +302,6 @@ async def paytr_callback(request: Request):
 
     if status_ == "success":
         updates = {
-            "status": "paid",
             "payment": {
                 "provider": "paytr",
                 "status": "paid",

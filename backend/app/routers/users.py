@@ -70,8 +70,7 @@ Tüm işlemler `get_current_user` bağımlılığı ile kimlik doğrulama gerekt
 """
 from fastapi import APIRouter, Depends, HTTPException
 from uuid import uuid4
-from backend.app.core.security import get_current_user
-from backend.app.core.auth import get_current_admin
+from backend.app.core.security import get_current_user , get_current_admin
 from backend.app.config import db
 from backend.app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
 

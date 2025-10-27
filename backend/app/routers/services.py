@@ -147,7 +147,7 @@ async def create_service(
         blob.make_public()
         image_url = blob.public_url
     except Exception:
-        image_url = blob.generate_signed_url(expiration=3600 * 24 * 365 * 100000)
+        image_url = blob.generate_signed_url(expiration=3600 * 24 * 365 * 10)
 
     payload = {
         "id": svc_ref.id,
