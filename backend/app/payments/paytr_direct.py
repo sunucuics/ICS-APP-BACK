@@ -7,7 +7,7 @@ import hmac
 import base64
 import hashlib
 from typing import List, Dict, Optional, Literal
-
+import re
 import httpx
 from fastapi import APIRouter, HTTPException, Request , Form , Query
 from starlette.responses import PlainTextResponse, HTMLResponse
@@ -49,6 +49,7 @@ def hmac_b64(key_str: str, msg_str: str) -> str:
 
 
 
+
 def client_ip(request: Request, override: Optional[str]) -> str:
     if override:
         return override.split(",")[0].strip()
@@ -85,9 +86,11 @@ class DirectInitIn(BaseModel):
     user_ip: Optional[str] = None
     debug_on: Literal[0, 1] = 1
 
-    @validator("currency")
-    def _norm_currency(cls, v: str) -> str:
-        return "TL" if v in ("", "TRY", "TL") else v
+    def _oid_alnum(cls, v: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9]+", v):
+            raise ValueError("merchant_oid must be alphanumeric")
+
+        return v
 
 class DirectInitOut(BaseModel):
     action: str
@@ -99,73 +102,87 @@ class DirectInitOut(BaseModel):
 @router.post("/direct/init", response_model=DirectInitOut)
 async def paytr_direct_init(body: DirectInitIn, request: Request):
     """
-    Direct API Step 1: Kullanıcı formu doldurduktan sonra PayTR'ye POST edeceğin
-    alanları ve imzayı (paytr_token) üretir.
+    Direct API Step 1: PayTR'a POST edilecek alanları ve paytr_token'ı üretir.
 
-    Önemli:
-    - payment_amount kuruş (noktasız) string olmalı.
-    - user_basket Base64-JSON olmalı.
-    - Token hesaplamada alan sırası kritik (dokümandaki sırayla birleştirilir ve
-      sonuna merchant_salt eklenerek merchant_key ile HMAC-SHA256 yapılır, Base64’e çevrilir).
-      (Bkz. PayTR Direct/iFrame örnekleri)  # docs: token + salt + HMAC + Base64
+    Notlar:
+    - payment_amount kuruş (string) olmalı: 15 TL -> "1500"
+    - user_basket Base64(JSON) olmalı
+    - Token, KANONİK 10 alan + merchant_salt ile üretilir (sıra KRİTİK)
     """
+    import re, logging
+    log = logging.getLogger("paytr")
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO)
+
     ip = client_ip(request, body.user_ip)
     if not ip:
         raise HTTPException(400, "user_ip required")
 
-    # Sepeti -> [["Ürün","349.90",1], ...] JSON -> Base64
+    # OID sadece alfanümerik
+    if not re.fullmatch(r"[A-Za-z0-9]+", body.merchant_oid or ""):
+        raise HTTPException(status_code=400, detail="merchant_oid must be alphanumeric")
+
+    # Sepeti -> [["Ürün","349.90",1], ...] -> JSON -> Base64
     basket_arr = [[i.name, f"{i.price:.2f}", i.quantity] for i in body.basket]
     user_basket_b64 = b64_str(json.dumps(basket_arr, ensure_ascii=False, separators=(",", ":")))
 
+    # 15 -> "1500"
     amount_kurus = to_cents(body.payment_amount)
 
-    # === İMZA SIRASI ===
-    # DİKKAT: PayTR dokümanındaki sıraya birebir uyulmalıdır. Aşağıdaki sıra Direct (card) için
-    # yaygın kullanılan alanları içerir. Bankanız/PAYTR hesabınızın dokümanında farklılık varsa
-    # burada aynı sıraya güncelleyin.
-    #
-    # Ref: "Data to be used in token production" ve örnek iFrame/Direct kodları (salt mesajın sonuna eklenir,
-    # HMAC SHA256 merchant_key ile, çıktı Base64). :contentReference[oaicite:4]{index=4}
-    sign_str = (
-        f"{PAYTR_MERCHANT_ID}"
-        f"{ip}"
-        f"{body.merchant_oid}"
-        f"{body.email}"
-        f"{amount_kurus}"
-        f"{body.payment_type}"
-        f"{body.installment_count}"
-        f"{body.currency}"
-        f"{PAYTR_TEST_MODE}"
-        f"{body.non_3d}"
-        f"{PAYTR_MERCHANT_SALT}"
-    )
-    paytr_token = hmac_b64(PAYTR_MERCHANT_KEY, sign_str)
-
+    # PayTR'a göndereceğin FIELDS (init cevabı)
     fields: Dict[str, str] = {
-        "merchant_id": PAYTR_MERCHANT_ID,
+        "merchant_id": PAYTR_MERCHANT_ID,        # GERÇEK MID
         "user_ip": ip,
         "merchant_oid": body.merchant_oid,
         "email": body.email,
-        "payment_type": body.payment_type,
-        "payment_amount": amount_kurus,           # <-- kuruş, noktasız
-        "currency": body.currency,
-        "test_mode": PAYTR_TEST_MODE,
-        "non_3d": str(body.non_3d),
+        "payment_type": body.payment_type,       # "card"
+        "payment_amount": amount_kurus,          # örn: "1500"
+        "currency": body.currency,               # "TL"
+        "test_mode": PAYTR_TEST_MODE,            # "0" / "1" (string)
+        "non_3d": str(body.non_3d),              # "0" / "1"
         "client_lang": body.client_lang,
         "merchant_ok_url": PAYTR_OK_URL,
         "merchant_fail_url": PAYTR_FAIL_URL,
         "user_name": body.user_name,
         "user_address": body.user_address,
         "user_phone": body.user_phone,
-        "user_basket": user_basket_b64,          # <-- Base64 JSON
+        "user_basket": user_basket_b64,         # Base64(JSON)
         "installment_count": str(body.installment_count),
-        "paytr_token": paytr_token,
         "debug_on": str(body.debug_on),
     }
     if body.card_type:
-        fields["card_type"] = body.card_type
+        fields["card_type"] = body.card_type  # token stringine dahil ETMİYORUZ
+
+    # === TOKEN: SADECE KANONİK 10 ALAN + SALT ===
+    # Sıra:
+    # merchant_id, user_ip, merchant_oid, email, payment_amount,
+    # payment_type, installment_count, currency, test_mode, non_3d, + SALT
+    tok_str = (
+        fields["merchant_id"] +
+        fields["user_ip"] +
+        fields["merchant_oid"] +
+        fields["email"] +
+        fields["payment_amount"] +
+        fields["payment_type"] +
+        fields["installment_count"] +
+        fields["currency"] +
+        fields["test_mode"] +
+        fields["non_3d"] +
+        PAYTR_MERCHANT_SALT
+    )
+    paytr_token = hmac_b64(PAYTR_MERCHANT_KEY, tok_str)
+    fields["paytr_token"] = paytr_token
+
+    # Debug log (sadece debug_on=1'de)
+    if fields.get("debug_on") == "1":
+        log.info("PAYTR mid=%s oid=%s ip=%s amt=%s test=%s non3d=%s",
+                 fields["merchant_id"], fields["merchant_oid"], fields["user_ip"],
+                 fields["payment_amount"], fields["test_mode"], fields["non_3d"])
+        log.info("PAYTR str2sign=%s", tok_str)
+        log.info("PAYTR token=%s", paytr_token)
 
     return DirectInitOut(action="https://www.paytr.com/odeme", fields=fields)
+
 
 # -----------------------------------------------------------------------------
 # 2) CALLBACK — PayTR bildirimini doğrula ve düz 'OK' dön
