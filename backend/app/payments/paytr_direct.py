@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import os, json, hmac, base64, hashlib, logging, re
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal , Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, Form, Query
+from fastapi import APIRouter, HTTPException, Request, Form, Query , Body
 from starlette.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, Field, EmailStr, validator
 
@@ -44,9 +44,46 @@ def to_cents(amount: float | str) -> str:
 def b64_str(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("utf-8")
 
-def hmac_b64(key_str: str, msg_str: str) -> str:
+def _hmac_b64(key_str: str, msg_str: str) -> str:
     dig = hmac.new(key_str.encode("utf-8"), msg_str.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(dig).decode("utf-8")
+
+
+def _parse_fields(raw: Any) -> Dict[str, Any]:
+    """
+    Aşağıdaki formatların hepsini kabul eder:
+      1) Flat dict:            { "merchant_id": "...", ... }
+      2) Wrapped dict:         { "fields": { ... } }
+      3) Wrapped JSON string:  { "fields": "{ \"merchant_id\":\"...\", ... }" }
+      4) Düz JSON string:      "{ \"merchant_id\":\"...\", ... }"
+    """
+    # 3) ve 4) için (request body doğrudan string ise)
+    if isinstance(raw, str):
+        return json.loads(raw)
+
+    if isinstance(raw, dict):
+        if "fields" in raw:
+            val = raw["fields"]
+            if isinstance(val, str):
+                return json.loads(val)         # JSON string
+            elif isinstance(val, dict):
+                return val                      # dict
+            else:
+                raise ValueError("fields must be JSON string or object")
+        else:
+            return raw                           # flat dict
+
+    raise ValueError("Body must be an object or JSON string")
+
+def _normalize_fields(d: Dict[str, Any]) -> Dict[str, str]:
+    """Tüm değerleri stringe çeker, None ise '' yapar, trimler."""
+    out: Dict[str, str] = {}
+    for k, v in d.items():
+        if v is None:
+            out[k] = ""
+        else:
+            out[k] = str(v).strip()
+    return out
 
 def client_ip(request: Request, override: Optional[str]) -> str:
     if override:
@@ -72,14 +109,19 @@ SIG_ORDER_EXTENDED = [
     # not: bazı hesaplarda card_type da beklenebilir; client_lang'den sonra ekliyoruz (varsa)
 ]
 
-def _calc_direct_token(fields: Dict[str, str], mode: str) -> tuple[str, str, List[str]]:
-    order = SIG_ORDER_MINIMAL.copy() if mode != "extended" else SIG_ORDER_EXTENDED.copy()
-    if mode == "extended" and "card_type" in fields:
-        idx = order.index("client_lang") + 1
-        order.insert(idx, "card_type")
-    pieces = [str(fields.get(k, "")) for k in order]
-    s2s = "".join(pieces) + PAYTR_MERCHANT_SALT
-    return hmac_b64(PAYTR_MERCHANT_KEY, s2s), s2s, order
+def _calc_direct_token(fields: Dict[str, str], sign_mode: str = "minimal"):
+    """
+    Kanonik sıra (Direct API minimal):
+    merchant_id, user_ip, merchant_oid, email, payment_amount,
+    payment_type, installment_count, currency, test_mode, non_3d, + SALT
+    """
+    order = [
+        "merchant_id", "user_ip", "merchant_oid", "email", "payment_amount",
+        "payment_type", "installment_count", "currency", "test_mode", "non_3d"
+    ]
+    s2s = "".join(fields.get(k, "") for k in order) + PAYTR_MERCHANT_SALT
+    calc = _hmac_b64(PAYTR_MERCHANT_KEY, s2s)
+    return calc, s2s, order
 
 # ---- iFrame token (get-token) ----
 def _calc_iframe_token(*, merchant_id: str, user_ip: str, merchant_oid: str, email: str,
@@ -213,30 +255,54 @@ async def paytr_direct_init(body: DirectInitIn, request: Request):
 # DIRECT — verify (token diff'i gör)
 # =========================
 @router.post("/direct/verify", response_model=VerifyOut)
-async def paytr_direct_verify(payload: Dict[str, str]):
-    f = {k: ("" if v is None else str(v)).strip() for k, v in payload.items()}
-    notes = []
-    if not f.get("payment_amount","").isdigit():
-        notes.append("payment_amount kuruş string olmalı (15 TL -> '1500').")
-    if not re.fullmatch(r"[A-Za-z0-9]+", f.get("merchant_oid","")):
-        notes.append("merchant_oid sadece alfanümerik olmalı.")
-    # user_basket kontrolü
+async def paytr_direct_verify(raw: Any = Body(...)):
+    """
+    INIT'ten gelen fields ile imzayı doğrular.
+    - Hem flat dict, hem {"fields": {...}} hem de JSON string kabul eder.
+    - Eksik/hatalı alanları 'notes' içinde bildirir.
+    """
     try:
-        json.loads(base64.b64decode(f.get("user_basket","")).decode("utf-8"))
-    except Exception:
-        notes.append("user_basket Base64(JSON) çözümlenemedi.")
+        parsed = _parse_fields(raw)
+    except Exception as e:
+        # body anlaşılamadı
+        raise HTTPException(status_code=400, detail=f"invalid body: {e}")
 
+    f = _normalize_fields(parsed)
+
+    notes: List[str] = []
+
+    # Bazı hızlı kontroller
+    amt = f.get("payment_amount", "")
+    if not amt.isdigit():
+        notes.append("payment_amount kuruş string olmalı (ör: 15 TL -> '1500').")
+
+    oid = f.get("merchant_oid", "")
+    if not re.fullmatch(r"[A-Za-z0-9]+", oid or ""):
+        notes.append("merchant_oid sadece alfanümerik olmalı.")
+
+    # Sepet decode (bilgi amaçlı)
+    if "user_basket" in f and f["user_basket"]:
+        try:
+            jb = base64.b64decode(f["user_basket"])
+            _ = json.loads(jb.decode("utf-8"))
+        except Exception:
+            notes.append("user_basket Base64(JSON) çözümlenemedi.")
+
+    # Token üret ve karşılaştır
     calc, s2s, order = _calc_direct_token(f, PAYTR_SIGN_MODE)
-    mid_match = (f.get("merchant_id") == PAYTR_MERCHANT_ID)
+    posted = f.get("paytr_token", "")
+
+    mid_match = (f.get("merchant_id", "") == PAYTR_MERCHANT_ID)
+    match = (calc == posted) and mid_match
 
     return VerifyOut(
-        match=(calc == f.get("paytr_token","")),
+        match=match,
         mid_match=mid_match,
         calc_token=calc,
-        posted_token=f.get("paytr_token",""),
+        posted_token=posted,
         sign_mode=PAYTR_SIGN_MODE,
         string_to_sign=s2s,
-        order_used=order,
+        order_used=order + ["+SALT"],
         notes=notes or None
     )
 
@@ -310,7 +376,7 @@ async def paytr_callback(
 ):
     # expected = base64(hmac_sha256(key, merchant_oid + salt + status + total_amount))
     msg = f"{merchant_oid}{PAYTR_MERCHANT_SALT}{status}{total_amount}"
-    expected = hmac_b64(PAYTR_MERCHANT_KEY, msg)
+    expected = _hmac_b64(PAYTR_MERCHANT_KEY, msg)
 
     if expected != hash:
         return PlainTextResponse("ERR", status_code=400)
