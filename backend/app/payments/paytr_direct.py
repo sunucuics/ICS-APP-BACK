@@ -145,7 +145,7 @@ class VerifyOut(BaseModel):
 
 # iFrame init input
 class IframeInitIn(BaseModel):
-    merchant_oid: str = Field(..., max_length=64, regex=r"^[A-Za-z0-9]+$")
+    merchant_oid: str = Field(..., max_length=64, pattern=r"^[A-Za-z0-9]+$")
     email: EmailStr
     payment_amount: float           # TL (örn 15.00)
     user_name: str
@@ -330,3 +330,19 @@ async def installments():
         return r.json()
 
 # (İsteğe bağlı demo formu tutmak istersen bırak; prod'da gerekli değil)
+
+@router.get("/success", response_class=HTMLResponse)
+async def paytr_success():
+    return HTMLResponse("""
+    <!doctype html><meta charset="utf-8">
+    <h1>Ödeme Başarılı</h1>
+    <p>Teşekkürler! Ödemeniz alındı.</p>
+    """, status_code=200)
+
+@router.get("/fail", response_class=HTMLResponse)
+async def paytr_fail():
+    return HTMLResponse("""
+    <!doctype html><meta charset="utf-8">
+    <h1>Ödeme Başarısız</h1>
+    <p>İşlem tamamlanamadı. Lütfen tekrar deneyin.</p>
+    """, status_code=200)
