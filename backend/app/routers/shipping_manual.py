@@ -75,17 +75,6 @@ def _prefixed(name: str) -> str:
     return f"{_PREFIX}{name}" if _PREFIX else name
 _CARTS = _prefixed("carts")
 
-def _unit_price_from_product(p: Optional[Dict[str, Any]]) -> float:
-    if not isinstance(p, dict):
-        return 0.0
-    for key in ("final_price", "price"):
-        v = p.get(key, None)
-        try:
-            if v is not None and str(v).strip() != "":
-                return float(v)
-        except Exception:
-            continue
-    return 0.0
 
 def _fetch_products_by_ids_from_db(product_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     ids = [pid for pid in set(product_ids) if pid]
@@ -96,15 +85,42 @@ def _fetch_products_by_ids_from_db(product_ids: Iterable[str]) -> Dict[str, Dict
         for i in range(0, len(ids), 10):
             batch = ids[i:i+10]
             q = (db.collection_group("items")
-                   .where("is_deleted", "==", False)
-                   .where(FieldPath.document_id(), "in", batch))
+                 .where("id", "in", batch))  # document_id yerine düz 'id' alanı
             for snap in q.stream():
                 d = snap.to_dict() or {}
                 d["id"] = snap.id
+                if d.get("is_deleted"):  # kod seviyesinde filtre
+                    continue
                 idx[snap.id] = d
+
+
     except Exception as e:
-        log.warning("DB fallback query failed (index?) — continuing without it: %s", e)
-        # Burada API'den gelenlerle yetinip yolumuza devam ediyoruz.
+
+        log.warning("DB fallback query failed (index?) — trying per-id equality: %s", e)
+
+        # Tek tek eşitlik sorgusu (ek index gerekmez)
+
+        for pid in batch:
+
+            try:
+
+                q1 = db.collection_group("items").where(FieldPath.document_id(), "==", pid).limit(1).stream()
+
+                snap = next(q1, None)
+
+                if snap:
+
+                    d = snap.to_dict() or {}
+
+                    d["id"] = snap.id
+
+                    if not d.get("is_deleted"):
+                        idx[snap.id] = d
+
+            except Exception as e2:
+
+                log.warning("Per-id fetch failed for %s: %s", pid, e2)
+
     return idx
 
 
@@ -155,18 +171,20 @@ def _parse_money(v) -> float:
     except Exception:
         return 0.0
 
+
 def _unit_price_from_product(p: Optional[Dict[str, Any]]) -> float:
-    if not isinstance(p, dict): return 0.0
-    for key in ("final_price", "price"):
-        val = _parse_money(p.get(key))
-        if val > 0:
-            return val
+    if not isinstance(p, dict):
+        return 0.0
+    for k in ("final_price", "price"):
+        v = _parse_money(p.get(k))
+        if v > 0:
+            return v
     return 0.0
 
 
 def _get_product_from_db(product_id: str) -> Optional[Dict[str, Any]]:
     try:
-        q = db.collection_group("items").where(FieldPath.document_id(), "==", product_id)
+        q = db.collection_group("items").where("id", "==", product_id)
         for snap in q.stream():
             d = snap.to_dict() or {}
             d["id"] = snap.id
@@ -176,20 +194,28 @@ def _get_product_from_db(product_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _fetch_products_current(request: Request, ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Önce /products/ ile tüm kataloğu tek istekle alır ve indexler.
+    Sonra sadece eksik ID'ler için Firestore fallback yapar.
+    """
     out: Dict[str, Dict[str, Any]] = {}
     wanted = [pid for pid in set(ids) if pid]
-    if not wanted: return out
+    if not wanted:
+        return out
+
+    # 1) API'den tamamını çek & indexle
+    api_products = _fetch_products_via_api(request)
+    idx = _index_products_by_id(api_products)
     for pid in wanted:
-        p = _get_product_via_api(request, pid)
-        if p: out[pid] = p
+        if pid in idx:
+            out[pid] = idx[pid]
+
+    # 2) Eksikler için DB fallback
     missing = [pid for pid in wanted if pid not in out]
-    for pid in missing:
-        p = _get_product_from_db(pid)
-        if p: out[pid] = p
-    still = [pid for pid in wanted if pid not in out]
-    if still:
-        out.update(_fetch_products_by_ids_from_db(still))
+    if missing:
+        out.update(_fetch_products_by_ids_from_db(missing))
     return out
+
 
 
 def _ensure_transition(current: str, target: str):
@@ -337,7 +363,14 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
 
         unit = _unit_price_from_product(p)
         if unit <= 0:
-            unit = _parse_money((it or {}).get("final_price") or (it or {}).get("price"))
+            for k in ("final_price", "price"):
+                unit = _parse_money((it or {}).get(k))
+                if unit > 0:
+                    break
+        if unit <= 0:
+            line_total = _parse_money((it or {}).get("line_total") or (it or {}).get("total"))
+            if qty > 0 and line_total > 0:
+                unit = line_total / float(qty)
 
         img = None
         if p and isinstance(p.get("images"), list) and p["images"]:
@@ -350,19 +383,19 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
 
 
 def _calc_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    def _unit(it: Dict[str, Any]) -> float:
+    def _unit(it: Dict[str, Any]) -> Decimal:
+        v = it.get("final_price", None)
+        if v is None or str(v).strip() == "":
+            v = it.get("price", 0)
         try:
-            v = it.get("final_price", None)
-            if v is None or str(v).strip() == "":
-                v = it.get("price", 0)
-            return float(v or 0)
+            return Decimal(str(v).replace(",", "."))
         except Exception:
-            return 0.0
+            return Decimal("0")
 
-    subtotal = sum((it.get("qty", 0) or 0) * _unit(it) for it in items)
+    subtotal = sum(Decimal(str(it.get("qty", 0) or 0)) * _unit(it) for it in items)
+    grand = subtotal.quantize(Decimal("0.01"))
     cur = (getattr(settings, "currency", None) or "TRY").upper()
-    grand = round(subtotal, 2)
-    return {"subtotal": grand, "grand_total": grand, "currency": cur}
+    return {"subtotal": float(grand), "grand_total": float(grand), "currency": cur}
 
 
 def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (List[Dict[str, Any]], Dict[str, Any]):
@@ -384,7 +417,16 @@ def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (Lis
 
         unit = _unit_price_from_product(p)
         if unit <= 0:
-            unit = _parse_money(it.get("final_price") or it.get("price"))
+            # Sepet satırındaki muhtemel alan adları
+            for k in ("final_price", "price"):
+                unit = _parse_money((it or {}).get(k))
+                if unit > 0:
+                    break
+        if unit <= 0:
+            # line_total veya total varsa birim fiyatı türet
+            line_total = _parse_money((it or {}).get("line_total") or (it or {}).get("total"))
+            if qty > 0 and line_total > 0:
+                unit = line_total / float(qty)
 
         img = it.get("image_url")
         if not img and p and isinstance(p.get("images"), list) and p["images"]:
