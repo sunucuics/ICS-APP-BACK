@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import os, json, hmac, base64, hashlib, logging, re
 from typing import List, Dict, Optional, Literal , Any
+from firebase_admin import firestore
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Form, Query , Body
 from starlette.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, Field, EmailStr, validator
+from backend.app.config import db
 
 # =========================
 # ENV
@@ -22,6 +25,20 @@ PAYTR_SIGN_MODE = os.getenv("PAYTR_SIGN_MODE", "minimal").lower()  # minimal | e
 
 if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
     raise RuntimeError("PAYTR env missing")
+
+_PREFIX = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
+def _prefixed(name: str) -> str:
+    return f"{_PREFIX}{name}" if _PREFIX else name
+_CARTS = _prefixed("carts")
+
+def _clear_cart(user_id: str):
+    try:
+        cref = db.collection(_CARTS).document(user_id)
+        cref.set({"items": []}, merge=True)
+        for dsnap in cref.collection("items").stream():
+            dsnap.reference.delete()
+    except Exception:
+        pass
 
 router = APIRouter(prefix="/paytr", tags=["paytr"])
 
@@ -367,22 +384,76 @@ async def paytr_iframe_init(body: IframeInitIn, request: Request):
 # =========================
 # CALLBACK — PayTR bildirimi
 # =========================
+# =========================
+# CALLBACK — PayTR bildirimi
+# =========================
 @router.post("/callback", response_class=PlainTextResponse)
 async def paytr_callback(
     merchant_oid: str = Form(...),
     status: str       = Form(...),    # "success" | "failed"
-    total_amount: str = Form(...),    # örn "34990"
+    total_amount: str = Form(...),    # örn "34990" (kuruş string)
     hash: str         = Form(...),
 ):
-    # expected = base64(hmac_sha256(key, merchant_oid + salt + status + total_amount))
+    # 1) İmza doğrulama
     msg = f"{merchant_oid}{PAYTR_MERCHANT_SALT}{status}{total_amount}"
     expected = _hmac_b64(PAYTR_MERCHANT_KEY, msg)
-
     if expected != hash:
         return PlainTextResponse("ERR", status_code=400)
 
-    # TODO: merchant_oid ile idempotent sipariş güncelle
+    # 2) İlgili siparişi getir (merchant_oid = order_id)
+    ref = db.collection("orders").document(merchant_oid)
+    snap = ref.get()
+    if not snap.exists:
+        return PlainTextResponse("ERR", status_code=404)
+
+    now = datetime.now(timezone.utc)
+    doc = snap.to_dict() or {}
+    user_id = doc.get("user_id")
+
+    # 3) Idempotent transaction ile payment.status yaz
+    @firestore.transactional
+    def _txn(tx):
+        s = ref.get(transaction=tx)
+        d = s.to_dict() or {}
+        pay = d.get("payment") or {}
+        cur = (pay.get("status") or "").lower()
+
+        # Zaten finalize ise (succeeded/failed) tekrar yazma (idempotent)
+        if cur in ("succeeded", "failed"):
+            return d
+
+        new_status = "succeeded" if status == "success" else "failed"
+        update: Dict[str, Any] = {
+            "updated_at": now,
+            "payment": {
+                **pay,
+                "status": new_status,
+                "provider": pay.get("provider") or "PAYTR",
+                "merchant_oid": merchant_oid,
+                "total_amount": total_amount,  # kuruş string
+                "raw": {"status": status, "total_amount": total_amount},
+            },
+        }
+
+        # Başarısız ödemede siparişi iptal etmek istiyorsanız:
+        if new_status == "failed":
+            update["status"] = "canceled"
+            update["status_history"] = firestore.ArrayUnion([
+                {"status": "canceled", "at": now, "by": "system", "meta": {"reason": "payment_failed"}}
+            ])
+
+        tx.update(ref, update)
+        return {**d, **update}
+
+    tx = db.transaction()
+    merged = _txn(tx)
+
+    # 4) Ödeme başarılı ise sepeti temizle (isteğe bağlı, yukarıdaki helper ile)
+    if status == "success" and user_id:
+        _clear_cart(user_id)
+
     return PlainTextResponse("OK", status_code=200)
+
 
 # =========================
 # TAKSİT ORANLARI

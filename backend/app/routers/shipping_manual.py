@@ -482,17 +482,12 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
         "items": items,
         "totals": totals,
         "note": None,
-        "payment": {},
+        "payment": {
+            "provider": "PAYTR",
+            "status": "awaiting",
+            "merchant_oid": ref.id},
     }
     ref.set(payload)
-
-    # Sepeti temizle
-    try:
-        db.collection(_CARTS).document(user_id).set({"items": []}, merge=True)
-        for dsnap in db.collection(_CARTS).document(user_id).collection("items").stream():
-            dsnap.reference.delete()
-    except Exception:
-        pass
 
     return {"id": ref.id, "message": "Siparişiniz alındı, kargonuz hazırlanıyor.", **payload}
 
@@ -775,7 +770,10 @@ async def dev_create_order(_: Dict = Depends(get_current_admin)):
         "items": [{"product_id": "p1", "name": "Lamba", "qty": 1, "price": 999.90}],
         "totals": {"grand_total": 999.90, "currency": "TRY"},
         "note": None,
-        "payment": {},
+        "payment": {
+            "provider": "PAYTR",
+            "status": "awaiting",
+            "merchant_oid": ref.id},
     }
     ref.set(payload)
     return {"id": ref.id, **payload}
