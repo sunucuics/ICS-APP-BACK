@@ -99,12 +99,15 @@ PHONE_PATTERN = re.compile(r"^\d{3}\s\d{3}\s\d{4}$")   # 555 123 4567
 async def register(
     request: Request,
     name: str = Form(..., min_length=1, description="Ad Soyad"),
-    phone: str = Form(..., description="Telefon (555 123 4567)"),
+    phone: str | None = Form(None, description="Telefon (opsiyonel, 555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
     fcm_token: str | None = Form(None, description="FCM Token (opsiyonel)"),
-    authorization: str | None = Header(None, alias="Authorization",
-                                       description="Bearer <Firebase ID Token> (opsiyonel)"),
+    authorization: str | None = Header(
+        None,
+        alias="Authorization",
+        description="Bearer <Firebase ID Token> (opsiyonel)",
+    ),
 ):
     # 1) UID elde et: header varsa token doğrula; yoksa Admin SDK ile user yarat
     uid: str | None = None
@@ -129,8 +132,12 @@ async def register(
         except Exception as exc:
             raise HTTPException(400, f"Firebase kullanıcı oluşturma hatası: {exc}")
 
-    # 2) Telefon formatı
-    if not PHONE_PATTERN.fullmatch(phone):
+    # 2) Telefon formatı (sadece girildiyse kontrol et)
+    # boş string gelirse de None gibi davranması için strip ile normalize edelim
+    if phone is not None:
+        phone = phone.strip() or None
+
+    if phone and not PHONE_PATTERN.fullmatch(phone):
         raise HTTPException(422, "Telefon biçimi '555 123 4567' olmalı")
 
     # 3) Email eşleşmesi
@@ -144,10 +151,13 @@ async def register(
         raise HTTPException(400, "Bu kullanıcı zaten kayıtlı")
 
     # 5) Profil yaz
-    profile_doc = {
+    # Telefon gelmediyse "0" olarak kaydediyoruz
+    stored_phone = phone or None
+
+    profile_doc: dict = {
         "name": name,
         "email": email,
-        "phone": phone,
+        "phone": stored_phone,
         "role": "customer",
         "addresses": [],
         "created_at": gcf.SERVER_TIMESTAMP,
@@ -155,6 +165,7 @@ async def register(
     }
     if fcm_token:
         profile_doc["fcm_token"] = fcm_token
+
     user_ref.set(profile_doc)
 
     # 6) Cevap (tokenlar)
@@ -166,7 +177,11 @@ async def register(
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
                     f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={settings.firebase_web_api_key}",
-                    json={"email": email, "password": password, "returnSecureToken": True},
+                    json={
+                        "email": email,
+                        "password": password,
+                        "returnSecureToken": True,
+                    },
                 )
             if r.status_code == 200:
                 data = r.json()
@@ -179,13 +194,24 @@ async def register(
             logging.warning(f"Login proxy error: {e}")
 
     user_out = UserProfile(
-        id=uid, name=name, email=email, phone=phone,
-        role="customer", addresses=[], created_at=None, is_guest=False
+        id=uid,
+        name=name,
+        email=email,
+        phone=stored_phone,  # her durumda ya gerçek numara ya da "0"
+        role="customer",
+        addresses=[],
+        created_at=None,
+        is_guest=False,
     )
     return RegisterResponse(
-        user_id=uid, user=user_out,
-        id_token=id_tok, refresh_token=refresh_tok, expires_in=exp
+        user_id=uid,
+        user=user_out,
+        id_token=id_tok,
+        refresh_token=refresh_tok,
+        expires_in=exp,
     )
+
+
 # Optionally, if we wanted to implement login via backend (not typical since client handles it, but for completeness):
 # We could verify email/password by calling Firebase's REST API or custom token creation, but it's simpler to let front-end handle login.
 # Therefore, we do not implement a /login endpoint here. The user obtains JWT from Firebase client SDK.
