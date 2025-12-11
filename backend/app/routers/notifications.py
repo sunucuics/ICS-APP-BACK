@@ -197,12 +197,13 @@ def delete_notification_campaign(campaign_id: str):
 @router.post("/send")
 def send_notification(notification_data: dict):
     """
-    Send push notification to users
+    Send push notification to users and save to database
     """
     try:
         title = notification_data.get("title", "")
         body = notification_data.get("body", "")
         target_segments = notification_data.get("segments", [])
+        template_id = notification_data.get("template_id")
         
         # Get user FCM tokens based on segments
         users_ref = db.collection("users")
@@ -214,12 +215,22 @@ def send_notification(notification_data: dict):
             users = users_ref.stream()
         
         fcm_tokens = []
+        user_ids = []
+        user_tokens_map = {}  # Map user_id to fcm_token
+        
         for user_doc in users:
             user_data = user_doc.to_dict()
+            user_id = user_doc.id
             if "fcm_token" in user_data and user_data["fcm_token"]:
-                fcm_tokens.append(user_data["fcm_token"])
+                fcm_token = user_data["fcm_token"]
+                fcm_tokens.append(fcm_token)
+                user_ids.append(user_id)
+                user_tokens_map[user_id] = fcm_token
         
         # Send FCM notification
+        success_count = 0
+        failure_count = 0
+        
         if fcm_tokens:
             # Create the message
             message = messaging.MulticastMessage(
@@ -236,12 +247,48 @@ def send_notification(notification_data: dict):
             
             # Send the message
             response = messaging.send_multicast(message)
+            success_count = response.success_count
+            failure_count = response.failure_count
+            
+            # Save notifications to database for all users (regardless of FCM success)
+            # This ensures users can see notifications even if FCM delivery failed
+            notifications_ref = db.collection("user_notifications")
+            batch = db.batch()
+            batch_count = 0
+            
+            for user_id in user_ids:
+                notification_doc = notifications_ref.document()
+                notification_data_db = {
+                    "user_id": user_id,
+                    "title": title,
+                    "body": body,
+                    "type": "admin_notification",
+                    "is_read": False,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "data": {
+                        "template_id": template_id,
+                        "segments": target_segments
+                    } if template_id or target_segments else None
+                }
+                batch.set(notification_doc, notification_data_db)
+                batch_count += 1
+                
+                # Firestore batch limit is 500, commit when approaching limit
+                if batch_count >= 450:
+                    batch.commit()
+                    batch = db.batch()
+                    batch_count = 0
+            
+            # Commit remaining notifications
+            if batch_count > 0:
+                batch.commit()
             
             return {
                 "message": "Notification sent successfully",
                 "target_count": len(fcm_tokens),
-                "success_count": response.success_count,
-                "failure_count": response.failure_count,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "saved_to_db": len(user_ids),
                 "title": title,
                 "body": body
             }

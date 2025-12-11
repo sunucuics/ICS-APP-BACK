@@ -1,6 +1,6 @@
 # backend/app/schemas/notification.py
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict, Any
 from datetime import datetime
 
 class NotificationTemplateBase(BaseModel):
@@ -14,3 +14,13 @@ class NotificationTemplateOut(NotificationTemplateBase):
     id: str
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+class UserNotificationOut(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    body: str
+    type: str = Field(default="admin_notification", description="Bildirim tipi")
+    is_read: bool = Field(default=False, description="Okundu mu?")
+    created_at: Optional[datetime] = None
+    data: Optional[Dict[str, Any]] = Field(default=None, description="Ekstra veriler")

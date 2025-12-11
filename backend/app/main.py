@@ -9,6 +9,7 @@ from backend.app.routers import (
     admin_dashboard, analytics, notifications,
     settings as settings_router
 )
+from backend.app.routers import user_notifications
 from backend.app.routers import categories as categories_router
 from backend.app.routers import products as products_router
 from backend.app.routers import services as services_router
@@ -68,6 +69,7 @@ app.include_router(orders_router.router)
 app.include_router(appointments_router.router)
 app.include_router(comments_router.router)
 app.include_router(auth_delete.router)
+app.include_router(user_notifications.router)
 
 # Include admin routers (with prefix /admin)
 app.include_router(admin_dashboard.router, prefix="/admin")
