@@ -167,6 +167,18 @@ async def create_service(
     data["id"] = snap.id
     return data
 
+@admin_router.post("", response_model=ServiceOut, status_code=status.HTTP_201_CREATED, response_model_exclude_none=True)
+async def create_service_no_slash(
+    title: str = Form(...),
+    description: str = Form(""),
+    is_upcoming: bool = Form(False),
+    image: UploadFile = File(...),
+):
+    """
+    Create a service (no trailing slash version).
+    """
+    return await create_service(title, description, is_upcoming, image)
+
 @admin_router.put("/{service_id}", response_model=ServiceOut, response_model_exclude_none=True)
 async def update_service(
     service_id: str,

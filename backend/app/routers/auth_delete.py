@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Form
 from pydantic import EmailStr
 from backend.app.core.security import get_current_user
@@ -9,7 +10,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 @router.post("/delete-account/initiate", summary="Hesap silme talebi başlat (e-posta kodlu)")
 async def initiate_delete_account(current_user = Depends(get_current_user)):
     uid = current_user["id"]
-    email: EmailStr | None = current_user.get("email")
+    email: Optional[EmailStr] = current_user.get("email")
     name = current_user.get("name") or ""
     if not email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Kullanıcının e-posta adresi yok")

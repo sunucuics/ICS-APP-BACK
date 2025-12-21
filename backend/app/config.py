@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     paytr_ok_url: str        = Field(default="https://example.com/payment/success", validation_alias=AliasChoices("PAYTR_OK_URL","paytr_ok_url"))
     paytr_fail_url: str      = Field(default="https://example.com/payment/fail",    validation_alias=AliasChoices("PAYTR_FAIL_URL","paytr_fail_url"))
     paytr_test_mode: str     = Field(default="1", validation_alias=AliasChoices("PAYTR_TEST_MODE","paytr_test_mode"))
-    paytr_callback_url: str | None = Field(default=None, description="PayTR IPN callback URL")
+    paytr_callback_url: Optional[str] = Field(default=None, description="PayTR IPN callback URL")
 
 
     # App misc

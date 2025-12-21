@@ -98,6 +98,81 @@ def _attach_user_names(rows: List[Dict]) -> List[Dict]:
         r["user_name"] = name_map.get(r.get("user_id"))
     return rows
 
+def _load_product_names(product_ids: List[str]) -> dict:
+    """Ürün isimlerini yükler. {product_id: title} döndürür."""
+    mapping: Dict[str, Optional[str]] = {}
+    uniq = [pid for pid in set(product_ids) if pid]
+    if not uniq:
+        return mapping
+
+    # Collection group ile ürünleri bul
+    try:
+        for pid in uniq:
+            try:
+                # Önce collection_group ile dene
+                q = db.collection_group("items").where(filter=FieldFilter("id", "==", pid)).limit(1)
+                for snap in q.stream():
+                    data = snap.to_dict() or {}
+                    mapping[pid] = data.get("title") or data.get("name")
+                    break
+                else:
+                    # Bulunamadıysa document_id ile dene
+                    for col_name in ["items", "products"]:
+                        try:
+                            snap = db.collection(col_name).document(pid).get()
+                            if snap.exists:
+                                data = snap.to_dict() or {}
+                                mapping[pid] = data.get("title") or data.get("name")
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return mapping
+
+def _load_service_names(service_ids: List[str]) -> dict:
+    """Hizmet isimlerini yükler. {service_id: title} döndürür."""
+    mapping: Dict[str, Optional[str]] = {}
+    uniq = [sid for sid in set(service_ids) if sid]
+    if not uniq:
+        return mapping
+
+    # Services koleksiyonundan hizmetleri bul
+    try:
+        for sid in uniq:
+            try:
+                snap = db.collection("services").document(sid).get()
+                if snap.exists:
+                    data = snap.to_dict() or {}
+                    mapping[sid] = data.get("title") or data.get("name")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return mapping
+
+def _attach_target_names(rows: List[Dict]) -> List[Dict]:
+    """Ürün ve hizmet isimlerini ekler."""
+    product_ids = [r.get("target_id") for r in rows if r.get("target_type") == "product" and r.get("target_id")]
+    service_ids = [r.get("target_id") for r in rows if r.get("target_type") == "service" and r.get("target_id")]
+    
+    product_map = _load_product_names(product_ids)
+    service_map = _load_service_names(service_ids)
+    
+    for r in rows:
+        target_type = r.get("target_type")
+        target_id = r.get("target_id")
+        if target_type == "product" and target_id:
+            r["target_name"] = product_map.get(target_id)
+        elif target_type == "service" and target_id:
+            r["target_name"] = service_map.get(target_id)
+    
+    return rows
+
 def _make_comment(*, user_id: str, target_type: TargetType, target_id: str, content: str, rating: int) -> Dict:
     if _profanity_blocked(content):
         raise HTTPException(status_code=400, detail="Uygunsuz içerik tespit edildi.")
@@ -185,16 +260,20 @@ def list_service_comments(
 @admin_router.get("/", response_model=List[CommentOut], summary="(Admin) Tüm yorumları listele")
 def list_all_comments():
     """
-    Admin - List all comments
+    Admin - List all comments with user names and target names
     """
     comments_ref = db.collection("comments").order_by("created_at", direction=firestore.Query.DESCENDING)
     docs = comments_ref.stream()
-    comments = []
+    rows = []
     for doc in docs:
-        comment_data = doc.to_dict()
-        comment_data["id"] = doc.id
-        comments.append(CommentOut(**comment_data))
-    return comments
+        comment_data = _doc_to_out(doc)
+        rows.append(comment_data)
+    
+    # Kullanıcı isimlerini ve hedef (ürün/hizmet) isimlerini ekle
+    rows = _attach_user_names(rows)
+    rows = _attach_target_names(rows)
+    
+    return [CommentOut(**row) for row in rows]
 
 @admin_router.get("", response_model=List[CommentOut], summary="(Admin) Tüm yorumları listele (no slash)")
 def list_all_comments_no_slash():

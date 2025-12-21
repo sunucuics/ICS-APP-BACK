@@ -550,8 +550,8 @@ async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
 # -----------------------------------------------------------------------------
 # ADMIN — Kargoya verilecekler / ship / deliver / cancel / delete
 # -----------------------------------------------------------------------------
-@admin_router.get("/queue", summary="Kargoya verilecekler ve kargoya verilenler")
-async def list_ship_queue(_: Dict = Depends(get_current_admin)):
+@admin_router.get("/queue", summary="Kargoya verilecekler, kargoya verilenler ve teslim edilenler")
+async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)):
     base = db.collection("orders").where("is_deleted", "==", False)
 
     preparing_q = (
@@ -564,14 +564,84 @@ async def list_ship_queue(_: Dict = Depends(get_current_admin)):
         .order_by("created_at", direction=firestore.Query.ASCENDING)
         .stream()
     )
+    delivered_q = (
+        base.where("status", "==", "delivered")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
 
-    preparing = [_merge_doc_id(d) for d in preparing_q]
-    shipped   = [_merge_doc_id(d) for d in shipped_q]
+    preparing_raw = [_merge_doc_id(d) for d in preparing_q]
+    shipped_raw   = [_merge_doc_id(d) for d in shipped_q]
+    delivered_raw = [_merge_doc_id(d) for d in delivered_q]
+
+    # Tüm siparişleri birleştir ve items'ları zenginleştir
+    all_orders = preparing_raw + shipped_raw + delivered_raw
+    
+    # Tüm product_id'leri topla
+    all_product_ids = set()
+    for order in all_orders:
+        items = order.get("items") or []
+        for item in items:
+            pid = str(item.get("product_id") or item.get("id") or "").strip()
+            if pid:
+                all_product_ids.add(pid)
+    
+    # Ürün bilgilerini çek
+    product_index = _fetch_products_current(request, all_product_ids) if all_product_ids else {}
+    
+    # Items'ları zenginleştir
+    def _enrich_order(order_doc: Dict[str, Any]) -> Dict[str, Any]:
+        items = list(order_doc.get("items") or [])
+        enriched_items = []
+        for it in items:
+            pid = str(it.get("product_id") or it.get("id") or "").strip()
+            p = product_index.get(pid)
+            
+            # Ürün adını belirle: önce product'tan, sonra item'dan, son olarak product_id
+            name = (
+                (p or {}).get("title") or (p or {}).get("name") or (p or {}).get("label")
+                or it.get("name") or it.get("title")
+                or (p or {}).get("sku") or pid
+            )
+            
+            # Fiyat bilgisi
+            unit_price = _unit_price_from_product(p)
+            if unit_price <= 0:
+                for k in ("final_price", "price"):
+                    unit_price = _parse_money(it.get(k))
+                    if unit_price > 0:
+                        break
+            
+            # Resim bilgisi
+            img = it.get("image_url")
+            if not img and p and isinstance(p.get("images"), list) and p["images"]:
+                img = p["images"][0]
+            
+            enriched_item = {
+                **it,
+                "name": name,
+                "price": unit_price if unit_price > 0 else it.get("price", 0),
+                "final_price": unit_price if unit_price > 0 else it.get("final_price", it.get("price", 0)),
+                "image_url": img or it.get("image_url"),
+            }
+            enriched_items.append(enriched_item)
+        
+        return {**order_doc, "items": enriched_items}
+    
+    # Tüm siparişleri zenginleştir
+    preparing = [_enrich_order(o) for o in preparing_raw]
+    shipped = [_enrich_order(o) for o in shipped_raw]
+    delivered = [_enrich_order(o) for o in delivered_raw]
 
     return {
         "preparing": preparing,
         "shipped": shipped,
-        "count": {"preparing": len(preparing), "shipped": len(shipped)},
+        "delivered": delivered,
+        "count": {
+            "preparing": len(preparing),
+            "shipped": len(shipped),
+            "delivered": len(delivered),
+        },
     }
 
 

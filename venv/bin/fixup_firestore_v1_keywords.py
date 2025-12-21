@@ -1,4 +1,4 @@
-#!/Users/berkeseker/Documents/Repositories/ICS-APP-BACK/venv/bin/python3.12
+#!/Users/berkeseker/Documents/Repositories/ICS-APP-BACK/venv/bin/python3
 # -*- coding: utf-8 -*-
 # Copyright 2025 Google LLC
 #

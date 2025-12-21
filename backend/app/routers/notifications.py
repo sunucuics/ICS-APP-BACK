@@ -62,12 +62,19 @@ def get_notification_templates():
             # backward compat: migrate "content" -> "body"
             if "body" not in raw and "content" in raw:
                 raw["body"] = raw["content"]
+            
+            # Validate and normalize type field
+            template_type = raw.get("type", "email")
+            # Only allow valid types: email, sms, push
+            if template_type not in ["email", "sms", "push"]:
+                template_type = "email"  # Default to email for invalid types
+            
             out.append(NotificationTemplateOut(
                 id=d.id,
                 name=raw.get("name",""),
                 subject=raw.get("subject"),
                 body=raw.get("body",""),
-                type=raw.get("type","email"),
+                type=template_type,
                 is_active=bool(raw.get("is_active", True)),
                 created_at=raw.get("created_at"),
                 updated_at=raw.get("updated_at"),
@@ -202,7 +209,8 @@ def send_notification(notification_data: dict):
     try:
         title = notification_data.get("title", "")
         body = notification_data.get("body", "")
-        target_segments = notification_data.get("segments", [])
+        # Support both 'segments' and 'user_segments' for backward compatibility
+        target_segments = notification_data.get("segments") or notification_data.get("user_segments") or []
         template_id = notification_data.get("template_id")
         
         # Get user FCM tokens based on segments
@@ -212,22 +220,30 @@ def send_notification(notification_data: dict):
             users = users_ref.stream()
         else:
             # Filter users by segments (this would need more complex logic)
+            # For now, send to all users if segments are specified
             users = users_ref.stream()
         
         fcm_tokens = []
         user_ids = []
         user_tokens_map = {}  # Map user_id to fcm_token
         
+        # Collect all users (with or without FCM tokens)
+        all_user_ids = []
         for user_doc in users:
             user_data = user_doc.to_dict()
             user_id = user_doc.id
+            all_user_ids.append(user_id)
+            
+            # Collect FCM tokens for push notifications
             if "fcm_token" in user_data and user_data["fcm_token"]:
                 fcm_token = user_data["fcm_token"]
                 fcm_tokens.append(fcm_token)
-                user_ids.append(user_id)
                 user_tokens_map[user_id] = fcm_token
         
-        # Send FCM notification
+        # Use all users for database notifications, not just those with FCM tokens
+        user_ids = all_user_ids
+        
+        # Send FCM notification (only if we have tokens)
         success_count = 0
         failure_count = 0
         
@@ -285,7 +301,8 @@ def send_notification(notification_data: dict):
             
             return {
                 "message": "Notification sent successfully",
-                "target_count": len(fcm_tokens),
+                "target_count": len(user_ids),
+                "fcm_token_count": len(fcm_tokens),
                 "success_count": success_count,
                 "failure_count": failure_count,
                 "saved_to_db": len(user_ids),
@@ -293,9 +310,41 @@ def send_notification(notification_data: dict):
                 "body": body
             }
         else:
+            # Even if no FCM tokens, save notifications to database
+            notifications_ref = db.collection("user_notifications")
+            batch = db.batch()
+            batch_count = 0
+            
+            for user_id in user_ids:
+                notification_doc = notifications_ref.document()
+                notification_data_db = {
+                    "user_id": user_id,
+                    "title": title,
+                    "body": body,
+                    "type": "admin_notification",
+                    "is_read": False,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "data": {
+                        "template_id": template_id,
+                        "segments": target_segments
+                    } if template_id or target_segments else None
+                }
+                batch.set(notification_doc, notification_data_db)
+                batch_count += 1
+                
+                if batch_count >= 450:
+                    batch.commit()
+                    batch = db.batch()
+                    batch_count = 0
+            
+            if batch_count > 0:
+                batch.commit()
+            
             return {
-                "message": "No FCM tokens found",
-                "target_count": 0,
+                "message": "Notification saved to database (no FCM tokens found for push delivery)",
+                "target_count": len(user_ids),
+                "fcm_token_count": 0,
+                "saved_to_db": len(user_ids),
                 "title": title,
                 "body": body
             }

@@ -61,6 +61,7 @@ Amaç: Oturumu kapatmak.
 3. "Logged out" mesajı döndürülür.
 
 """
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , Header , Request
 import os
 import logging
@@ -99,18 +100,18 @@ PHONE_PATTERN = re.compile(r"^\d{3}\s\d{3}\s\d{4}$")   # 555 123 4567
 async def register(
     request: Request,
     name: str = Form(..., min_length=1, description="Ad Soyad"),
-    phone: str | None = Form(None, description="Telefon (opsiyonel, 555 123 4567)"),
+    phone: Optional[str] = Form(None, description="Telefon (opsiyonel, 555 123 4567)"),
     email: EmailStr = Form(..., description="E-posta"),
     password: str = Form(..., min_length=6, description="Şifre (min 6 karakter)"),
-    fcm_token: str | None = Form(None, description="FCM Token (opsiyonel)"),
-    authorization: str | None = Header(
+    fcm_token: Optional[str] = Form(None, description="FCM Token (opsiyonel)"),
+    authorization: Optional[str] = Header(
         None,
         alias="Authorization",
         description="Bearer <Firebase ID Token> (opsiyonel)",
     ),
 ):
     # 1) UID elde et: header varsa token doğrula; yoksa Admin SDK ile user yarat
-    uid: str | None = None
+    uid: Optional[str] = None
     if authorization and authorization.startswith("Bearer "):
         id_token = authorization[7:]
         try:

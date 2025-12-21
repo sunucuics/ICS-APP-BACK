@@ -10,6 +10,7 @@ class CommentOut(BaseModel):
     id: str
     target_type: TargetType
     target_id: str
+    target_name: Optional[str] = None  # <-- eklendi: ürün veya hizmet adı
     user_id: str
     user_name: Optional[str] = None  # <-- eklendi
     content: str = Field(min_length=1, max_length=500)

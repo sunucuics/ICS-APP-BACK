@@ -180,12 +180,19 @@ def get_email_templates():
             # normalize field names in case old docs still have "content"
             if "body" not in data and "content" in data:
                 data["body"] = data["content"]
+            
+            # Validate and normalize type field
+            template_type = data.get("type", "email")
+            # Only allow valid types: email, sms, push
+            if template_type not in ["email", "sms", "push"]:
+                template_type = "email"  # Default to email for invalid types
+            
             item = NotificationTemplateOut(
                 id=doc.id,
                 name=data.get("name", ""),
                 subject=data.get("subject"),
                 body=data.get("body", ""),
-                type=data.get("type", "email"),  # default "email" for backward compat
+                type=template_type,
                 is_active=bool(data.get("is_active", True)),
                 created_at=data.get("created_at"),
                 updated_at=data.get("updated_at"),

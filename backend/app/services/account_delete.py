@@ -1,3 +1,4 @@
+from typing import Optional
 from google.api_core.exceptions import NotFound
 from firebase_admin import auth as firebase_auth, _auth_utils
 from backend.app.core.crypto import gen_numeric_code, hmac_hash
@@ -12,7 +13,7 @@ from backend.app.core.email_utils import send_email
 
 # --- Silme istek akışı ---
 
-async def initiate(uid: str, email: str, display_name: str | None = "") -> None:
+async def initiate(uid: str, email: str, display_name: Optional[str] = "") -> None:
     """
     Kullanıcı için tek kullanımlık doğrulama kodu üretir, hash'ler, Firestore'a yazar
     ve e-posta ile gönderir.

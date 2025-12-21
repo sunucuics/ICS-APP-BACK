@@ -32,6 +32,17 @@ class DiscountCreateRequest(BaseModel):
     description: Optional[str] = None
 
 
+class DiscountUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    percentage: Optional[float] = None
+    targetType: Optional[str] = None
+    targetId: Optional[str] = None
+    startDate: Optional[datetime] = None
+    endDate: Optional[datetime] = None
+    isActive: Optional[bool] = None
+    description: Optional[str] = None
+
+
 # ---------------------------------------------------------------------
 # Router (admin korumalı)
 # ---------------------------------------------------------------------
@@ -119,9 +130,9 @@ def list_discounts_no_slash(
     active: Optional[bool] = Query(None, description="Aktif filtre"),
 ):
     """
-    Yalnızca PRODUCT indirimlerini listeler. Opsiyonel ürün ve aktiflik filtresi.
+    Tüm indirimleri listeler (product ve category). Opsiyonel ürün ve aktiflik filtresi.
     """
-    q = db.collection("discounts").where(filter=FieldFilter("target_type", "==", "product"))
+    q = db.collection("discounts")
     if product_id:
         q = q.where(filter=FieldFilter("target_id", "==", product_id))
     if active is not None:
@@ -130,15 +141,19 @@ def list_discounts_no_slash(
     out: List[DiscountOut] = []
     for doc in q.stream():
         data = doc.to_dict() or {}
-        out.append(DiscountOut(
-            id=doc.id,
-            target_type="product",
-            target_id=data.get("target_id"),
-            percent=float(data.get("percent", 0.0)),
-            active=bool(data.get("active", False)),
-            start_at=data.get("start_at"),
-            end_at=data.get("end_at"),
-        ))
+        target_type = data.get("target_type", "product")
+        # Only include product and category discounts
+        if target_type in ["product", "category"]:
+            target_id = data.get("target_id") or ""
+            out.append(DiscountOut(
+                id=doc.id,
+                target_type=target_type,
+                target_id=target_id,
+                percent=float(data.get("percent", 0.0)),
+                active=bool(data.get("active", False)),
+                start_at=data.get("start_at"),
+                end_at=data.get("end_at"),
+            ))
     return out
 
 
@@ -148,9 +163,9 @@ def list_discounts(
     active: Optional[bool] = Query(None, description="Aktif filtre"),
 ):
     """
-    Yalnızca PRODUCT indirimlerini listeler. Opsiyonel ürün ve aktiflik filtresi.
+    Tüm indirimleri listeler (product ve category). Opsiyonel ürün ve aktiflik filtresi.
     """
-    q = db.collection("discounts").where(filter=FieldFilter("target_type", "==", "product"))
+    q = db.collection("discounts")
     if product_id:
         q = q.where(filter=FieldFilter("target_id", "==", product_id))
     if active is not None:
@@ -159,15 +174,19 @@ def list_discounts(
     out: List[DiscountOut] = []
     for doc in q.stream():
         data = doc.to_dict() or {}
-        out.append(DiscountOut(
-            id=doc.id,
-            target_type="product",
-            target_id=data.get("target_id"),
-            percent=float(data.get("percent", 0.0)),
-            active=bool(data.get("active", False)),
-            start_at=data.get("start_at"),
-            end_at=data.get("end_at"),
-        ))
+        target_type = data.get("target_type", "product")
+        # Only include product and category discounts
+        if target_type in ["product", "category"]:
+            target_id = data.get("target_id") or ""
+            out.append(DiscountOut(
+                id=doc.id,
+                target_type=target_type,
+                target_id=target_id,
+                percent=float(data.get("percent", 0.0)),
+                active=bool(data.get("active", False)),
+                start_at=data.get("start_at"),
+                end_at=data.get("end_at"),
+            ))
     return out
 
 
@@ -177,12 +196,13 @@ def get_discount(discount_id: str):
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Discount not found")
     data = doc.to_dict() or {}
-    if data.get("target_type") != "product":
-        raise HTTPException(status_code=400, detail="Only product discounts are supported")
+    target_type = data.get("target_type", "product")
+    if target_type not in ["product", "category"]:
+        raise HTTPException(status_code=400, detail="Only product and category discounts are supported")
     return DiscountOut(
         id=doc.id,
-        target_type="product",
-        target_id=data.get("target_id"),
+        target_type=target_type,
+        target_id=data.get("target_id") or "",
         percent=float(data.get("percent", 0.0)),
         active=bool(data.get("active", False)),
         start_at=data.get("start_at"),
@@ -225,7 +245,15 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
     if request.targetType == "product" and request.targetId:
         _recalc_product_final_price(request.targetId)
 
-    return DiscountOut(id=ref.id, **payload)
+    return DiscountOut(
+        id=ref.id,
+        target_type=request.targetType,
+        target_id=request.targetId or "",
+        percent=float(request.percentage),
+        active=bool(request.isActive),
+        start_at=request.startDate,
+        end_at=request.endDate,
+    )
 
 
 @router.post(
@@ -270,6 +298,80 @@ def create_discount_product(
 @router.put(
     "/{discount_id}",
     response_model=DiscountOut,
+    summary="Update Discount (JSON)",
+)
+def update_discount_json(
+    discount_id: str,
+    request: DiscountUpdateRequest,
+):
+    """
+    JSON ile indirim günceller.
+    """
+    ref = db.collection("discounts").document(discount_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Discount not found")
+
+    current = snap.to_dict() or {}
+    target_type = current.get("target_type", "product")
+    if target_type not in ["product", "category"]:
+        raise HTTPException(status_code=400, detail="Only product and category discounts are supported")
+
+    updates = {}
+    if request.percentage is not None:
+        if request.percentage <= 0 or request.percentage > 100:
+            raise HTTPException(status_code=400, detail="percentage 0-100 aralığında olmalı")
+        updates["percent"] = float(request.percentage)
+    if request.startDate is not None:
+        updates["start_at"] = request.startDate
+    if request.endDate is not None:
+        updates["end_at"] = request.endDate
+    if request.isActive is not None:
+        updates["active"] = bool(request.isActive)
+    if request.targetType is not None:
+        if request.targetType not in ["product", "category"]:
+            raise HTTPException(status_code=400, detail="targetType 'product' veya 'category' olmalı")
+        updates["target_type"] = request.targetType
+    if request.targetId is not None:
+        updates["target_id"] = request.targetId
+
+    # Tarih tutarlılığı
+    start_at = updates.get("start_at") or current.get("start_at")
+    end_at = updates.get("end_at") or current.get("end_at")
+    if start_at and end_at and start_at > end_at:
+        raise HTTPException(status_code=400, detail="start_at > end_at olamaz")
+
+    if updates:
+        ref.update(updates)
+        # Update target_type if changed
+        if "target_type" in updates:
+            target_type = updates["target_type"]
+
+    # Ürünün final fiyatını güncelle (sadece product için)
+    final_target_type = updates.get("target_type") or target_type
+    final_target_id = updates.get("target_id") or current.get("target_id")
+    if final_target_type == "product" and final_target_id:
+        _recalc_product_final_price(final_target_id)
+    # Eski target_id'yi de güncelle (eğer değiştiyse)
+    if current.get("target_type") == "product" and current.get("target_id") and current.get("target_id") != final_target_id:
+        _recalc_product_final_price(current.get("target_id"))
+
+    fresh = ref.get().to_dict() or {}
+    final_target_type = fresh.get("target_type", target_type)
+    return DiscountOut(
+        id=discount_id,
+        target_type=final_target_type,
+        target_id=fresh.get("target_id") or "",
+        percent=float(fresh.get("percent", 0.0)),
+        active=bool(fresh.get("active", False)),
+        start_at=fresh.get("start_at"),
+        end_at=fresh.get("end_at"),
+    )
+
+
+@router.put(
+    "/{discount_id}/form",
+    response_model=DiscountOut,
     summary="Update Discount (product, form)",
 )
 def update_discount_product(
@@ -288,8 +390,9 @@ def update_discount_product(
         raise HTTPException(status_code=404, detail="Discount not found")
 
     current = snap.to_dict() or {}
-    if current.get("target_type") != "product":
-        raise HTTPException(status_code=400, detail="Only product discounts are supported")
+    target_type = current.get("target_type", "product")
+    if target_type not in ["product", "category"]:
+        raise HTTPException(status_code=400, detail="Only product and category discounts are supported")
 
     updates = {}
     if percent is not None:
@@ -311,17 +414,26 @@ def update_discount_product(
     if updates:
         ref.update(updates)
 
-    # Ürünün final fiyatını güncelle
-    _recalc_product_final_price(current.get("target_id", ""))
+    # Ürünün final fiyatını güncelle (sadece product için)
+    if target_type == "product" and current.get("target_id"):
+        _recalc_product_final_price(current.get("target_id", ""))
 
     fresh = ref.get().to_dict() or {}
-    return DiscountOut(id=discount_id, **fresh)
+    return DiscountOut(
+        id=discount_id,
+        target_type=target_type,
+        target_id=fresh.get("target_id") or "",
+        percent=float(fresh.get("percent", 0.0)),
+        active=bool(fresh.get("active", False)),
+        start_at=fresh.get("start_at"),
+        end_at=fresh.get("end_at"),
+    )
 
 
 @router.delete("/{discount_id}", summary="Delete Discount")
 def delete_discount(discount_id: str):
     """
-    İndirimi kalıcı olarak siler ve ürünü yeniden hesaplar.
+    İndirimi kalıcı olarak siler ve ürünü yeniden hesaplar (sadece product için).
     """
     ref = db.collection("discounts").document(discount_id)
     snap = ref.get()
@@ -329,12 +441,14 @@ def delete_discount(discount_id: str):
         raise HTTPException(status_code=404, detail="Discount not found")
 
     data = snap.to_dict() or {}
-    if data.get("target_type") != "product":
-        raise HTTPException(status_code=400, detail="Only product discounts are supported")
+    target_type = data.get("target_type", "product")
+    if target_type not in ["product", "category"]:
+        raise HTTPException(status_code=400, detail="Only product and category discounts are supported")
 
     ref.delete()
 
-    # Ürünün final fiyatını güncelle
-    _recalc_product_final_price(data.get("target_id", ""))
+    # Ürünün final fiyatını güncelle (sadece product için)
+    if target_type == "product" and data.get("target_id"):
+        _recalc_product_final_price(data.get("target_id", ""))
 
     return {"detail": "Discount deleted"}

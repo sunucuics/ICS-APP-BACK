@@ -11,28 +11,37 @@ from backend.app.schemas.notification import UserNotificationOut
 
 router = APIRouter(prefix="/notifications", tags=["User: Notifications"])
 
+@router.get("", response_model=List[UserNotificationOut])
 @router.get("/", response_model=List[UserNotificationOut])
 def get_notifications(current_user: dict = Depends(get_current_user)):
     """
     Get all notifications for the current user
     """
     try:
-        user_id = current_user.get("uid")
+        user_id = current_user.get("id") or current_user.get("uid")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found")
         
         # Get notifications for this user, ordered by created_at descending
         notifications_ref = db.collection("user_notifications")
-        query = notifications_ref.where("user_id", "==", user_id).order_by("created_at", direction=firestore.Query.DESCENDING)
+        # Use where only (no order_by to avoid index requirement)
+        query = notifications_ref.where("user_id", "==", user_id)
         docs = query.stream()
         
         notifications = []
         for doc in docs:
             notification_data = doc.to_dict()
             notification_data["id"] = doc.id
-            notifications.append(UserNotificationOut(**notification_data))
+            notifications.append(notification_data)
         
-        return notifications
+        # Sort by created_at descending in Python (to avoid Firestore index requirement)
+        notifications.sort(
+            key=lambda x: x.get("created_at") or datetime.min,
+            reverse=True
+        )
+        
+        # Convert to UserNotificationOut after sorting
+        return [UserNotificationOut(**n) for n in notifications]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching notifications: {str(e)}")
 
@@ -42,7 +51,7 @@ def get_notification(notification_id: str, current_user: dict = Depends(get_curr
     Get a specific notification by ID
     """
     try:
-        user_id = current_user.get("uid")
+        user_id = current_user.get("id") or current_user.get("uid")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found")
         
@@ -69,7 +78,7 @@ def mark_notification_as_read(notification_id: str, current_user: dict = Depends
     Mark a notification as read
     """
     try:
-        user_id = current_user.get("uid")
+        user_id = current_user.get("id") or current_user.get("uid")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found")
         
@@ -100,7 +109,7 @@ def mark_all_notifications_as_read(current_user: dict = Depends(get_current_user
     Mark all notifications as read for the current user
     """
     try:
-        user_id = current_user.get("uid")
+        user_id = current_user.get("id") or current_user.get("uid")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found")
         
@@ -132,7 +141,7 @@ def delete_notification(notification_id: str, current_user: dict = Depends(get_c
     Delete a notification
     """
     try:
-        user_id = current_user.get("uid")
+        user_id = current_user.get("id") or current_user.get("uid")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found")
         

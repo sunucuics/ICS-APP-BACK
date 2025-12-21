@@ -1,6 +1,6 @@
 # app/routers/featured.py
 from __future__ import annotations
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Path, status
 from backend.app.schemas.featured import FeaturedExpandedDoc
 from backend.app.services.featured_service import feature, unfeature, list_items
@@ -12,7 +12,7 @@ admin_router = APIRouter(
     dependencies=[Depends(get_current_admin)],
 )
 
-def _uid_of(admin) -> str | None:
+def _uid_of(admin) -> Optional[str]:
     return admin.get("uid") if isinstance(admin, dict) else getattr(admin, "uid", None)
 
 # ---------- PRODUCTS (ADMIN) ----------
