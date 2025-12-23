@@ -260,14 +260,18 @@ def list_service_comments(
 @admin_router.get("/", response_model=List[CommentOut], summary="(Admin) Tüm yorumları listele")
 def list_all_comments():
     """
-    Admin - List all comments with user names and target names
+    Admin - List all comments with user names and target names (excluding deleted comments)
     """
-    comments_ref = db.collection("comments").order_by("created_at", direction=firestore.Query.DESCENDING)
-    docs = comments_ref.stream()
-    rows = []
-    for doc in docs:
-        comment_data = _doc_to_out(doc)
-        rows.append(comment_data)
+    q = (
+        db.collection("comments")
+        .where(filter=FieldFilter("is_deleted", "==", False))
+    )
+    try:
+        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+    except Exception:
+        pass
+    docs = list(q.stream())
+    rows = [_doc_to_out(d) for d in docs]
     
     # Kullanıcı isimlerini ve hedef (ürün/hizmet) isimlerini ekle
     rows = _attach_user_names(rows)

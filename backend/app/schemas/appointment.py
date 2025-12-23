@@ -35,7 +35,7 @@ Admin panelinden manuel randevu oluşturmak veya saat bloklamak için.
 Randevu durumunu güncellemek için.
 | Alan   | Tip                                   | Zorunlu | Açıklama |
 |--------|---------------------------------------|---------|----------|
-| status | `"approved"` \| `"cancelled"`         | ✔       | Yeni durum |
+| status | `"approved"` \| `"completed"` \| `"cancelled"`         | ✔       | Yeni durum |
 
 ---
 
@@ -46,6 +46,7 @@ Randevu durumunu güncellemek için.
 |------------|--------------|
 | `pending`  | Beklemede    |
 | `approved` | Onaylandı    |
+| `completed`| Tamamlandı   |
 | `cancelled`| İptal edildi |
 
 ---
@@ -61,7 +62,7 @@ Kullanıcı ve admin tarafında randevu yanıtı.
 | user_id    | `str` / `null`              | Kullanıcı ID'si |
 | start      | `datetime`                  | Başlangıç |
 | end        | `datetime`                  | Bitiş |
-| status     | `"pending"` \| `"approved"` \| `"cancelled"` | Durum |
+| status     | `"pending"` \| `"approved"` \| `"completed"` \| `"cancelled"` | Durum |
 
 ---
 
@@ -127,7 +128,7 @@ class AppointmentAdminCreate(BaseModel):
 
 class AppointmentUpdate(BaseModel):
     """Schema for updating appointment status."""
-    status: Literal["approved", "cancelled"] = Field(..., description="Yeni durum")
+    status: Literal["approved", "completed", "cancelled"] = Field(..., description="Yeni durum (approved, completed, cancelled)")
 
 
 # --------- Ortak Enum / Çıkış Şemaları ---------
@@ -136,7 +137,6 @@ class AppointmentStatus(str, Enum):
     pending = "pending"
     approved = "approved"
     cancelled = "cancelled"
-    confirmed = "confirmed"
     completed = "completed"
 
 class AppointmentOut(BaseModel):
@@ -170,6 +170,7 @@ class AppointmentAdminOut(BaseModel):
     start: datetime
     end: datetime
     status: str
+    notes: Optional[str] = None
     user: Optional[UserBrief] = None
     service: Optional[ServiceBrief] = None
 

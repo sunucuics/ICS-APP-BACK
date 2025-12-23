@@ -53,6 +53,7 @@ def _coerce_dt(v: Any) -> Optional[datetime]:
 def request_appointment(
     service_id: str = Form(...),
     start: datetime = Form(...),
+    notes: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -93,7 +94,8 @@ def request_appointment(
         "user_id": user_id,
         "start": start_norm,
         "end": end_time,
-        "status": "pending"
+        "status": "pending",
+        "notes": notes
     }
     ref.set(appt_data)
     appt_data["id"] = ref.id
@@ -125,7 +127,7 @@ admin_router = APIRouter(prefix="/appointments", dependencies=[Depends(get_curre
 
 
 @admin_router.get("", response_model=List[AppointmentAdminOut])
-def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|cancelled)$")):
+def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
     """
     Admin endpoint – lists all appointments.
     Optional **status** filter.
@@ -160,6 +162,7 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
             "start":  _coerce_dt(d.get("start")),
             "end":    _coerce_dt(d.get("end")),
             "status": d.get("status", "pending"),
+            "notes":  d.get("notes"),
             "user": {
                 "id":    uid,
                 "name":  (user_map.get(uid) or {}).get("name"),
@@ -178,7 +181,7 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
 
 
 @admin_router.get("/", response_model=List[AppointmentAdminOut])
-def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|cancelled)$")):
+def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
     """
     Admin endpoint – lists all appointments.
     Optional **status** filter.

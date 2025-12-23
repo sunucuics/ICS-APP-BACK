@@ -242,6 +242,28 @@ def get_current_address(current_user: dict = Depends(get_current_user)):
 
     return AddressOut(**current)
 
+@router.put("/me/fcm-token")
+def update_fcm_token(
+    fcm_token: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update the FCM token for the current user.
+    This should be called when:
+    - User logs in
+    - FCM token refreshes
+    - App starts and user is authenticated
+    """
+    user_id = current_user["id"]
+    user_ref = db.collection("users").document(user_id)
+    
+    if not user_ref.get().exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_ref.update({"fcm_token": fcm_token})
+    
+    return {"message": "FCM token updated successfully", "user_id": user_id}
+
 # Admin router for user management
 admin_router = APIRouter(prefix="/users", tags=["Admin: Users"], dependencies=[Depends(get_current_admin)])
 
@@ -255,8 +277,39 @@ def list_users():
     users = []
     for doc in docs:
         user_data = doc.to_dict()
+        if not user_data:
+            continue
+        
+        # Email is required, skip users without email
+        email = user_data.get("email")
+        if not email or not isinstance(email, str) or "@" not in email:
+            print(f"Skipping user {doc.id}: invalid or missing email")
+            continue
+        
+        # Ensure required fields exist
         user_data["id"] = doc.id
-        users.append(UserProfile(**user_data))
+        user_data.setdefault("role", "customer")
+        user_data.setdefault("addresses", [])
+        
+        # Remove fields that are not in UserProfile schema
+        # Keep only: id, name, email, phone, role, addresses
+        cleaned_data = {
+            "id": user_data["id"],
+            "email": email,
+            "role": user_data.get("role", "customer"),
+            "addresses": user_data.get("addresses", []),
+            "name": user_data.get("name"),
+            "phone": user_data.get("phone"),
+        }
+        
+        try:
+            users.append(UserProfile(**cleaned_data))
+        except Exception as e:
+            # Log error but continue processing other users
+            print(f"Error parsing user {doc.id}: {e}")
+            print(f"User data: {cleaned_data}")
+            continue
+    
     return users
 
 @admin_router.get("", response_model=list[UserProfile])
