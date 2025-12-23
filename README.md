@@ -1,6 +1,5 @@
 # ICS App Backend
 
-## 🎉 Proje Tamamlandı!
 
 Bu proje, ICS (İnşaat ve Çevre Sistemleri) uygulamasının backend API'sini içermektedir. Uygulama tamamen tamamlanmış ve production-ready durumdadır.
 
