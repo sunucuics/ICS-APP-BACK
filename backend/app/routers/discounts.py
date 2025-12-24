@@ -56,6 +56,18 @@ router = APIRouter(
 # Yardımcılar
 # ---------------------------------------------------------------------
 
+def _to_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Firestore'dan gelen veya request ile gelen datetime'ı UTC tz-aware hale getirir.
+    - tz yoksa: UTC kabul eder.
+    - tz varsa: UTC'ye çevirir.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 def _day_start_utc(d: Optional[date]) -> Optional[datetime]:
     if d is None:
         return None
@@ -69,11 +81,16 @@ def _day_end_utc(d: Optional[date]) -> Optional[datetime]:
     return datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
 
 def _is_window_active(start_at: Optional[datetime], end_at: Optional[datetime], now: datetime) -> bool:
+    start_at = _to_aware_utc(start_at)
+    end_at = _to_aware_utc(end_at)
+    now = _to_aware_utc(now) or datetime.now(timezone.utc)
+
     if start_at and now < start_at:
         return False
     if end_at and now > end_at:
         return False
     return True
+
 
 def _best_discount_percent_for_product(product_id: str) -> float:
     """
@@ -93,6 +110,7 @@ def _best_discount_percent_for_product(product_id: str) -> float:
         if _is_window_active(d.get("start_at"), d.get("end_at"), now):
             best = max(best, float(d.get("percent", 0.0)))
     return best
+
 
 def _recalc_product_final_price(product_id: str) -> None:
     """
@@ -222,11 +240,13 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
     """
     if request.percentage <= 0 or request.percentage > 100:
         raise HTTPException(status_code=400, detail="percentage 0-100 aralığında olmalı")
-    
+
     if request.targetType not in ["product", "category"]:
         raise HTTPException(status_code=400, detail="targetType 'product' veya 'category' olmalı")
-    
-    if request.startDate and request.endDate and request.startDate > request.endDate:
+
+    start_at = _to_aware_utc(request.startDate)
+    end_at = _to_aware_utc(request.endDate)
+    if start_at and end_at and start_at > end_at:
         raise HTTPException(status_code=400, detail="startDate > endDate olamaz")
 
     payload = {
@@ -234,12 +254,26 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
         "target_id": request.targetId,
         "percent": float(request.percentage),
         "active": bool(request.isActive),
-        "start_at": request.startDate,
-        "end_at": request.endDate,
+        "start_at": start_at,
+        "end_at": end_at,
     }
 
     ref = db.collection("discounts").document()
     ref.set(payload)
+
+    if request.targetType == "product" and request.targetId:
+        _recalc_product_final_price(request.targetId)
+
+    return DiscountOut(
+        id=ref.id,
+        target_type=request.targetType,
+        target_id=request.targetId or "",
+        percent=float(request.percentage),
+        active=bool(request.isActive),
+        start_at=start_at,
+        end_at=end_at,
+    )
+
 
     # Ürünün final fiyatını güncelle (sadece product için)
     if request.targetType == "product" and request.targetId:
@@ -367,6 +401,8 @@ def update_discount_json(
         start_at=fresh.get("start_at"),
         end_at=fresh.get("end_at"),
     )
+
+
 
 
 @router.put(

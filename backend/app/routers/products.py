@@ -97,6 +97,57 @@ from google.cloud.firestore_v1 import FieldFilter
 from google.cloud import firestore as gcf
 from google.cloud.firestore import SERVER_TIMESTAMP
 
+
+from datetime import datetime, timezone  # mevcut importlarınızda datetime var; timezone yoksa ekleyin
+
+def _to_aware_utc(dt):
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _is_window_active(start_at, end_at, now):
+    start_at = _to_aware_utc(start_at)
+    end_at = _to_aware_utc(end_at)
+    now = _to_aware_utc(now) or datetime.now(timezone.utc)
+    if start_at and now < start_at:
+        return False
+    if end_at and now > end_at:
+        return False
+    return True
+
+def _delete_discounts_for_product(product_id: str) -> int:
+    """
+    discounts koleksiyonunda bu product_id’ye bağlı PRODUCT indirimlerini siler.
+    - composite index'e takılmamak için tek filtreden ilerler.
+    - eski/kirli data (targetId/productId vb.) için de temizlik yapar.
+    """
+    deleted = 0
+
+    # Sadece target_type üzerinden filtre (tek alan -> index sorunsuz)
+    q = db.collection("discounts").where(filter=FieldFilter("target_type", "==", "product"))
+
+    for snap in q.stream():
+        d = snap.to_dict() or {}
+
+        # Olası alan adları
+        candidates = [
+            d.get("target_id"),
+            d.get("targetId"),
+            d.get("product_id"),
+            d.get("productId"),
+        ]
+
+        if product_id in candidates:
+            snap.reference.delete()
+            deleted += 1
+
+    return deleted
+
+
+
+
 router = APIRouter(prefix="/products", tags=["Products"])
 
 def _list_products_impl(
@@ -351,14 +402,10 @@ async def create_product_json(
 
 
 @admin_router.put("/{product_id}", response_model=ProductOut)
-async def update_product(product_id: str,
-                         product_update: ProductUpdate):
-    """
-    Admin endpoint to update a product.
-    Allows updating basic fields; image update can be done by uploading new images (which will replace existing images).
-    If images are provided, they will overwrite the current images of the product.
-    """
-    # Find the product in subcollections using collection_group
+async def update_product(product_id: str, product_update: ProductUpdate):
+
+
+
     snap = next(
         db.collection_group("items")
           .where(filter=FieldFilter("id", "==", product_id))
@@ -368,51 +415,150 @@ async def update_product(product_id: str,
     )
     if not snap:
         raise HTTPException(status_code=404, detail="Product not found")
-    
+
     doc_ref = snap.reference
-    
+
     update_data = {}
-    if product_update.title is not None: 
+    if product_update.title is not None:
         update_data["title"] = product_update.title
-    if product_update.description is not None: 
+    if product_update.description is not None:
         update_data["description"] = product_update.description
-    if product_update.price is not None: 
-        update_data["price"] = product_update.price
-    if product_update.stock is not None: 
-        update_data["stock"] = product_update.stock
-    if product_update.category_id is not None: 
+    if product_update.price is not None:
+        update_data["price"] = float(product_update.price)
+    if product_update.stock is not None:
+        update_data["stock"] = int(product_update.stock)
+    if product_update.category_id is not None:
         update_data["category_id"] = product_update.category_id
-    if product_update.is_upcoming is not None: 
-        update_data["is_upcoming"] = product_update.is_upcoming
-    # Note: Image updates are handled separately via upload endpoint
+    if product_update.is_upcoming is not None:
+        update_data["is_upcoming"] = bool(product_update.is_upcoming)
+
     if update_data:
+        update_data["updated_at"] = SERVER_TIMESTAMP
         doc_ref.update(update_data)
-    # Return updated document
-    updated_doc = doc_ref.get().to_dict()
-    updated_doc['id'] = product_id
-    # Compute final_price with any discount
-    final_price = updated_doc['price']
-    best_percent = 0
-    import datetime
-    now = datetime.datetime.utcnow()
-    disc_q = db.collection("discounts").where("active", "==", True).where("target_id", "in", [product_id, updated_doc.get('category_id')]).stream()
-    for d in disc_q:
-        disc = d.to_dict()
-        start_at = disc.get('start_at'); end_at = disc.get('end_at')
-        if start_at and now < start_at: continue
-        if end_at and now > end_at: continue
-        if disc['target_type'] == 'product' and disc['target_id'] == product_id:
-            best_percent = max(best_percent, disc['percent'])
-            break  # product-specific discount found, can break
-        elif disc['target_type'] == 'category' and disc['target_id'] == updated_doc.get('category_id'):
-            best_percent = max(best_percent, disc['percent'])
-    if best_percent:
-        final_price = round(final_price * (100 - best_percent) / 100, 2)
-    updated_doc['final_price'] = final_price
+
+    updated_doc = doc_ref.get().to_dict() or {}
+    updated_doc["id"] = product_id
+
+    base_price = float(updated_doc.get("price", 0.0))
+    now = datetime.now(timezone.utc)
+
+    best_percent = 0.0
+
+    # 1) Product discount
+    prod_q = (
+        db.collection("discounts")
+        .where(filter=FieldFilter("active", "==", True))
+        .where(filter=FieldFilter("target_type", "==", "product"))
+        .where(filter=FieldFilter("target_id", "==", product_id))
+    )
+    for ds in prod_q.stream():
+        d = ds.to_dict() or {}
+        if _is_window_active(d.get("start_at"), d.get("end_at"), now):
+            best_percent = max(best_percent, float(d.get("percent", 0.0)))
+
+    # 2) Category discount (category_id varsa)
+    category_id = updated_doc.get("category_id")
+    if category_id:
+        cat_q = (
+            db.collection("discounts")
+            .where(filter=FieldFilter("active", "==", True))
+            .where(filter=FieldFilter("target_type", "==", "category"))
+            .where(filter=FieldFilter("target_id", "==", category_id))
+        )
+        for ds in cat_q.stream():
+            d = ds.to_dict() or {}
+            if _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                best_percent = max(best_percent, float(d.get("percent", 0.0)))
+
+    final_price = round(base_price * (100.0 - best_percent) / 100.0, 2) if best_percent else round(base_price, 2)
+    updated_doc["final_price"] = final_price
+
+    # final_price'ı da db'ye yazalım ki listelerde tutarlı olsun
+    doc_ref.update({"final_price": final_price})
+
     return updated_doc
+
 
 @admin_router.delete("/{product_id}")
 def delete_product(product_id: str, hard: bool = False):
+    q = (
+        db.collection_group("items")
+        .where(filter=FieldFilter("id", "==", product_id))
+        .limit(1)
+        .stream()
+    )
+    doc_snap = next(q, None)
+    if not doc_snap:
+        raise HTTPException(404, "Product not found")
+
+    doc_ref = doc_snap.reference
+
+    deleted_discounts = _delete_discounts_for_product(product_id)
+
+    if hard:
+        doc_ref.delete()
+        return {"detail": "Product hard-deleted", "deleted_discounts": deleted_discounts}
+
+    doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
+    return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
+
+    """
+    Admin product deletion
+    • hard=true  → tamamen siler
+    • hard=false → is_deleted = True
+    Ayrıca: Ürüne bağlı product indirimlerini de siler (cascade).
+    """
+    q = (
+        db.collection_group("items")
+        .where(filter=FieldFilter("id", "==", product_id))
+        .limit(1)
+        .stream()
+    )
+    doc_snap = next(q, None)
+    if not doc_snap:
+        raise HTTPException(404, "Product not found")
+
+    doc_ref = doc_snap.reference
+
+    # Ürüne ait indirimleri önce sil (hard/soft fark etmez)
+    deleted_discounts = _delete_discounts_for_product(product_id)
+
+    if hard:
+        doc_ref.delete()
+        return {"detail": "Product hard-deleted", "deleted_discounts": deleted_discounts}
+
+    doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
+    return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
+
+    """
+    Admin product deletion
+    • hard=true  → tamamen siler
+    • hard=false → is_deleted = True
+    Ayrıca: Ürüne bağlı product indirimlerini de siler (cascade).
+    """
+    q = (
+        db.collection_group("items")
+        .where(filter=FieldFilter("id", "==", product_id))
+        .limit(1)
+        .stream()
+    )
+    doc_snap = next(q, None)
+    if not doc_snap:
+        raise HTTPException(404, "Product not found")
+
+    doc_ref = doc_snap.reference
+
+    # Ürün indirimlerini sil (hard/soft fark etmez)
+    deleted_discounts = _delete_discounts_for_product(product_id)
+
+    if hard:
+        doc_ref.delete()
+        return {"detail": "Product hard-deleted", "deleted_discounts": deleted_discounts}
+    else:
+        doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
+        return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
+
+
     """
     Admin product deletion
     • hard=true  → tamamen siler ve (isterseniz) görselleri de kaldırabilirsiniz

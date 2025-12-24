@@ -106,8 +106,9 @@ Başarılı girişte dönen token paketi.
 
 """
 from pydantic import BaseModel, EmailStr, constr, Field
-from typing import List, Optional , Annotated
+from typing import Any, Dict, List, Optional , Annotated
 from fastapi import Form
+
 
 PHONE_REGEX = r'^\d{3}\s\d{3}\s\d{4}$'
 NameStr  = Annotated[str, Field(min_length=1, strip_whitespace=True)]
@@ -264,3 +265,8 @@ class RegisterResponse(BaseModel):
     id_token: str
     refresh_token: str
     expires_in: int
+
+class ProfileUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    phone: Optional[str] = None          # "" gelirse temizlemek için
+    email: Optional[EmailStr] = None

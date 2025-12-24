@@ -59,7 +59,7 @@ Hizmet listeleme veya detay yanıtı.
 
 """
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Any, List, Optional
 from datetime import datetime
 
 class ServiceBase(BaseModel):
@@ -76,17 +76,20 @@ class ServiceUpdate(BaseModel):
     image: Optional[str] = None  # URL (opsiyonel)
 
 class ServiceOut(BaseModel):
-    """Schema for service info output to clients (no category fields)."""
     id: str
     title: str
-    description: str
-    image: Optional[str] = None  # URL to service image
-    is_upcoming: bool
-    is_deleted: bool
-    created_at: Optional[datetime] = None  # Firestore timestamp okununca datetime gelir
+    description: Optional[str] = ""
+    is_upcoming: bool = False
+    is_deleted: bool = False
     kind: Optional[str] = "service"
+    created_at: Optional[datetime] = None
 
-    model_config = {"from_attributes": True}
+    # yeni alan
+    images: List[str] = Field(default_factory=list, description="Service images (up to 3)")
+
+    # geri uyum (eski clientlar için)
+    image: Optional[str] = None
+
 
 class ServiceCreate(BaseModel):
     title: str

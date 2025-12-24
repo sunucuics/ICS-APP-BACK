@@ -66,7 +66,7 @@ from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , H
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
-from backend.app.schemas.user import UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
+from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
 from backend.app.core.security import (get_current_user)
 from backend.app.config import db
 import re
@@ -320,3 +320,61 @@ def logout(current_user: dict = Depends(get_current_user)):
         # Kullanıcı silinmiş vs. ise sessizce geçiyoruz.
         pass
     return {"detail": "Logged out"}
+
+@router.put(
+    "/me",
+    response_model=UserProfile,
+    summary="Kullanıcı profili güncelle (me)",
+)
+async def update_my_profile(
+    payload: ProfileUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    uid = current_user["id"]
+
+    user_ref = db.collection("users").document(uid)
+    snap = user_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="User profile not found")
+
+    updates: Dict[str, Any] = {}
+
+    # NAME
+    if payload.name is not None:
+        updates["name"] = payload.name.strip()
+
+    # PHONE
+    if payload.phone is not None:
+        phone = payload.phone.strip()
+        phone = phone or None  # "" -> None
+        if phone and not PHONE_PATTERN.fullmatch(phone):
+            raise HTTPException(status_code=422, detail="Telefon biçimi '555 123 4567' olmalı")
+        updates["phone"] = phone
+
+    # EMAIL (Firebase Auth + Firestore)
+    if payload.email is not None:
+        new_email = payload.email.strip().lower()
+        try:
+            firebase_auth.update_user(uid, email=new_email)
+        except firebase_auth.EmailAlreadyExistsError:
+            raise HTTPException(status_code=409, detail="Bu e-posta zaten kullanılıyor")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Email update failed: {e}")
+
+        updates["email"] = new_email
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    updates["updated_at"] = gcf.SERVER_TIMESTAMP
+    user_ref.update(updates)
+
+    fresh = user_ref.get().to_dict() or {}
+    return UserProfile(
+        id=uid,
+        name=fresh.get("name"),
+        email=fresh.get("email"),
+        phone=fresh.get("phone"),
+        role=fresh.get("role", "customer"),
+        addresses=fresh.get("addresses", []) or [],  # UserProfile şeman bunu istiyor, boş döner
+    )
