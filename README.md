@@ -5,6 +5,7 @@ Bu proje, ICS (İnşaat ve Çevre Sistemleri) uygulamasının backend API'sini i
 
 ## 🚀 Deploy
 
+
 Backend'i Google Cloud Run'a deploy etmek için:
 
 ```bash
