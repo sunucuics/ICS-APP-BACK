@@ -355,15 +355,11 @@ def send_notification(notification_data: NotificationSendRequest):
                         ),
                         apns=messaging.APNSConfig(
                             headers={
-                                'apns-priority': '10',  # 10 = immediate delivery (required for alerts)
-                                'apns-push-type': 'alert',
+                                'apns-priority': '10',
                             },
                             payload=messaging.APNSPayload(
                                 aps=messaging.Aps(
                                     sound='default',
-                                    badge=1,
-                                    mutable_content=True,
-                                    content_available=True,
                                 ),
                             ),
                         ),
