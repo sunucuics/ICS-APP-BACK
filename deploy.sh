@@ -23,9 +23,13 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 IMAGE_TAG="gcr.io/${PROJECT_ID}/ics-backend:${TIMESTAMP}"
 LATEST_TAG="gcr.io/${PROJECT_ID}/ics-backend:latest"
 
-# 1. Build ve push (hem timestamp hem latest tag ile)
+# 1. Build ve push (önce latest ile build et)
 echo "📦 Docker image build ediliyor..."
-gcloud builds submit --tag ${IMAGE_TAG} --tag ${LATEST_TAG} .
+gcloud builds submit --tag ${LATEST_TAG} .
+
+# 2. Timestamp tag'ini ekle (latest'ten kopyala)
+echo "🏷️  Timestamp tag ekleniyor..."
+gcloud container images add-tag ${LATEST_TAG} ${IMAGE_TAG}
 
 # 2. Deploy (timestamp tag kullanarak - Cloud Run'ın yeni revision oluşturmasını garanti eder)
 echo "🚀 Yeni revision deploy ediliyor..."
