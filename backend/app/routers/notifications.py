@@ -361,14 +361,17 @@ def send_notification(notification_data: NotificationSendRequest):
                                 aps=messaging.Aps(
                                     sound='default',
                                     badge=1,
-                                    content_available=True,
                                 ),
                             ),
                         ),
                     )
                     
-                    # Use send_each_for_multicast instead of deprecated send_multicast
-                    response = messaging.send_each_for_multicast(multicast_message)
+                    # Use send_each_for_multicast with fallback to send_multicast
+                    try:
+                        response = messaging.send_each_for_multicast(multicast_message)
+                    except AttributeError:
+                        # Fallback for older SDK versions
+                        response = messaging.send_multicast(multicast_message)
                     total_success += response.success_count
                     total_failure += response.failure_count
                 
@@ -377,7 +380,9 @@ def send_notification(notification_data: NotificationSendRequest):
             except Exception as e:
                 # Log FCM error but don't fail the entire request
                 # Notifications are already saved to database
-                print(f"FCM send error: {str(e)}")
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"FCM send error: {str(e)}\nTrace: {error_trace}")
                 failure_count = len(fcm_tokens)
         
         return {
