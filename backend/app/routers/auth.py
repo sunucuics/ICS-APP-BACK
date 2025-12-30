@@ -61,11 +61,12 @@ Amaç: Oturumu kapatmak.
 3. "Logged out" mesajı döndürülür.
 
 """
-from typing import Optional
+from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status , Form , Query , Header , Request
 import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
+from starlette.concurrency import run_in_threadpool
 from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
 from backend.app.core.security import (get_current_user)
 from backend.app.config import db
@@ -290,9 +291,14 @@ async def login(
     if fcm_token:
         try:
             user_id = data["localId"]
-            db.collection("users").document(user_id).update({
-                "fcm_token": fcm_token
-            })
+            
+            # Non-blocking update using threadpool
+            def update_token_sync():
+                db.collection("users").document(user_id).update({
+                    "fcm_token": fcm_token
+                })
+                
+            await run_in_threadpool(update_token_sync)
         except Exception as e:
             logging.warning(f"Failed to update FCM token: {e}")
 
@@ -305,7 +311,7 @@ async def login(
 
 
 # --------------------------------------------------------------------------- #
-# LOGOUT – refresh token’ları iptal eder, ID token’ı geçersiz kılar
+# LOGOUT – refresh token'ları iptal eder, ID token'ı geçersiz kılar
 # --------------------------------------------------------------------------- #
 @router.post("/logout", summary="Sunucu tarafında oturumu kapat (refresh revoke)")
 def logout(current_user: dict = Depends(get_current_user)):

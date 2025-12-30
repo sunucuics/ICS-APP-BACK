@@ -68,8 +68,11 @@ Tüm işlemler `get_current_user` bağımlılığı ile kimlik doğrulama gerekt
 2. `addresses` alanı liste olarak döndürülür.
 
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from pydantic import BaseModel
 from uuid import uuid4
+from firebase_admin import auth as firebase_auth
+from firebase_admin import _auth_utils
 from backend.app.core.security import get_current_user , get_current_admin
 from backend.app.config import db
 from backend.app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
@@ -242,9 +245,12 @@ def get_current_address(current_user: dict = Depends(get_current_user)):
 
     return AddressOut(**current)
 
+class FCMTokenUpdate(BaseModel):
+    fcm_token: str
+
 @router.put("/me/fcm-token")
 def update_fcm_token(
-    fcm_token: str,
+    request: FCMTokenUpdate,
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -260,7 +266,7 @@ def update_fcm_token(
     if not user_ref.get().exists:
         raise HTTPException(status_code=404, detail="User not found")
     
-    user_ref.update({"fcm_token": fcm_token})
+    user_ref.update({"fcm_token": request.fcm_token})
     
     return {"message": "FCM token updated successfully", "user_id": user_id}
 
@@ -334,10 +340,14 @@ def get_user_by_id(user_id: str):
     return UserProfile(**user_data)
 
 @admin_router.put("/{user_id}/role")
-def update_user_role(user_id: str, role: str):
+def update_user_role(user_id: str, role: str = Query(..., description="User role (customer or admin)")):
     """
     Admin - Update user role
     """
+    # Validate role value
+    if role not in ["customer", "admin"]:
+        raise HTTPException(status_code=400, detail="Role must be 'customer' or 'admin'")
+    
     user_ref = db.collection("users").document(user_id)
     doc = user_ref.get()
     if not doc.exists:
@@ -350,6 +360,9 @@ def update_user_role(user_id: str, role: str):
 def delete_user(user_id: str):
     """
     Admin - Delete user
+    This deletes the user from both Firestore and Firebase Authentication.
+    The user will not be able to login after deletion.
+    Note: Related data (orders, comments, appointments) are not automatically cleaned up.
     """
     user_ref = db.collection("users").document(user_id)
     doc = user_ref.get()
@@ -360,7 +373,21 @@ def delete_user(user_id: str):
     user_data = doc.to_dict()
     user_data["id"] = doc.id
     
-    # Delete the user document
+    # Revoke all refresh tokens (logout user from all devices)
+    try:
+        firebase_auth.revoke_refresh_tokens(user_id)
+    except _auth_utils.UserNotFoundError:
+        # User might not exist in Firebase Auth, continue anyway
+        pass
+    
+    # Delete from Firestore
     user_ref.delete()
     
-    return {"message": f"User {user_id} deleted successfully", "deleted_user": user_data}
+    # Delete from Firebase Authentication
+    try:
+        firebase_auth.delete_user(user_id)
+    except _auth_utils.UserNotFoundError:
+        # User might not exist in Firebase Auth, but that's okay
+        pass
+    
+    return {"message": f"User {user_id} deleted successfully from both Firestore and Firebase Auth", "deleted_user": user_data}

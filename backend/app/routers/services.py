@@ -39,6 +39,11 @@ def _public_url_for_blob(blob) -> str:
         return blob.generate_signed_url(expiration=3600 * 24 * 365 * 10)
 
 
+def _is_valid_upload_file(file: UploadFile) -> bool:
+    """UploadFile'ın gerçekten yüklenmiş bir dosya olup olmadığını kontrol eder"""
+    return file is not None and file.filename is not None and file.filename != ""
+
+
 def _upload_one_image(service_id: str, file: UploadFile) -> Dict[str, str]:
     filename = file.filename or f"{uuid4()}.jpg"
     key = f"services/{service_id}/{uuid4()}-{filename}"
@@ -164,7 +169,7 @@ async def create_service(
 ):
     svc_ref = db.collection("services").document()
 
-    files = [f for f in (image1, image2, image3) if f is not None]
+    files = [f for f in (image1, image2, image3) if _is_valid_upload_file(f)]
     if len(files) > MAX_IMAGES:
         raise HTTPException(status_code=422, detail=f"Max {MAX_IMAGES} images allowed")
 
@@ -269,7 +274,7 @@ async def update_service(
             items.append(_upload_one_image(service_id, file))
 
     # silme: sadece remove true ve aynı slota yeni dosya yoksa
-    if remove_image3 and image3 is None and len(items) > 2:
+    if remove_image3 and not _is_valid_upload_file(image3) and len(items) > 2:
         removed = items.pop(2)
         path = removed.get("path") if isinstance(removed, dict) else None
         if path:
@@ -278,7 +283,7 @@ async def update_service(
             except Exception:
                 pass
 
-    if remove_image2 and image2 is None and len(items) > 1:
+    if remove_image2 and not _is_valid_upload_file(image2) and len(items) > 1:
         removed = items.pop(1)
         path = removed.get("path") if isinstance(removed, dict) else None
         if path:
@@ -287,7 +292,7 @@ async def update_service(
             except Exception:
                 pass
 
-    if remove_image1 and image1 is None and len(items) > 0:
+    if remove_image1 and not _is_valid_upload_file(image1) and len(items) > 0:
         removed = items.pop(0)
         path = removed.get("path") if isinstance(removed, dict) else None
         if path:
@@ -297,11 +302,11 @@ async def update_service(
                 pass
 
     # yeni upload varsa replace
-    if image1 is not None:
+    if _is_valid_upload_file(image1):
         _replace_at(0, image1)
-    if image2 is not None:
+    if _is_valid_upload_file(image2):
         _replace_at(1, image2)
-    if image3 is not None:
+    if _is_valid_upload_file(image3):
         _replace_at(2, image3)
 
     # max 3

@@ -148,6 +148,22 @@ class UserCreate(BaseModel):
     ] = Field(..., description="Şifre (min 6 karakter)")
 
 
+class ProfileUpdateRequest(BaseModel):
+    """Kullanıcı profil güncelleme isteği. Tüm alanlar opsiyonel, ancak en az bir alan gönderilmelidir."""
+    name: Optional[str] = Field(None, description="Ad Soyad (trim edilir)")
+    phone: Optional[str] = Field(None, description="Telefon (555 123 4567 formatında)")
+    email: Optional[EmailStr] = Field(None, description="E-posta (lowercase edilir)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "Efehan Hüsrevoğlu",
+                "phone": "555 123 4567",
+                "email": "newmail@example.com"
+            }
+        }
+
+
 class UserProfile(UserBase):
     """Schema for user profile output."""
     id: str = Field(..., description="User unique ID (UID from Firebase)")
@@ -265,8 +281,3 @@ class RegisterResponse(BaseModel):
     id_token: str
     refresh_token: str
     expires_in: int
-
-class ProfileUpdateRequest(BaseModel):
-    name: Optional[str] = Field(None, min_length=1)
-    phone: Optional[str] = None          # "" gelirse temizlemek için
-    email: Optional[EmailStr] = None

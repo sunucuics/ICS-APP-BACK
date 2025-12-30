@@ -92,27 +92,56 @@ def _is_window_active(start_at: Optional[datetime], end_at: Optional[datetime], 
     return True
 
 
-def _best_discount_percent_for_product(product_id: str) -> float:
+def _best_discount_percent_for_product(product_id: str, category_id: Optional[str] = None) -> float:
     """
     Ürüne hedeflenen (active=True) ve tarih aralığı uygun olan indirimlerden EN YÜKSEK yüzdelik.
-    (Sadece target_type='product' dikkate alınır.)
+    Hem product hem de category indirimlerini kontrol eder.
     """
     now = datetime.now(timezone.utc)
     best = 0.0
-    q = (
+    
+    # 1) Product discount
+    prod_q = (
         db.collection("discounts")
         .where(filter=FieldFilter("active", "==", True))
         .where(filter=FieldFilter("target_type", "==", "product"))
         .where(filter=FieldFilter("target_id", "==", product_id))
     )
-    for snap in q.stream():
+    for snap in prod_q.stream():
         d = snap.to_dict() or {}
         if _is_window_active(d.get("start_at"), d.get("end_at"), now):
             best = max(best, float(d.get("percent", 0.0)))
+    
+    # 2) Category discount - Eğer category_id verilmemişse, ürünün category_id'sini bul
+    if category_id is None:
+        # Alt koleksiyonlardan ürünü bul
+        item_snap = next(
+            db.collection_group("items")
+            .where(filter=FieldFilter("id", "==", product_id))
+            .limit(1)
+            .stream(),
+            None,
+        )
+        if item_snap:
+            pdata = item_snap.to_dict() or {}
+            category_id = pdata.get("category_id")
+    
+    if category_id:
+        cat_q = (
+            db.collection("discounts")
+            .where(filter=FieldFilter("active", "==", True))
+            .where(filter=FieldFilter("target_type", "==", "category"))
+            .where(filter=FieldFilter("target_id", "==", category_id))
+        )
+        for snap in cat_q.stream():
+            d = snap.to_dict() or {}
+            if _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                best = max(best, float(d.get("percent", 0.0)))
+    
     return best
 
 
-def _recalc_product_final_price(product_id: str) -> None:
+def _recalc_product_final_price(product_id: str, category_id: Optional[str] = None) -> None:
     """
     Ürünün final_price'ını günceller. Hem ana products koleksiyonunda hem de alt koleksiyonlarda günceller.
     """
@@ -122,7 +151,8 @@ def _recalc_product_final_price(product_id: str) -> None:
     if prod_doc.exists:
         pdata = prod_doc.to_dict() or {}
         base_price = float(pdata.get("price", 0.0))
-        pct = _best_discount_percent_for_product(product_id)
+        cat_id = category_id or pdata.get("category_id")
+        pct = _best_discount_percent_for_product(product_id, cat_id)
         new_final = round(base_price * (100.0 - pct) / 100.0, 2)
         if pdata.get("final_price") != new_final:
             prod_ref.update({"final_price": new_final})
@@ -132,10 +162,52 @@ def _recalc_product_final_price(product_id: str) -> None:
     for item in items:
         pdata = item.to_dict() or {}
         base_price = float(pdata.get("price", 0.0))
-        pct = _best_discount_percent_for_product(product_id)
+        cat_id = category_id or pdata.get("category_id")
+        pct = _best_discount_percent_for_product(product_id, cat_id)
         new_final = round(base_price * (100.0 - pct) / 100.0, 2)
         if pdata.get("final_price") != new_final:
             item.reference.update({"final_price": new_final})
+
+
+def _recalc_category_products_final_price(category_id: str) -> int:
+    """
+    Belirli bir kategorideki TÜM ürünlerin final_price değerlerini yeniden hesaplar.
+    Kategori indirimi oluşturulduğunda/güncellendiğinde/silindiğinde çağrılır.
+    Returns: Güncellenen ürün sayısı
+    """
+    updated_count = 0
+    
+    # collection_group("items") ile category_id filtresi index gerektirdiğinden,
+    # tüm ürünleri çekip kod seviyesinde filtreliyoruz
+    try:
+        items = db.collection_group("items").stream()
+        
+        for item in items:
+            pdata = item.to_dict() or {}
+            
+            # Sadece bu kategorideki ürünleri işle
+            if pdata.get("category_id") != category_id:
+                continue
+            
+            product_id = pdata.get("id")
+            if not product_id:
+                continue
+                
+            # is_deleted ürünleri atla
+            if pdata.get("is_deleted", False):
+                continue
+                
+            base_price = float(pdata.get("price", 0.0))
+            pct = _best_discount_percent_for_product(product_id, category_id)
+            new_final = round(base_price * (100.0 - pct) / 100.0, 2)
+            
+            if pdata.get("final_price") != new_final:
+                item.reference.update({"final_price": new_final})
+                updated_count += 1
+    except Exception as e:
+        print(f"⚠️ Error recalculating category products: {e}")
+    
+    return updated_count
 
 
 # ---------------------------------------------------------------------
@@ -261,8 +333,14 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
     ref = db.collection("discounts").document()
     ref.set(payload)
 
-    if request.targetType == "product" and request.targetId:
-        _recalc_product_final_price(request.targetId)
+    # Ürünlerin final fiyatını güncelle
+    if request.targetId:
+        if request.targetType == "product":
+            _recalc_product_final_price(request.targetId)
+        elif request.targetType == "category":
+            # Kategori indirimi: Bu kategorideki TÜM ürünlerin fiyatlarını güncelle
+            updated = _recalc_category_products_final_price(request.targetId)
+            print(f"✅ Category discount created: {updated} products updated")
 
     return DiscountOut(
         id=ref.id,
@@ -272,21 +350,6 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
         active=bool(request.isActive),
         start_at=start_at,
         end_at=end_at,
-    )
-
-
-    # Ürünün final fiyatını güncelle (sadece product için)
-    if request.targetType == "product" and request.targetId:
-        _recalc_product_final_price(request.targetId)
-
-    return DiscountOut(
-        id=ref.id,
-        target_type=request.targetType,
-        target_id=request.targetId or "",
-        percent=float(request.percentage),
-        active=bool(request.isActive),
-        start_at=request.startDate,
-        end_at=request.endDate,
     )
 
 
@@ -357,9 +420,9 @@ def update_discount_json(
             raise HTTPException(status_code=400, detail="percentage 0-100 aralığında olmalı")
         updates["percent"] = float(request.percentage)
     if request.startDate is not None:
-        updates["start_at"] = request.startDate
+        updates["start_at"] = _to_aware_utc(request.startDate)
     if request.endDate is not None:
-        updates["end_at"] = request.endDate
+        updates["end_at"] = _to_aware_utc(request.endDate)
     if request.isActive is not None:
         updates["active"] = bool(request.isActive)
     if request.targetType is not None:
@@ -381,14 +444,27 @@ def update_discount_json(
         if "target_type" in updates:
             target_type = updates["target_type"]
 
-    # Ürünün final fiyatını güncelle (sadece product için)
+    # Ürünlerin final fiyatlarını güncelle
     final_target_type = updates.get("target_type") or target_type
     final_target_id = updates.get("target_id") or current.get("target_id")
-    if final_target_type == "product" and final_target_id:
-        _recalc_product_final_price(final_target_id)
-    # Eski target_id'yi de güncelle (eğer değiştiyse)
-    if current.get("target_type") == "product" and current.get("target_id") and current.get("target_id") != final_target_id:
-        _recalc_product_final_price(current.get("target_id"))
+    old_target_type = current.get("target_type", "product")
+    old_target_id = current.get("target_id")
+    
+    # Yeni hedef için güncelle
+    if final_target_id:
+        if final_target_type == "product":
+            _recalc_product_final_price(final_target_id)
+        elif final_target_type == "category":
+            updated = _recalc_category_products_final_price(final_target_id)
+            print(f"✅ Category discount updated: {updated} products updated")
+    
+    # Eski hedef değiştiyse, eski hedefi de güncelle
+    if old_target_id and old_target_id != final_target_id:
+        if old_target_type == "product":
+            _recalc_product_final_price(old_target_id)
+        elif old_target_type == "category":
+            updated = _recalc_category_products_final_price(old_target_id)
+            print(f"✅ Old category products updated: {updated} products")
 
     fresh = ref.get().to_dict() or {}
     final_target_type = fresh.get("target_type", target_type)
@@ -450,9 +526,14 @@ def update_discount_product(
     if updates:
         ref.update(updates)
 
-    # Ürünün final fiyatını güncelle (sadece product için)
-    if target_type == "product" and current.get("target_id"):
-        _recalc_product_final_price(current.get("target_id", ""))
+    # Ürünlerin final fiyatlarını güncelle
+    target_id = current.get("target_id", "")
+    if target_id:
+        if target_type == "product":
+            _recalc_product_final_price(target_id)
+        elif target_type == "category":
+            updated = _recalc_category_products_final_price(target_id)
+            print(f"✅ Category discount updated (form): {updated} products updated")
 
     fresh = ref.get().to_dict() or {}
     return DiscountOut(
@@ -469,7 +550,7 @@ def update_discount_product(
 @router.delete("/{discount_id}", summary="Delete Discount")
 def delete_discount(discount_id: str):
     """
-    İndirimi kalıcı olarak siler ve ürünü yeniden hesaplar (sadece product için).
+    İndirimi kalıcı olarak siler ve ürünlerin final fiyatlarını yeniden hesaplar.
     """
     ref = db.collection("discounts").document(discount_id)
     snap = ref.get()
@@ -481,10 +562,23 @@ def delete_discount(discount_id: str):
     if target_type not in ["product", "category"]:
         raise HTTPException(status_code=400, detail="Only product and category discounts are supported")
 
+    target_id = data.get("target_id", "")
+    
+    # İndirimi sil
     ref.delete()
 
-    # Ürünün final fiyatını güncelle (sadece product için)
-    if target_type == "product" and data.get("target_id"):
-        _recalc_product_final_price(data.get("target_id", ""))
+    # Ürünlerin final fiyatlarını güncelle (hata olsa bile response dön)
+    try:
+        if target_id:
+            if target_type == "product":
+                _recalc_product_final_price(target_id)
+            elif target_type == "category":
+                # Kategori indirimi silindi: Bu kategorideki TÜM ürünlerin fiyatlarını güncelle
+                updated = _recalc_category_products_final_price(target_id)
+                print(f"✅ Category discount deleted: {updated} products updated")
+    except Exception as e:
+        # Fiyat güncelleme hatası olsa bile indirim silindi, sadece logla
+        print(f"⚠️ Warning: Discount deleted but price recalculation failed: {e}")
+        # Response yine de başarılı dön (indirim silindi)
 
     return {"detail": "Discount deleted"}

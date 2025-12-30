@@ -100,6 +100,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 
 from datetime import datetime, timezone  # mevcut importlarınızda datetime var; timezone yoksa ekleyin
 
+
 def _to_aware_utc(dt):
     if dt is None:
         return None
@@ -116,6 +117,50 @@ def _is_window_active(start_at, end_at, now):
     if end_at and now > end_at:
         return False
     return True
+
+
+def _calculate_final_price(product_id: str, category_id: Optional[str], base_price: float) -> float:
+    """
+    Ürün için indirimli fiyatı hesaplar.
+    Hem product hem de category indirimlerini kontrol eder.
+    """
+    now = datetime.now(timezone.utc)
+    best_percent = 0.0
+    
+    # 1) Product discount
+    try:
+        prod_q = (
+            db.collection("discounts")
+            .where(filter=FieldFilter("active", "==", True))
+            .where(filter=FieldFilter("target_type", "==", "product"))
+            .where(filter=FieldFilter("target_id", "==", product_id))
+        )
+        for snap in prod_q.stream():
+            d = snap.to_dict() or {}
+            if _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                best_percent = max(best_percent, float(d.get("percent", 0.0)))
+    except Exception:
+        pass  # Silently handle discount lookup errors
+    
+    # 2) Category discount
+    if category_id:
+        try:
+            cat_q = (
+                db.collection("discounts")
+                .where(filter=FieldFilter("active", "==", True))
+                .where(filter=FieldFilter("target_type", "==", "category"))
+                .where(filter=FieldFilter("target_id", "==", category_id))
+            )
+            for snap in cat_q.stream():
+                d = snap.to_dict() or {}
+                if _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                    best_percent = max(best_percent, float(d.get("percent", 0.0)))
+        except Exception:
+            pass  # Silently handle discount lookup errors
+    
+    if best_percent > 0:
+        return round(base_price * (100.0 - best_percent) / 100.0, 2)
+    return round(base_price, 2)
 
 def _delete_discounts_for_product(product_id: str) -> int:
     """
@@ -166,7 +211,7 @@ def _list_products_impl(
 
     if category_name:
         # Artık type filtresi YOK; dokümana kaydedilen category_name üzerinden filtre
-        print(f"🔍 Filtering by category_name: '{category_name}'")
+        pass  # Category filtering done at code level below
         # Geçici olarak filtrelemeyi kaldırıyoruz - debug için
         # q = q.where(filter=FieldFilter("category_name", "==", category_name))
 
@@ -178,34 +223,38 @@ def _list_products_impl(
     #     pass
 
     out: List[ProductOut] = []
-    try:
-        for d in q.stream():
-            src = d.to_dict() or {}
-            print(f"📦 Processing product: {src.get('title', 'Unknown')} - category: {src.get('category_name', 'None')}")
+    for d in q.stream():
+        src = d.to_dict() or {}
+        
+        # Kategori filtrelemesini kod seviyesinde yap
+        if category_name and src.get("category_name") != category_name:
+            continue
             
-            # Kategori filtrelemesini kod seviyesinde yap
-            if category_name and src.get("category_name") != category_name:
-                continue
-                
-            # is_deleted filtresini kod seviyesinde yap
-            if src.get("is_deleted", False):
-                continue
-                
-            out.append(ProductOut(
-                id=src.get("id", d.id),
-                title=src.get("title", ""),
-                description=src.get("description", ""),
-                price=float(src.get("price", 0)),
-                final_price=float(src.get("final_price", src.get("price", 0) or 0)),
-                stock=int(src.get("stock", 0)),
-                is_upcoming=bool(src.get("is_upcoming", False)),
-                category_name=src.get("category_name", ""),
-                images=src.get("images", []) or [],
-            ))
-        print(f"✅ Found {len(out)} products")
-    except Exception as e:
-        print(f"❌ Error processing products: {e}")
-        raise e
+        # is_deleted filtresini kod seviyesinde yap
+        if src.get("is_deleted", False):
+            continue
+        
+        # final_price'ı dinamik olarak hesapla (indirimler dahil)
+        product_id = src.get("id", d.id)
+        category_id = src.get("category_id")
+        base_price = float(src.get("price", 0))
+        calculated_final_price = _calculate_final_price(product_id, category_id, base_price)
+        
+        # DEBUG: İlk birkaç ürünün fiyatlarını logla
+        if len(out) < 3:
+            print(f"[DEBUG LIST] Product: {src.get('title', 'N/A')[:20]}, DB price: {src.get('price')}, Returning: {base_price}")
+            
+        out.append(ProductOut(
+            id=product_id,
+            title=src.get("title", ""),
+            description=src.get("description", ""),
+            price=base_price,
+            final_price=calculated_final_price,
+            stock=int(src.get("stock", 0)),
+            is_upcoming=bool(src.get("is_upcoming", False)),
+            category_name=src.get("category_name", ""),
+            images=src.get("images", []) or [],
+        ))
     return out
 
 
@@ -241,12 +290,27 @@ def get_product(product_id: str):
         raise HTTPException(status_code=404, detail="Product not found")
 
     src = snap.to_dict() or {}
+    
+    # DEBUG: Veritabanından gelen ham değerleri logla
+    print(f"[DEBUG PRODUCT] ID: {product_id}")
+    print(f"[DEBUG PRODUCT] Raw price from DB: {src.get('price')}")
+    print(f"[DEBUG PRODUCT] Raw final_price from DB: {src.get('final_price')}")
+    
+    # final_price'ı dinamik olarak hesapla (indirimler dahil)
+    p_id = src.get("id", snap.id)
+    category_id = src.get("category_id")
+    base_price = float(src.get("price", 0))
+    calculated_final_price = _calculate_final_price(p_id, category_id, base_price)
+    
+    print(f"[DEBUG PRODUCT] Calculated final_price: {calculated_final_price}")
+    print(f"[DEBUG PRODUCT] Returning price: {base_price}, final_price: {calculated_final_price}")
+    
     return ProductOut(
-        id=src.get("id", snap.id),
+        id=p_id,
         title=src.get("title", ""),
         description=src.get("description", ""),
-        price=float(src.get("price", 0)),
-        final_price=float(src.get("final_price", src.get("price", 0) or 0)),
+        price=base_price,
+        final_price=calculated_final_price,
         stock=int(src.get("stock", 0)),
         is_upcoming=bool(src.get("is_upcoming", False)),
         category_name=src.get("category_name", ""),
@@ -338,14 +402,15 @@ async def create_product(
 
     image_urls = [upload(u) for u in uploads]
 
-    # 6) Firestore kaydı
+    # 6) Firestore kaydı - Fiyatlar TL cinsinden saklanır
     data = product_in.model_dump()
     data.update(
         id=prod_ref.id,
         title=product_in.name,
         category_id=cat_id,
         images=image_urls,
-        final_price=product_in.price,
+        price=float(product_in.price),  # TL cinsinden
+        final_price=float(product_in.price),  # TL cinsinden
         is_deleted=False,
         created_at=firestore.SERVER_TIMESTAMP,
     )
@@ -378,13 +443,13 @@ async def create_product_json(
     # 2) Slug oluştur
     slug = product_in.name.lower().replace(" ", "-").replace("ı", "i").replace("ğ", "g").replace("ü", "u").replace("ş", "s").replace("ö", "o").replace("ç", "c")
     
-    # 3) Ürün verilerini hazırla
+    # 3) Ürün verilerini hazırla - Fiyatlar TL cinsinden saklanır
     data = {
         "id": "",  # Firestore otomatik ID verecek
         "title": product_in.name,
         "description": product_in.description or "",
-        "price": float(product_in.price),
-        "final_price": float(product_in.price),  # İndirim yoksa aynı
+        "price": float(product_in.price),  # TL cinsinden
+        "final_price": float(product_in.price),  # İndirim yoksa aynı, TL cinsinden
         "stock": int(product_in.stock),
         "is_upcoming": bool(product_in.is_upcoming),
         "category_id": cat_doc.id,
@@ -399,6 +464,89 @@ async def create_product_json(
     data["id"] = prod_ref.id
     prod_ref.set(data)
     return data
+
+
+@admin_router.post("/_fix-prices", summary="Fiyatları 100'e böl (kuruş -> TL dönüşümü)")
+async def fix_prices_kurus_to_tl():
+    """
+    Tüm ürün fiyatlarını 100'e böler.
+    Bu endpoint, fiyatlar yanlışlıkla kuruş cinsinden girilmişse düzeltmek için kullanılır.
+    Örnek: 1000 -> 10 (TL)
+    
+    DİKKAT: Bu işlem geri alınamaz! Sadece gerektiğinde kullanın.
+    """
+    fixed_count = 0
+    fixed_products = []
+    
+    for d in db.collection_group("items").stream():
+        src = d.to_dict() or {}
+        if src.get("is_deleted", False):
+            continue
+            
+        old_price = float(src.get("price", 0))
+        old_final = float(src.get("final_price", 0))
+        
+        # Fiyat 100'den büyükse ve kuruş olarak girilmiş olabilir
+        if old_price >= 100:
+            new_price = round(old_price / 100, 2)
+            new_final = round(old_final / 100, 2) if old_final >= 100 else old_final
+            
+            d.reference.update({
+                "price": new_price,
+                "final_price": new_final,
+            })
+            
+            fixed_count += 1
+            fixed_products.append({
+                "id": d.id,
+                "title": src.get("title", "N/A"),
+                "old_price": old_price,
+                "new_price": new_price,
+            })
+    
+    return {
+        "message": f"{fixed_count} ürün fiyatı düzeltildi",
+        "fixed_count": fixed_count,
+        "fixed_products": fixed_products[:20],  # İlk 20 ürünü göster
+    }
+
+
+@admin_router.get("/_check-prices", summary="Fiyatları kontrol et")
+async def check_prices():
+    """
+    Tüm ürün fiyatlarını listeler - kuruş/TL tutarsızlığını tespit etmek için.
+    """
+    products = []
+    for d in db.collection_group("items").stream():
+        src = d.to_dict() or {}
+        if src.get("is_deleted", False):
+            continue
+        
+        price = float(src.get("price", 0))
+        final_price = float(src.get("final_price", 0))
+        
+        # Fiyat analizi
+        likely_kurus = price >= 100  # 100'den büyük fiyatlar muhtemelen kuruş
+        
+        products.append({
+            "id": d.id,
+            "title": src.get("title", "N/A")[:30],
+            "price": price,
+            "final_price": final_price,
+            "likely_kurus": likely_kurus,
+            "tl_if_kurus": round(price / 100, 2) if likely_kurus else None,
+        })
+    
+    # Kuruş olabilecek ürünleri öne al
+    products.sort(key=lambda x: (not x["likely_kurus"], -x["price"]))
+    
+    kurus_count = sum(1 for p in products if p["likely_kurus"])
+    
+    return {
+        "total_products": len(products),
+        "likely_kurus_count": kurus_count,
+        "products": products[:50],  # İlk 50 ürünü göster
+    }
 
 
 @admin_router.put("/{product_id}", response_model=ProductOut)
@@ -424,7 +572,7 @@ async def update_product(product_id: str, product_update: ProductUpdate):
     if product_update.description is not None:
         update_data["description"] = product_update.description
     if product_update.price is not None:
-        update_data["price"] = float(product_update.price)
+        update_data["price"] = float(product_update.price)  # TL cinsinden
     if product_update.stock is not None:
         update_data["stock"] = int(product_update.stock)
     if product_update.category_id is not None:
@@ -481,6 +629,15 @@ async def update_product(product_id: str, product_update: ProductUpdate):
 
 @admin_router.delete("/{product_id}")
 def delete_product(product_id: str, hard: bool = False):
+    """
+    Admin product deletion.
+    
+    Args:
+        product_id: ID of the product to delete
+        hard: If True, permanently deletes the product. If False, soft deletes (is_deleted=True)
+    
+    Also deletes any discounts associated with the product.
+    """
     q = (
         db.collection_group("items")
         .where(filter=FieldFilter("id", "==", product_id))
@@ -493,6 +650,7 @@ def delete_product(product_id: str, hard: bool = False):
 
     doc_ref = doc_snap.reference
 
+    # Delete associated discounts
     deleted_discounts = _delete_discounts_for_product(product_id)
 
     if hard:
@@ -501,89 +659,3 @@ def delete_product(product_id: str, hard: bool = False):
 
     doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
     return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
-
-    """
-    Admin product deletion
-    • hard=true  → tamamen siler
-    • hard=false → is_deleted = True
-    Ayrıca: Ürüne bağlı product indirimlerini de siler (cascade).
-    """
-    q = (
-        db.collection_group("items")
-        .where(filter=FieldFilter("id", "==", product_id))
-        .limit(1)
-        .stream()
-    )
-    doc_snap = next(q, None)
-    if not doc_snap:
-        raise HTTPException(404, "Product not found")
-
-    doc_ref = doc_snap.reference
-
-    # Ürüne ait indirimleri önce sil (hard/soft fark etmez)
-    deleted_discounts = _delete_discounts_for_product(product_id)
-
-    if hard:
-        doc_ref.delete()
-        return {"detail": "Product hard-deleted", "deleted_discounts": deleted_discounts}
-
-    doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
-    return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
-
-    """
-    Admin product deletion
-    • hard=true  → tamamen siler
-    • hard=false → is_deleted = True
-    Ayrıca: Ürüne bağlı product indirimlerini de siler (cascade).
-    """
-    q = (
-        db.collection_group("items")
-        .where(filter=FieldFilter("id", "==", product_id))
-        .limit(1)
-        .stream()
-    )
-    doc_snap = next(q, None)
-    if not doc_snap:
-        raise HTTPException(404, "Product not found")
-
-    doc_ref = doc_snap.reference
-
-    # Ürün indirimlerini sil (hard/soft fark etmez)
-    deleted_discounts = _delete_discounts_for_product(product_id)
-
-    if hard:
-        doc_ref.delete()
-        return {"detail": "Product hard-deleted", "deleted_discounts": deleted_discounts}
-    else:
-        doc_ref.update({"is_deleted": True, "updated_at": SERVER_TIMESTAMP})
-        return {"detail": "Product soft-deleted", "deleted_discounts": deleted_discounts}
-
-
-    """
-    Admin product deletion
-    • hard=true  → tamamen siler ve (isterseniz) görselleri de kaldırabilirsiniz
-    • hard=false → is_deleted = True
-    """
-    # 1️⃣ ID’yi alt koleksiyonlar arasında ara
-    q = (
-        db.collection_group("items")
-        .where("id", "==", product_id)          # id alanı ile eşleş
-        .limit(1)
-        .stream()
-    )
-    doc_snap = next(q, None)
-    if not doc_snap:
-        raise HTTPException(404, "Product not found")
-
-    doc_ref = doc_snap.reference  # tam DocumentReference artık var
-
-    # 2️⃣ İşlem
-    if hard:
-        # Storage’daki görseller opsiyonel olarak silinebilir
-        # for blob in bucket.list_blobs(prefix=f"products/{product_id}/"):
-        #     blob.delete()
-        doc_ref.delete()
-        return {"detail": "Product hard-deleted"}
-    else:
-        doc_ref.update({"is_deleted": True})
-        return {"detail": "Product soft-deleted"}

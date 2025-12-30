@@ -497,9 +497,10 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
 @router.get("", summary="Kullanıcının siparişlerini listele (sayfalama destekli)")
 async def list_my_orders(
     me: Dict = Depends(get_current_user),
-    status_filter: Optional[str] = Query(None, alias="status", pattern="^(preparing|shipped|delivered|canceled)$"),
+    status_filter: Optional[str] = Query(None, alias="status", pattern="^(preparing|shipped|delivered|canceled|payment_failed)$"),
     limit: int = Query(20, ge=1, le=100),
-    start_after: Optional[str] = Query(None, description="ISO datetime (created_at) ile sayfalama")
+    start_after: Optional[str] = Query(None, description="ISO datetime (created_at) ile sayfalama"),
+    include_awaiting_payment: bool = Query(False, description="Ödeme bekleyen siparişleri dahil et")
 ):
     user_id = me["id"]
     q = db.collection("orders").where("user_id", "==", user_id).where("is_deleted", "==", False)
@@ -522,6 +523,12 @@ async def list_my_orders(
     for d in docs:
         data = d.to_dict() or {}
         data["id"] = d.id
+        
+        # Ödeme bekleyen siparişleri filtrele (varsayılan olarak gösterme)
+        payment_status = (data.get("payment") or {}).get("status", "").lower()
+        if not include_awaiting_payment and payment_status == "awaiting":
+            continue
+            
         items.append(data)
     if docs:
         last_ct = (docs[-1].to_dict() or {}).get("created_at")
@@ -546,6 +553,44 @@ async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Sipariş silinmiş")
     doc["id"] = order_id
     return doc
+
+# -----------------------------------------------------------------------------
+# PUBLIC — Ödeme bekleyen siparişi iptal et
+# -----------------------------------------------------------------------------
+@router.post("/{order_id}/cancel-awaiting", summary="Ödeme bekleyen siparişi iptal et")
+async def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_user)):
+    """Sadece payment.status='awaiting' olan siparişler iptal edilebilir."""
+    user_id = me["id"]
+    ref = db.collection("orders").document(order_id)
+    snap = ref.get()
+    
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+    
+    doc = snap.to_dict() or {}
+    if doc.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Bu sipariş size ait değil")
+    if doc.get("is_deleted"):
+        raise HTTPException(status_code=404, detail="Sipariş silinmiş")
+    
+    payment_status = (doc.get("payment") or {}).get("status", "").lower()
+    if payment_status != "awaiting":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Bu sipariş iptal edilemez. Ödeme durumu: {payment_status}"
+        )
+    
+    now = _now()
+    ref.update({
+        "status": "canceled",
+        "payment.status": "canceled",
+        "updated_at": now,
+        "status_history": firestore.ArrayUnion([
+            {"status": "canceled", "at": now, "by": user_id, "meta": {"reason": "user_canceled_awaiting_payment"}}
+        ])
+    })
+    
+    return {"message": "Sipariş iptal edildi", "order_id": order_id}
 
 # -----------------------------------------------------------------------------
 # ADMIN — Kargoya verilecekler / ship / deliver / cancel / delete
@@ -821,8 +866,12 @@ async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
 
 @admin_router.post("/dev", summary="Test amaçlı örnek sipariş oluştur (sadece admin)")
 async def dev_create_order(_: Dict = Depends(get_current_admin)):
+    """
+    Test siparişi oluşturur. Fiyatlar TL cinsinden saklanır.
+    """
     now = _now()
     ref = db.collection("orders").document()
+    # Fiyatlar TL cinsinden
     payload = {
         "user_id": "demo-user",
         "created_at": now,
@@ -837,8 +886,8 @@ async def dev_create_order(_: Dict = Depends(get_current_admin)):
             "address": {"line1": "Örnek Mah., Örnek Sk. No:1", "city": "İstanbul", "postal_code": "34000", "country": "TR"},
         },
         "shipping": {"provider": "MANUAL"},
-        "items": [{"product_id": "p1", "name": "Lamba", "qty": 1, "price": 999.90}],
-        "totals": {"grand_total": 999.90, "currency": "TRY"},
+        "items": [{"product_id": "p1", "name": "Lamba", "qty": 1, "price": 999.90, "final_price": 999.90}],
+        "totals": {"subtotal": 999.90, "grand_total": 999.90, "currency": "TRY"},
         "note": None,
         "payment": {
             "provider": "PAYTR",
@@ -866,3 +915,67 @@ async def email_test(_: Dict = Depends(get_current_admin)):
     except Exception as e:
         # İstisnayı döndür ki sebebi ekranda görülsün
         raise HTTPException(status_code=502, detail=f"SMTP error: {e.__class__.__name__}: {e}")
+
+
+@admin_router.post("/_cleanup-awaiting", summary="Eski awaiting siparişleri iptal et (admin)")
+async def cleanup_awaiting_orders(
+    minutes_old: int = Query(30, ge=5, le=1440, description="Kaç dakikadan eski siparişler iptal edilsin"),
+    _: Dict = Depends(get_current_admin)
+):
+    """
+    payment.status='awaiting' olan ve belirtilen dakikadan eski siparişleri otomatik iptal eder.
+    Varsayılan: 30 dakikadan eski siparişler.
+    """
+    from datetime import timedelta
+    
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes_old)
+    
+    # Awaiting durumundaki tüm siparişleri çek
+    # Firestore nested field query desteği sınırlı olduğu için tümünü çekip filtrele
+    all_orders = db.collection("orders").where("is_deleted", "==", False).stream()
+    
+    canceled_count = 0
+    canceled_ids = []
+    now = _now()
+    
+    for doc in all_orders:
+        data = doc.to_dict() or {}
+        payment_status = (data.get("payment") or {}).get("status", "").lower()
+        created_at = data.get("created_at")
+        
+        # Sadece awaiting olanları kontrol et
+        if payment_status != "awaiting":
+            continue
+            
+        # Tarih kontrolü
+        if created_at is None:
+            continue
+            
+        # Firestore timestamp'i datetime'a çevir
+        if hasattr(created_at, 'timestamp'):
+            created_dt = datetime.fromtimestamp(created_at.timestamp(), tz=timezone.utc)
+        elif isinstance(created_at, datetime):
+            created_dt = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        else:
+            continue
+            
+        # Cutoff'tan eski mi?
+        if created_dt < cutoff:
+            # İptal et
+            doc.reference.update({
+                "status": "canceled",
+                "payment.status": "expired",
+                "updated_at": now,
+                "status_history": firestore.ArrayUnion([
+                    {"status": "canceled", "at": now, "by": "system", "meta": {"reason": "awaiting_payment_expired"}}
+                ])
+            })
+            canceled_count += 1
+            canceled_ids.append(doc.id)
+    
+    return {
+        "message": f"{canceled_count} adet eski sipariş iptal edildi",
+        "canceled_count": canceled_count,
+        "canceled_ids": canceled_ids,
+        "cutoff_minutes": minutes_old
+    }
