@@ -348,7 +348,6 @@ def send_notification(notification_data: NotificationSendRequest):
                         android=messaging.AndroidConfig(
                             priority='high',
                             notification=messaging.AndroidNotification(
-                                priority='high',
                                 sound='default',
                                 channel_id='high_importance_channel',
                             ),
@@ -356,10 +355,13 @@ def send_notification(notification_data: NotificationSendRequest):
                         apns=messaging.APNSConfig(
                             headers={
                                 'apns-priority': '10',
+                                'apns-push-type': 'alert',
                             },
                             payload=messaging.APNSPayload(
                                 aps=messaging.Aps(
                                     sound='default',
+                                    badge=1,
+                                    content_available=True,
                                 ),
                             ),
                         ),
