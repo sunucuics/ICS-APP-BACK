@@ -12,7 +12,8 @@ from firebase_admin import messaging
 import os
 from backend.app.schemas.notification import (
     NotificationTemplateBase,
-    NotificationTemplateOut
+    NotificationTemplateOut,
+    NotificationSendRequest
 )
 from firebase_admin import firestore
 
@@ -202,89 +203,107 @@ def delete_notification_campaign(campaign_id: str):
         raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
 
 @router.post("/send")
-def send_notification(notification_data: dict):
+def send_notification(notification_data: NotificationSendRequest):
     """
     Send push notification to users and save to database
     """
     try:
-        title = notification_data.get("title", "")
-        body = notification_data.get("body", "")
+        title = notification_data.title
+        body = notification_data.body
         # Support both 'segments' and 'user_segments' for backward compatibility
-        target_segments = notification_data.get("segments") or notification_data.get("user_segments") or []
-        template_id = notification_data.get("template_id")
+        target_segments = notification_data.segments or notification_data.user_segments or []
+        template_id = notification_data.template_id
         
         # Get user FCM tokens based on segments
         users_ref = db.collection("users")
         
-        if not target_segments:  # Send to all users
-            users = users_ref.stream()
-        else:
-            # Filter users by segments (this would need more complex logic)
-            # For now, send to all users if segments are specified
-            users = users_ref.stream()
-        
-        fcm_tokens = []
-        user_ids = []
-        user_tokens_map = {}  # Map user_id to fcm_token
-        
-        # Collect all users (with or without FCM tokens)
-        all_user_ids = []
-        for user_doc in users:
-            user_data = user_doc.to_dict()
-            user_id = user_doc.id
-            all_user_ids.append(user_id)
+        # If specific target users are provided, filter by them
+        if notification_data.target_users:
+            user_ids = notification_data.target_users
+            fcm_tokens = []
+            user_tokens_map = {}
             
-            # Collect FCM tokens for push notifications
-            if "fcm_token" in user_data and user_data["fcm_token"]:
-                fcm_token = user_data["fcm_token"]
-                fcm_tokens.append(fcm_token)
-                user_tokens_map[user_id] = fcm_token
+            # Fetch specific users
+            for user_id in user_ids:
+                try:
+                    user_doc = users_ref.document(user_id).get()
+                    if user_doc.exists:
+                        user_data = user_doc.to_dict()
+                        if "fcm_token" in user_data and user_data["fcm_token"]:
+                            fcm_token = user_data["fcm_token"]
+                            fcm_tokens.append(fcm_token)
+                            user_tokens_map[user_id] = fcm_token
+                except Exception as e:
+                    # Skip invalid user IDs
+                    continue
+        else:
+            # Get all users or filter by segments
+            if not target_segments:  # Send to all users
+                users = users_ref.stream()
+            else:
+                # Filter users by segments (this would need more complex logic)
+                # For now, send to all users if segments are specified
+                users = users_ref.stream()
+            
+            fcm_tokens = []
+            user_ids = []
+            user_tokens_map = {}  # Map user_id to fcm_token
+            
+            # Collect all users (with or without FCM tokens)
+            for user_doc in users:
+                try:
+                    user_data = user_doc.to_dict()
+                    if not user_data:
+                        continue
+                    user_id = user_doc.id
+                    user_ids.append(user_id)
+                    
+                    # Collect FCM tokens for push notifications
+                    if "fcm_token" in user_data and user_data["fcm_token"]:
+                        fcm_token = user_data["fcm_token"]
+                        if fcm_token:  # Ensure token is not empty
+                            fcm_tokens.append(fcm_token)
+                            user_tokens_map[user_id] = fcm_token
+                except Exception as e:
+                    # Skip invalid user documents
+                    continue
         
-        # Use all users for database notifications, not just those with FCM tokens
-        user_ids = all_user_ids
+        # Validate we have at least title and body
+        if not title or not body:
+            raise HTTPException(status_code=400, detail="Title and body are required")
         
         # Send FCM notification (only if we have tokens)
         success_count = 0
         failure_count = 0
         
-        if fcm_tokens:
-            # Create the message
-            message = messaging.MulticastMessage(
-                notification=messaging.Notification(
-                    title=title,
-                    body=body,
-                ),
-                data={
-                    'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-                    'type': 'admin_notification'
-                },
-                tokens=fcm_tokens,
-            )
-            
-            # Send the message
-            response = messaging.send_multicast(message)
-            success_count = response.success_count
-            failure_count = response.failure_count
-            
-            # Save notifications to database for all users (regardless of FCM success)
-            # This ensures users can see notifications even if FCM delivery failed
-            notifications_ref = db.collection("user_notifications")
-            batch = db.batch()
-            batch_count = 0
-            
-            for user_id in user_ids:
+        # Save notifications to database for all users
+        notifications_ref = db.collection("user_notifications")
+        batch = db.batch()
+        batch_count = 0
+        
+        # Prepare notification data
+        notification_data_db_base = {
+            "title": title,
+            "body": body,
+            "type": "admin_notification",
+            "is_read": False,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        
+        # Add optional data
+        if template_id or target_segments:
+            notification_data_db_base["data"] = {
+                "template_id": template_id,
+                "segments": target_segments
+            }
+        
+        # Save notifications to database
+        for user_id in user_ids:
+            try:
                 notification_doc = notifications_ref.document()
                 notification_data_db = {
-                    "user_id": user_id,
-                    "title": title,
-                    "body": body,
-                    "type": "admin_notification",
-                    "is_read": False,
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "data": {
-                        "template_id": template_id,
-                        "segments": target_segments
-                    } if template_id or target_segments else None
+                    **notification_data_db_base,
+                    "user_id": user_id
                 }
                 batch.set(notification_doc, notification_data_db)
                 batch_count += 1
@@ -294,60 +313,86 @@ def send_notification(notification_data: dict):
                     batch.commit()
                     batch = db.batch()
                     batch_count = 0
-            
-            # Commit remaining notifications
-            if batch_count > 0:
-                batch.commit()
-            
-            return {
-                "message": "Notification sent successfully",
-                "target_count": len(user_ids),
-                "fcm_token_count": len(fcm_tokens),
-                "success_count": success_count,
-                "failure_count": failure_count,
-                "saved_to_db": len(user_ids),
-                "title": title,
-                "body": body
-            }
-        else:
-            # Even if no FCM tokens, save notifications to database
-            notifications_ref = db.collection("user_notifications")
-            batch = db.batch()
-            batch_count = 0
-            
-            for user_id in user_ids:
-                notification_doc = notifications_ref.document()
-                notification_data_db = {
-                    "user_id": user_id,
-                    "title": title,
-                    "body": body,
-                    "type": "admin_notification",
-                    "is_read": False,
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "data": {
-                        "template_id": template_id,
-                        "segments": target_segments
-                    } if template_id or target_segments else None
-                }
-                batch.set(notification_doc, notification_data_db)
-                batch_count += 1
-                
-                if batch_count >= 450:
-                    batch.commit()
-                    batch = db.batch()
-                    batch_count = 0
-            
-            if batch_count > 0:
-                batch.commit()
-            
-            return {
-                "message": "Notification saved to database (no FCM tokens found for push delivery)",
-                "target_count": len(user_ids),
-                "fcm_token_count": 0,
-                "saved_to_db": len(user_ids),
-                "title": title,
-                "body": body
-            }
+            except Exception as e:
+                # Continue with other users if one fails
+                continue
         
+        # Commit remaining notifications
+        if batch_count > 0:
+            batch.commit()
+        
+        # Send FCM push notifications if we have tokens
+        if fcm_tokens:
+            try:
+                # Create the message with high priority for delivery when device is off
+                # Split tokens into batches of 500 (FCM limit)
+                batch_size = 500
+                total_success = 0
+                total_failure = 0
+                
+                for i in range(0, len(fcm_tokens), batch_size):
+                    batch_tokens = fcm_tokens[i:i + batch_size]
+                    
+                    multicast_message = messaging.MulticastMessage(
+                        notification=messaging.Notification(
+                            title=title,
+                            body=body,
+                        ),
+                        data={
+                            'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                            'type': 'admin_notification',
+                            'title': title,
+                            'body': body,
+                        },
+                        tokens=batch_tokens,
+                        android=messaging.AndroidConfig(
+                            priority='high',
+                            notification=messaging.AndroidNotification(
+                                priority='high',
+                                sound='default',
+                                channel_id='high_importance_channel',
+                            ),
+                        ),
+                        apns=messaging.APNSConfig(
+                            payload=messaging.APNSPayload(
+                                aps=messaging.Aps(
+                                    sound='default',
+                                    content_available=True,
+                                    priority='high',
+                                ),
+                            ),
+                        ),
+                    )
+                    
+                    # Use send_each_for_multicast instead of deprecated send_multicast
+                    response = messaging.send_each_for_multicast(multicast_message)
+                    total_success += response.success_count
+                    total_failure += response.failure_count
+                
+                success_count = total_success
+                failure_count = total_failure
+            except Exception as e:
+                # Log FCM error but don't fail the entire request
+                # Notifications are already saved to database
+                print(f"FCM send error: {str(e)}")
+                failure_count = len(fcm_tokens)
+        
+        return {
+            "message": "Notification sent successfully",
+            "target_count": len(user_ids),
+            "fcm_token_count": len(fcm_tokens),
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "saved_to_db": len(user_ids),
+            "title": title,
+            "body": body
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Error sending notification: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Error sending notification: {str(e)}")

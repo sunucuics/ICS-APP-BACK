@@ -1,6 +1,6 @@
 # backend/app/schemas/notification.py
 from pydantic import BaseModel, Field
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, List
 from datetime import datetime
 
 class NotificationTemplateBase(BaseModel):
@@ -24,3 +24,13 @@ class UserNotificationOut(BaseModel):
     is_read: bool = Field(default=False, description="Okundu mu?")
     created_at: Optional[datetime] = None
     data: Optional[Dict[str, Any]] = Field(default=None, description="Ekstra veriler")
+
+class NotificationSendRequest(BaseModel):
+    title: str = Field(..., description="Bildirim başlığı")
+    body: str = Field(..., description="Bildirim içeriği")
+    template_id: Optional[str] = Field(None, description="Şablon ID (opsiyonel)")
+    user_segments: Optional[List[str]] = Field(None, description="Hedef kullanıcı segmentleri")
+    segments: Optional[List[str]] = Field(None, description="Hedef kullanıcı segmentleri (geriye dönük uyumluluk)")
+    target_users: Optional[List[str]] = Field(None, description="Hedef kullanıcı ID'leri")
+    send_immediately: bool = Field(True, description="Hemen gönder")
+    scheduled_at: Optional[datetime] = Field(None, description="Zamanlanmış gönderim tarihi")
