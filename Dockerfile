@@ -13,9 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 RUN useradd -m appuser
 
+# Pip'i upgrade et ve root user uyarısını bastır
+RUN pip install --upgrade pip --root-user-action=ignore
+
 # Bağımlılıklar (cache için ayrı katman)
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --root-user-action=ignore -r requirements.txt
 
 # Uygulama + opsiyonel dosyalar (alembic varsa gelir, yoksa sorun olmaz)
 COPY backend/ ./backend/

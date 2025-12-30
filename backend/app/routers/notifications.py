@@ -354,11 +354,19 @@ def send_notification(notification_data: NotificationSendRequest):
                             ),
                         ),
                         apns=messaging.APNSConfig(
+                            headers={
+                                'apns-priority': '10',  # 10 = immediate delivery (required for alerts)
+                                'apns-push-type': 'alert',
+                            },
                             payload=messaging.APNSPayload(
                                 aps=messaging.Aps(
+                                    alert=messaging.ApsAlert(
+                                        title=title,
+                                        body=body,
+                                    ),
                                     sound='default',
-                                    content_available=True,
-                                    priority='high',
+                                    badge=1,
+                                    mutable_content=True,
                                 ),
                             ),
                         ),
