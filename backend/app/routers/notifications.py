@@ -360,13 +360,10 @@ def send_notification(notification_data: NotificationSendRequest):
                             },
                             payload=messaging.APNSPayload(
                                 aps=messaging.Aps(
-                                    alert=messaging.ApsAlert(
-                                        title=title,
-                                        body=body,
-                                    ),
                                     sound='default',
                                     badge=1,
                                     mutable_content=True,
+                                    content_available=True,
                                 ),
                             ),
                         ),
