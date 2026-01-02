@@ -1,28 +1,40 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, json, hmac, base64, hashlib, logging, re
+import os
+import json
+import hmac
+import base64
+import hashlib
+import logging
+import re
+import time
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Dict, Optional, Literal , Any
-from firebase_admin import firestore
+from typing import Any, Dict, List, Optional, Literal, Tuple
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, Form, Query , Body
-from starlette.responses import PlainTextResponse, HTMLResponse
+from firebase_admin import firestore
+from fastapi import APIRouter, HTTPException, Request, Form, Body
 from pydantic import BaseModel, Field, EmailStr, validator
+from starlette.responses import PlainTextResponse, HTMLResponse
+
 from backend.app.config import db
 
 # =========================
 # ENV
 # =========================
+
+INSTALLMENT_SURCHARGE_PERCENT = Decimal(os.getenv("INSTALLMENT_SURCHARGE_PERCENT", "15.0"))
+
 PAYTR_MERCHANT_ID = os.getenv("PAYTR_MERCHANT_ID", "")
 PAYTR_MERCHANT_KEY = os.getenv("PAYTR_MERCHANT_KEY", "")
 PAYTR_MERCHANT_SALT = os.getenv("PAYTR_MERCHANT_SALT", "")
+
 PAYTR_OK_URL = os.getenv("PAYTR_OK_URL", "https://example.com/payment/success")
 PAYTR_FAIL_URL = os.getenv("PAYTR_FAIL_URL", "https://example.com/payment/fail")
+
 PAYTR_TEST_MODE = "1" if os.getenv("PAYTR_TEST_MODE", "0").lower() in ("1", "true", "yes") else "0"
-PAYTR_SIGN_MODE = os.getenv("PAYTR_SIGN_MODE", "minimal").lower()  # minimal | extended
 
 if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
     raise RuntimeError("PAYTR env missing")
@@ -30,16 +42,8 @@ if not (PAYTR_MERCHANT_ID and PAYTR_MERCHANT_KEY and PAYTR_MERCHANT_SALT):
 _PREFIX = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
 def _prefixed(name: str) -> str:
     return f"{_PREFIX}{name}" if _PREFIX else name
-_CARTS = _prefixed("carts")
 
-def _clear_cart(user_id: str):
-    try:
-        cref = db.collection(_CARTS).document(user_id)
-        cref.set({"items": []}, merge=True)
-        for dsnap in cref.collection("items").stream():
-            dsnap.reference.delete()
-    except Exception:
-        pass
+_CARTS = _prefixed("carts")
 
 router = APIRouter(prefix="/paytr", tags=["paytr"])
 
@@ -47,74 +51,27 @@ log = logging.getLogger("paytr")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
+_DEC_2 = Decimal("0.01")
+
+PAYTR_BIN_DETAIL_URL = "https://www.paytr.com/odeme/api/bin-detail"
+PAYTR_INSTALLMENT_RATES_URL = "https://www.paytr.com/odeme/taksit-oranlari"
+PAYTR_IFRAME_GET_TOKEN_URL = "https://www.paytr.com/odeme/api/get-token"
+
 # =========================
 # HELPERS
 # =========================
-def to_cents(amount: float | str) -> str:
-    """
-    TL tutarını kuruş cinsinden string'e çevirir.
-    Örnekler:
-      - 349.90 -> '34990'
-      - 100.0  -> '10000'
-      - 100    -> '10000'
-      - '99,99' -> '9999'
-    
-    Decimal kullanarak kayan nokta hatalarından kaçınır.
-    """
-    # Virgülü noktaya çevir (Türkçe format desteği)
-    s = str(amount).replace(",", ".")
-    
-    # Decimal ile hassas hesaplama
-    d = Decimal(s)
-    
-    # TL'yi kuruşa çevir (100 ile çarp)
-    cents = d * Decimal("100")
-    
-    # Tam sayıya yuvarla ve string olarak döndür
-    return str(cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
+def _d(x: Any) -> Decimal:
+    s = str(x).strip().replace(",", ".")
+    return Decimal(s)
 
-def validate_payment_amount(payment_amount: float, basket: List, tolerance_percent: float = 1.0) -> tuple[bool, str, float, float]:
-    """
-    Ödeme tutarının sepet toplamı ile tutarlı olduğunu doğrular.
-    
-    Args:
-        payment_amount: Frontend'den gelen ödeme tutarı (TL)
-        basket: Sepet öğeleri listesi (BasketItem)
-        tolerance_percent: Kabul edilebilir yüzdelik fark (varsayılan %1)
-    
-    Returns:
-        tuple: (is_valid, message, basket_total, difference_percent)
-    """
-    # Sepet toplamını hesapla
-    basket_total = Decimal("0")
-    for item in basket:
-        price = Decimal(str(item.price))
-        qty = Decimal(str(item.quantity))
-        basket_total += price * qty
-    
-    payment_decimal = Decimal(str(payment_amount))
-    
-    # Farkı hesapla
-    if basket_total == Decimal("0"):
-        if payment_decimal == Decimal("0"):
-            return True, "Sepet ve ödeme tutarı sıfır", float(basket_total), 0.0
-        else:
-            return False, f"Sepet boş ama ödeme tutarı {payment_amount} TL", float(basket_total), 100.0
-    
-    difference = abs(payment_decimal - basket_total)
-    difference_percent = float((difference / basket_total) * Decimal("100"))
-    
-    if difference_percent > tolerance_percent:
-        return (
-            False,
-            f"Ödeme tutarı ({payment_amount} TL) ile sepet toplamı ({float(basket_total)} TL) arasında %{difference_percent:.2f} fark var. "
-            f"Maksimum izin verilen fark: %{tolerance_percent}",
-            float(basket_total),
-            difference_percent
-        )
-    
-    return True, "Tutar doğrulandı", float(basket_total), difference_percent
+def tl_str(amount_tl: Decimal) -> str:
+    q = amount_tl.quantize(_DEC_2, rounding=ROUND_HALF_UP)
+    return format(q, "f")
+
+def to_kurus_str(amount_tl: Decimal) -> str:
+    kurus = (amount_tl * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return str(kurus)
 
 def b64_str(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("utf-8")
@@ -122,43 +79,6 @@ def b64_str(s: str) -> str:
 def _hmac_b64(key_str: str, msg_str: str) -> str:
     dig = hmac.new(key_str.encode("utf-8"), msg_str.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(dig).decode("utf-8")
-
-
-def _parse_fields(raw: Any) -> Dict[str, Any]:
-    """
-    Aşağıdaki formatların hepsini kabul eder:
-      1) Flat dict:            { "merchant_id": "...", ... }
-      2) Wrapped dict:         { "fields": { ... } }
-      3) Wrapped JSON string:  { "fields": "{ \"merchant_id\":\"...\", ... }" }
-      4) Düz JSON string:      "{ \"merchant_id\":\"...\", ... }"
-    """
-    # 3) ve 4) için (request body doğrudan string ise)
-    if isinstance(raw, str):
-        return json.loads(raw)
-
-    if isinstance(raw, dict):
-        if "fields" in raw:
-            val = raw["fields"]
-            if isinstance(val, str):
-                return json.loads(val)         # JSON string
-            elif isinstance(val, dict):
-                return val                      # dict
-            else:
-                raise ValueError("fields must be JSON string or object")
-        else:
-            return raw                           # flat dict
-
-    raise ValueError("Body must be an object or JSON string")
-
-def _normalize_fields(d: Dict[str, Any]) -> Dict[str, str]:
-    """Tüm değerleri stringe çeker, None ise '' yapar, trimler."""
-    out: Dict[str, str] = {}
-    for k, v in d.items():
-        if v is None:
-            out[k] = ""
-        else:
-            out[k] = str(v).strip()
-    return out
 
 def client_ip(request: Request, override: Optional[str]) -> str:
     if override:
@@ -169,51 +89,155 @@ def client_ip(request: Request, override: Optional[str]) -> str:
             return v.split(",")[0].strip()
     return (request.client.host or "").split(",")[0].strip()
 
-# ---- Direct sign orders ----
-SIG_ORDER_MINIMAL = [
-    "merchant_id","user_ip","merchant_oid","email",
-    "payment_amount","payment_type","installment_count",
-    "currency","test_mode","non_3d"
-]
-SIG_ORDER_EXTENDED = [
-    "merchant_id","user_ip","merchant_oid","email",
-    "payment_amount","payment_type","installment_count",
-    "currency","test_mode","non_3d",
-    "client_lang","merchant_ok_url","merchant_fail_url",
-    "user_name","user_address","user_phone","user_basket"
-    # not: bazı hesaplarda card_type da beklenebilir; client_lang'den sonra ekliyoruz (varsa)
+def _clear_cart(user_id: str) -> None:
+    try:
+        cref = db.collection(_CARTS).document(user_id)
+        cref.set({"items": []}, merge=True)
+        for dsnap in cref.collection("items").stream():
+            dsnap.reference.delete()
+    except Exception:
+        pass
+
+def basket_total_tl(basket: List["BasketItem"]) -> Decimal:
+    total = Decimal("0")
+    for it in basket:
+        total += _d(it.price) * Decimal(str(it.quantity))
+    return total.quantize(_DEC_2, rounding=ROUND_HALF_UP)
+
+def apply_installment_rate(base_amount_tl: Decimal, rate_percent: Decimal) -> Decimal:
+    multiplier = Decimal("1") + (rate_percent / Decimal("100"))
+    return (base_amount_tl * multiplier).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+
+def normalize_and_validate_client_amount(
+    client_amount: Decimal,
+    basket_total: Decimal,
+    tolerance_percent: Decimal = Decimal("1.0"),
+) -> Tuple[bool, str, Decimal]:
+    """
+    Frontend bazen TL bazen kuruş(x100) gönderebilir.
+    Tahsil edilecek tutar HER ZAMAN basket_total üzerinden belirlenir.
+    Bu fonksiyon sadece "bariz manipulasyon" var mı diye kontrol eder
+    ve unit mismatch varsa TL’ye normalize eder (log amaçlı).
+    """
+    if basket_total <= 0:
+        return False, "Sepet toplamı 0 veya negatif olamaz", basket_total
+
+    # TL gibi mi?
+    diff = abs(client_amount - basket_total)
+    diff_pct = (diff / basket_total) * Decimal("100")
+    if diff_pct <= tolerance_percent:
+        return True, "Client amount TL olarak uyumlu", client_amount
+
+    # Kuruş(x100) gibi mi?
+    client_div_100 = (client_amount / Decimal("100")).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+    diff2 = abs(client_div_100 - basket_total)
+    diff2_pct = (diff2 / basket_total) * Decimal("100")
+    if diff2_pct <= tolerance_percent:
+        return True, "Client amount kuruş(x100) gibi; TL'ye normalize edildi", client_div_100
+
+    return False, f"Tutar uyuşmaz: client={client_amount} basket={basket_total}", client_amount
+
+# ---- Direct token order (minimal canonical order) ----
+_DIRECT_SIG_ORDER = [
+    "merchant_id",
+    "user_ip",
+    "merchant_oid",
+    "email",
+    "payment_amount",
+    "payment_type",
+    "installment_count",
+    "currency",
+    "test_mode",
+    "non_3d",
 ]
 
-def _calc_direct_token(fields: Dict[str, str], sign_mode: str = "minimal"):
-    """
-    Kanonik sıra (Direct API minimal):
-    merchant_id, user_ip, merchant_oid, email, payment_amount,
-    payment_type, installment_count, currency, test_mode, non_3d, + SALT
-    """
-    order = [
-        "merchant_id", "user_ip", "merchant_oid", "email", "payment_amount",
-        "payment_type", "installment_count", "currency", "test_mode", "non_3d"
-    ]
-    s2s = "".join(fields.get(k, "") for k in order) + PAYTR_MERCHANT_SALT
-    calc = _hmac_b64(PAYTR_MERCHANT_KEY, s2s)
-    return calc, s2s, order
+def _calc_direct_token(fields: Dict[str, str]) -> Tuple[str, str, List[str]]:
+    s2s = "".join(fields.get(k, "") for k in _DIRECT_SIG_ORDER) + PAYTR_MERCHANT_SALT
+    token = _hmac_b64(PAYTR_MERCHANT_KEY, s2s)
+    return token, s2s, list(_DIRECT_SIG_ORDER)
 
 # ---- iFrame token (get-token) ----
-def _calc_iframe_token(*, merchant_id: str, user_ip: str, merchant_oid: str, email: str,
-                       payment_amount: str, user_basket: str,
-                       no_installment: str, max_installment: str, currency: str, test_mode: str) -> tuple[str, str]:
-    # dokümandaki sıra birebir:
-    # merchant_id + user_ip + merchant_oid + email + payment_amount + user_basket + no_installment + max_installment + currency + test_mode
-    hash_bytes = (merchant_id + user_ip + merchant_oid + email + payment_amount +
-                  user_basket + no_installment + max_installment + currency + test_mode).encode("utf-8")
-    msg = hash_bytes + PAYTR_MERCHANT_SALT.encode("utf-8")
-    dig = hmac.new(PAYTR_MERCHANT_KEY.encode("utf-8"), msg, hashlib.sha256).digest()
-    token = base64.b64encode(dig).decode("utf-8")
-    return token, (hash_bytes.decode("utf-8") + PAYTR_MERCHANT_SALT)
+def _calc_iframe_token(
+    *,
+    merchant_id: str,
+    user_ip: str,
+    merchant_oid: str,
+    email: str,
+    payment_amount_kurus: str,
+    user_basket: str,
+    no_installment: str,
+    max_installment: str,
+    currency: str,
+    test_mode: str,
+) -> Tuple[str, str]:
+    raw = (
+        merchant_id
+        + user_ip
+        + merchant_oid
+        + email
+        + payment_amount_kurus
+        + user_basket
+        + no_installment
+        + max_installment
+        + currency
+        + test_mode
+    )
+    msg = raw + PAYTR_MERCHANT_SALT
+    dig = hmac.new(PAYTR_MERCHANT_KEY.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(dig).decode("utf-8"), msg
+
+# ---- PayTR service calls ----
+async def paytr_bin_detail(bin_number: str) -> Dict[str, Any]:
+    bn = (bin_number or "").strip()
+    if not re.fullmatch(r"\d{6}|\d{8}", bn):
+        raise HTTPException(400, "bin_number 6 veya 8 hane olmalı")
+
+    hash_str = bn + PAYTR_MERCHANT_ID + PAYTR_MERCHANT_SALT
+    token = base64.b64encode(
+        hmac.new(PAYTR_MERCHANT_KEY.encode("utf-8"), hash_str.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    data = {"merchant_id": PAYTR_MERCHANT_ID, "bin_number": bn, "paytr_token": token}
+
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(PAYTR_BIN_DETAIL_URL, data=data)
+
+    try:
+        res = r.json()
+    except Exception:
+        raise HTTPException(502, f"BIN detail invalid response: {r.text[:200]}")
+
+    return res
+
+async def paytr_installment_rates(single_ratio: int = 1, abroad_ratio: int = 0) -> Dict[str, Any]:
+    request_id = str(int(time.time() * 1000))
+    hash_str = PAYTR_MERCHANT_ID + request_id + PAYTR_MERCHANT_SALT
+    token = base64.b64encode(
+        hmac.new(PAYTR_MERCHANT_KEY.encode("utf-8"), hash_str.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    data = {
+        "merchant_id": PAYTR_MERCHANT_ID,
+        "request_id": request_id,
+        "paytr_token": token,
+        "single_ratio": str(int(bool(single_ratio))),
+        "abroad_ratio": str(int(bool(abroad_ratio))),
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        r = await cli.post(PAYTR_INSTALLMENT_RATES_URL, data=data)
+
+    try:
+        res = r.json()
+    except Exception:
+        raise HTTPException(502, f"Installment rates invalid response: {r.text[:200]}")
+
+    return res
 
 # =========================
 # SCHEMAS
 # =========================
+
 class BasketItem(BaseModel):
     name: str = Field(..., max_length=100)
     price: float
@@ -222,9 +246,9 @@ class BasketItem(BaseModel):
 class DirectInitIn(BaseModel):
     merchant_oid: str = Field(..., max_length=64)
     email: EmailStr
-    payment_amount: float
+    payment_amount: float = 0  # client gönderiyor; backend güvenmez
     payment_type: Literal["card", "card_points"] = "card"
-    installment_count: int = Field(0, ge=0, le=12)  # 0=tek çekim, örn 6=6 taksit
+    installment_count: Literal[0, 3] = 0  # sadece 0 veya 3
     currency: str = "TL"
     non_3d: Literal[0, 1] = 0
     client_lang: Literal["tr", "en"] = "tr"
@@ -232,7 +256,7 @@ class DirectInitIn(BaseModel):
     user_address: str = Field(..., max_length=400)
     user_phone: str = Field(..., max_length=20)
     basket: List[BasketItem]
-    card_type: Optional[Literal["advantage","axess","combo","bonus","cardfinans","maximum","paraf","world","saglamkart"]] = None
+    bin_number: Optional[str] = None  # 3 taksit için zorunlu
     user_ip: Optional[str] = None
     debug_on: Literal[0, 1] = 1
 
@@ -255,28 +279,97 @@ class VerifyOut(BaseModel):
     mid_match: bool
     calc_token: str
     posted_token: str
-    sign_mode: str
     string_to_sign: str
     order_used: List[str]
     notes: Optional[List[str]] = None
 
-# iFrame init input
+class BinDetailIn(BaseModel):
+    bin_number: str = Field(..., description="Kartın ilk 6 veya 8 hanesi")
+    debug_on: int = 0
+
+class InstallmentQuoteIn(BaseModel):
+    bin_number: str = Field(..., description="Kartın ilk 6 veya 8 hanesi")
+    amount_tl: float = Field(..., gt=0, description="Peşin fiyat (TL)")
+
 class IframeInitIn(BaseModel):
     merchant_oid: str = Field(..., max_length=64, pattern=r"^[A-Za-z0-9]+$")
     email: EmailStr
-    payment_amount: float           # TL (örn 15.00)
+    payment_amount: float  # client gönderiyor; backend basket'a göre belirleyecek
     user_name: str
     user_address: str
     user_phone: str
     basket: List[BasketItem]
     user_ip: Optional[str] = None
     debug_on: int = 1
-    no_installment: int = 0         # 0: taksit göster, 1: sadece tek çekim
-    max_installment: int = 0        # 0: PayTR azamiye kadar, yoksa 2..12
+    no_installment: int = 0
+    max_installment: int = 0
     currency: str = "TL"
 
+class RefreshTokenIn(BaseModel):
+    merchant_oid: str = Field(..., max_length=64, pattern=r"^[A-Za-z0-9]+$")
+    installment_count: Literal[0, 3] = 0
+    user_ip: Optional[str] = None
+    bin_number: Optional[str] = None  # 3 taksit refresh için zorunlu
+
 # =========================
-# DIRECT — init (taksit: installment_count ile)
+# DIRECT — BIN DETAIL
+# =========================
+@router.post("/direct/bin-detail")
+async def direct_bin_detail(body: BinDetailIn):
+    res = await paytr_bin_detail(body.bin_number)
+    if body.debug_on:
+        log.info("BIN_DETAIL: %s", res)
+    return res
+
+# =========================
+# DIRECT — INSTALLMENT QUOTE (peşin / 3 taksit)
+# =========================
+@router.post("/direct/installment-quote")
+async def direct_installment_quote(body: InstallmentQuoteIn):
+    base_amount = _d(body.amount_tl).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+
+    bres = await paytr_bin_detail(body.bin_number)
+    if bres.get("status") != "success":
+        return {
+            "status": "failed",
+            "reason": bres.get("err_msg") or bres.get("reason") or "BIN tanımsız",
+            "installments": [
+                {
+                    "installment_count": 0,
+                    "rate_percent": 0,
+                    "total_tl": tl_str(base_amount),
+                    "per_installment_tl": tl_str(base_amount),
+                }
+            ],
+            "bin": bres,
+        }
+
+    card_type = (bres.get("cardType") or "").lower()  # credit / debit
+    brand = (bres.get("brand") or "").lower()
+
+    options: List[Dict[str, Any]] = [
+        {"installment_count": 0, "rate_percent": 0, "total_tl": tl_str(base_amount), "per_installment_tl": tl_str(base_amount)}
+    ]
+
+    if card_type != "credit" or not brand or brand == "none":
+        return {"status": "success", "brand": brand, "cardType": card_type, "installments": options, "bin": bres}
+
+    total = apply_installment_rate(base_amount, INSTALLMENT_SURCHARGE_PERCENT)
+    per = (total / Decimal("3")).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+
+    options.append(
+        {
+            "installment_count": 3,
+            "rate_percent": float(INSTALLMENT_SURCHARGE_PERCENT),
+            "total_tl": tl_str(total),
+            "per_installment_tl": tl_str(per),
+        }
+    )
+
+    return {"status": "success", "brand": brand, "cardType": card_type, "installments": options, "bin": bres}
+
+# =========================
+# DIRECT — init (0 / 3)
 # =========================
 @router.post("/direct/init", response_model=DirectInitOut)
 async def paytr_direct_init(body: DirectInitIn, request: Request):
@@ -284,54 +377,52 @@ async def paytr_direct_init(body: DirectInitIn, request: Request):
     if not ip:
         raise HTTPException(400, "user_ip required")
 
-    # DEBUG: Frontend'den gelen değerleri logla
-    log.info("=" * 80)
-    log.info("PAYTR_DIRECT_INIT_DEBUG - Frontend'den Gelen Veriler")
-    log.info("=" * 80)
-    log.info("payment_amount (Frontend gönderdi): %.2f", body.payment_amount)
-    log.info("Sepet içeriği:")
-    for idx, item in enumerate(body.basket, 1):
-        log.info("  %d. %s: %.2f x %d = %.2f", idx, item.name, item.price, item.quantity, item.price * item.quantity)
-    log.info("=" * 80)
+    base_total = basket_total_tl(body.basket)
 
-    # Tutar doğrulama - sepet toplamı ile payment_amount karşılaştır
-    is_valid, validation_msg, basket_total, diff_percent = validate_payment_amount(
-        body.payment_amount, body.basket, tolerance_percent=1.0
-    )
-    
-    if not is_valid:
-        log.error(
-            "PAYMENT_VALIDATION_FAILED oid=%s payment_amount=%.2f basket_total=%.2f diff=%.2f%% msg=%s",
-            body.merchant_oid, body.payment_amount, basket_total, diff_percent, validation_msg
-        )
-        raise HTTPException(
-            400, 
-            f"Ödeme tutarı doğrulaması başarısız: {validation_msg}"
-        )
-    
-    log.info(
-        "PAYMENT_VALIDATION_OK oid=%s payment_amount=%.2f basket_total=%.2f diff=%.2f%%",
-        body.merchant_oid, body.payment_amount, basket_total, diff_percent
-    )
+    # client amount sanity check (opsiyonel)
+    client_amount = _d(body.payment_amount)
+    ok, msg, normalized_client = normalize_and_validate_client_amount(client_amount, base_total, tolerance_percent=Decimal("1.0"))
+    if not ok and body.payment_amount not in (0, 0.0):
+        log.error("PAYMENT_AMOUNT_MISMATCH oid=%s msg=%s client=%s basket=%s", body.merchant_oid, msg, client_amount, base_total)
+        raise HTTPException(400, f"Ödeme tutarı doğrulaması başarısız: {msg}")
 
-    # Sepet -> Base64(JSON)
-    # PayTR dokümantasyonu: sepet fiyatları TL cinsinden 2 ondalıklı string olmalı
-    # Örnek: [["Ürün Adı", "10.00", 1]] -> 10 TL
-    # NOT: payment_amount kuruş, ama basket TL cinsinden!
-    basket_arr = [[i.name, f"{i.price:.2f}", i.quantity] for i in body.basket]
+    if msg.startswith("Client amount kuruş"):
+        log.warning("AMOUNT_UNIT_NORMALIZED oid=%s client=%s normalized=%s basket=%s", body.merchant_oid, client_amount, normalized_client, base_total)
+
+    basket_arr: List[List[Any]] = [
+        [i.name, tl_str(_d(i.price).quantize(_DEC_2, rounding=ROUND_HALF_UP)), i.quantity]
+        for i in body.basket
+    ]
+
+    payable_total = base_total
+    resolved_brand: Optional[str] = None
+
+    if body.installment_count == 3:
+        if not body.bin_number:
+            raise HTTPException(400, "3 taksit için bin_number zorunludur.")
+
+        bres = await paytr_bin_detail(body.bin_number)
+        if bres.get("status") != "success":
+            raise HTTPException(400, f"BIN doğrulanamadı: {bres.get('err_msg') or bres}")
+
+        card_type = (bres.get("cardType") or "").lower()
+        brand = (bres.get("brand") or "").lower()
+
+        if card_type != "credit":
+            raise HTTPException(400, "Banka kartı (debit) ile 3 taksit yapılamaz.")
+        if not brand or brand == "none":
+            raise HTTPException(400, "Bu kart taksit programına uygun değil (brand=none).")
+
+        resolved_brand = brand
+
+        payable_total = apply_installment_rate(base_total, INSTALLMENT_SURCHARGE_PERCENT)
+
+        surcharge = (payable_total - base_total).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+        if surcharge > 0:
+            basket_arr.append([f"3 Taksit Vade Farkı (%{tl_str(INSTALLMENT_SURCHARGE_PERCENT)})", tl_str(surcharge), 1])
+
     user_basket_b64 = b64_str(json.dumps(basket_arr, ensure_ascii=False, separators=(",", ":")))
-
-    # PayTR Direct API için payment_amount - TL cinsinden (kuruş DEĞİL!)
-    # PayTR form-post TL bekliyor: 10 TL = "1000" kuruş değil, "10" TL
-    amount_kurus = to_cents(body.payment_amount)  # Referans için
-    amount_tl = str(int(body.payment_amount)) if body.payment_amount == int(body.payment_amount) else f"{body.payment_amount:.2f}"
-    
-    # DEBUG: Değerleri logla
-    log.info("=" * 60)
-    log.info("PAYTR PAYMENT_AMOUNT DEBUG")
-    log.info("Frontend TL: %.2f", body.payment_amount)
-    log.info("PayTR'ye gönderilen (TL): %s", amount_tl)
-    log.info("=" * 60)
+    amount_tl = tl_str(payable_total)  # IMPORTANT: Direct'te TL string
 
     fields: Dict[str, str] = {
         "merchant_id": PAYTR_MERCHANT_ID,
@@ -339,7 +430,7 @@ async def paytr_direct_init(body: DirectInitIn, request: Request):
         "merchant_oid": body.merchant_oid,
         "email": body.email,
         "payment_type": body.payment_type,
-        "payment_amount": amount_tl,  # TL cinsinden (10 TL = "10")
+        "payment_amount": amount_tl,
         "currency": body.currency,
         "test_mode": PAYTR_TEST_MODE,
         "non_3d": str(body.non_3d),
@@ -353,76 +444,75 @@ async def paytr_direct_init(body: DirectInitIn, request: Request):
         "installment_count": str(body.installment_count),
         "debug_on": str(body.debug_on),
     }
-    if body.card_type:
-        fields["card_type"] = body.card_type  # extended modda imzaya dahil ediyoruz
 
-    token, s2s, order = _calc_direct_token(fields, PAYTR_SIGN_MODE)
+    if body.installment_count == 3 and resolved_brand:
+        fields["card_type"] = resolved_brand
+
+    token, s2s, order_used = _calc_direct_token(fields)
     fields["paytr_token"] = token
 
-    # Debug logging
     if fields.get("debug_on") == "1":
-        log.info("=" * 60)
-        log.info("PAYTR DIRECT INIT - Ödeme Detayları")
-        log.info("=" * 60)
-        log.info("Sipariş ID (merchant_oid): %s", body.merchant_oid)
-        log.info("Gelen Tutar (TL): %.2f TL", body.payment_amount)
-        log.info("Sepet Toplamı (TL): %.2f TL", basket_total)
-        log.info("PayTR'ye Gönderilen: %s TL", amount_tl)
-        log.info("-" * 40)
-        log.info("Taksit Sayısı: %s", body.installment_count)
-        log.info("Kullanıcı IP: %s", ip)
-        log.info("Test Modu: %s", PAYTR_TEST_MODE)
-        log.info("-" * 40)
-        log.info("Sepet İçeriği:")
-        for idx, item in enumerate(body.basket, 1):
-            item_total = item.price * item.quantity
-            log.info("  %d. %s: %.2f TL x %d = %.2f TL", 
-                     idx, item.name, item.price, item.quantity, item_total)
-        log.info("-" * 40)
-        log.info("HMAC Token: %s", token[:20] + "...")
-        log.info("=" * 60)
+        log.info("=" * 80)
+        log.info("PAYTR DIRECT INIT")
+        log.info("oid=%s ip=%s test=%s", body.merchant_oid, ip, PAYTR_TEST_MODE)
+        log.info("base_total=%s TL | payable_total=%s TL | installment=%s | card_type=%s",
+                 tl_str(base_total), amount_tl, body.installment_count, fields.get("card_type"))
+        log.info("string_to_sign=%s", s2s)
+        log.info("order_used=%s", order_used)
+        log.info("token=%s...", token[:24])
+        log.info("=" * 80)
 
     return DirectInitOut(action="https://www.paytr.com/odeme", fields=fields)
 
 # =========================
-# DIRECT — verify (token diff'i gör)
+# DIRECT — verify (token debug)
 # =========================
+def _parse_fields(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, str):
+        return json.loads(raw)
+    if isinstance(raw, dict):
+        if "fields" in raw:
+            val = raw["fields"]
+            if isinstance(val, str):
+                return json.loads(val)
+            if isinstance(val, dict):
+                return val
+            raise ValueError("fields must be JSON string or object")
+        return raw
+    raise ValueError("Body must be an object or JSON string")
+
+def _normalize_fields(d: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in d.items():
+        out[k] = "" if v is None else str(v).strip()
+    return out
+
 @router.post("/direct/verify", response_model=VerifyOut)
 async def paytr_direct_verify(raw: Any = Body(...)):
-    """
-    INIT'ten gelen fields ile imzayı doğrular.
-    - Hem flat dict, hem {"fields": {...}} hem de JSON string kabul eder.
-    - Eksik/hatalı alanları 'notes' içinde bildirir.
-    """
     try:
         parsed = _parse_fields(raw)
     except Exception as e:
-        # body anlaşılamadı
         raise HTTPException(status_code=400, detail=f"invalid body: {e}")
 
     f = _normalize_fields(parsed)
-
     notes: List[str] = []
-
-    # Bazı hızlı kontroller
-    amt = f.get("payment_amount", "")
-    if not amt.isdigit():
-        notes.append("payment_amount kuruş string olmalı (ör: 15 TL -> '1500').")
 
     oid = f.get("merchant_oid", "")
     if not re.fullmatch(r"[A-Za-z0-9]+", oid or ""):
         notes.append("merchant_oid sadece alfanümerik olmalı.")
 
-    # Sepet decode (bilgi amaçlı)
-    if "user_basket" in f and f["user_basket"]:
+    amt = f.get("payment_amount", "")
+    if not re.fullmatch(r"\d+(\.\d{1,2})?", amt or ""):
+        notes.append("payment_amount Direct için TL decimal olmalı (örn: 100.99).")
+
+    if f.get("user_basket"):
         try:
             jb = base64.b64decode(f["user_basket"])
             _ = json.loads(jb.decode("utf-8"))
         except Exception:
             notes.append("user_basket Base64(JSON) çözümlenemedi.")
 
-    # Token üret ve karşılaştır
-    calc, s2s, order = _calc_direct_token(f, PAYTR_SIGN_MODE)
+    calc, s2s, order = _calc_direct_token(f)
     posted = f.get("paytr_token", "")
 
     mid_match = (f.get("merchant_id", "") == PAYTR_MERCHANT_ID)
@@ -433,235 +523,46 @@ async def paytr_direct_verify(raw: Any = Body(...)):
         mid_match=mid_match,
         calc_token=calc,
         posted_token=posted,
-        sign_mode=PAYTR_SIGN_MODE,
         string_to_sign=s2s,
         order_used=order + ["+SALT"],
-        notes=notes or None
+        notes=notes or None,
     )
 
 # =========================
-# iFRAME — init (taksiti kullanıcı seçer)
+# DIRECT — refresh-token (siparişten yeniden token)
 # =========================
-@router.post("/iframe/init")
-async def paytr_iframe_init(body: IframeInitIn, request: Request):
-    ip = body.user_ip or client_ip(request, None)
-    if not ip: raise HTTPException(400, "user_ip required")
-
-    # Tutar doğrulama - sepet toplamı ile payment_amount karşılaştır
-    is_valid, validation_msg, basket_total, diff_percent = validate_payment_amount(
-        body.payment_amount, body.basket, tolerance_percent=1.0
-    )
-    
-    if not is_valid:
-        log.error(
-            "IFRAME_PAYMENT_VALIDATION_FAILED oid=%s payment_amount=%.2f basket_total=%.2f diff=%.2f%% msg=%s",
-            body.merchant_oid, body.payment_amount, basket_total, diff_percent, validation_msg
-        )
-        raise HTTPException(
-            400, 
-            f"Ödeme tutarı doğrulaması başarısız: {validation_msg}"
-        )
-
-    # PayTR iFrame API için payment_amount - TL cinsinden
-    amount_tl = str(int(body.payment_amount)) if body.payment_amount == int(body.payment_amount) else f"{body.payment_amount:.2f}"
-    # PayTR sepet fiyatları TL cinsinden 2 ondalıklı string
-    basket = [[i.name, f"{i.price:.2f}", i.quantity] for i in body.basket]
-    user_basket = b64_str(json.dumps(basket, ensure_ascii=False, separators=(",",":")))
-
-    # Debug logging
-    if body.debug_on == 1:
-        log.info("=" * 60)
-        log.info("PAYTR IFRAME INIT - Ödeme Detayları")
-        log.info("=" * 60)
-        log.info("Sipariş ID (merchant_oid): %s", body.merchant_oid)
-        log.info("Gelen Tutar (TL): %.2f TL", body.payment_amount)
-        log.info("Sepet Toplamı (TL): %.2f TL", basket_total)
-        log.info("PayTR'ye Gönderilen: %s TL", amount_tl)
-        log.info("Max Taksit: %s", body.max_installment)
-        log.info("Taksit Yok: %s", body.no_installment)
-        log.info("=" * 60)
-
-    token, s2s = _calc_iframe_token(
-        merchant_id=PAYTR_MERCHANT_ID,
-        user_ip=ip,
-        merchant_oid=body.merchant_oid,
-        email=body.email,
-        payment_amount=amount_tl,
-        user_basket=user_basket,
-        no_installment=str(body.no_installment),
-        max_installment=str(body.max_installment),
-        currency=body.currency,
-        test_mode=PAYTR_TEST_MODE
-    )
-
-    form = {
-        "merchant_id": PAYTR_MERCHANT_ID,
-        "user_ip": ip,
-        "merchant_oid": body.merchant_oid,
-        "email": body.email,
-        "payment_amount": amount_tl,
-        "paytr_token": token,
-        "user_basket": user_basket,
-        "debug_on": str(body.debug_on),
-        "no_installment": str(body.no_installment),
-        "max_installment": str(body.max_installment),
-        "user_name": body.user_name,
-        "user_address": body.user_address,
-        "user_phone": body.user_phone,
-        "merchant_ok_url": PAYTR_OK_URL,
-        "merchant_fail_url": PAYTR_FAIL_URL,
-        "timeout_limit": "30",
-        "currency": body.currency,
-        "test_mode": PAYTR_TEST_MODE
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as cli:
-        r = await cli.post("https://www.paytr.com/odeme/api/get-token", data=form)
-    try:
-        data = r.json()
-    except Exception:
-        raise HTTPException(502, f"invalid response from get-token: {r.text[:200]}")
-
-    if data.get("status") != "success":
-        log.error("IFRAME get-token failed: %s | str2sign=%s", data, s2s)
-        raise HTTPException(502, f"get-token failed: {data}")
-    return {"token": data["token"]}
-
-# =========================
-# CALLBACK — PayTR bildirimi
-# =========================
-@router.post("/callback", response_class=PlainTextResponse)
-async def paytr_callback(
-    merchant_oid: str = Form(...),
-    status: str       = Form(...),    # "success" | "failed"
-    total_amount: str = Form(...),    # örn "34990" (kuruş string)
-    hash: str         = Form(...),
-):
-    log.info("PAYTR_CALLBACK_RECEIVED: oid=%s status=%s total_amount=%s", merchant_oid, status, total_amount)
-    
-    # 1) İmza doğrulama
-    msg = f"{merchant_oid}{PAYTR_MERCHANT_SALT}{status}{total_amount}"
-    expected = _hmac_b64(PAYTR_MERCHANT_KEY, msg)
-    if expected != hash:
-        log.error("PAYTR_CALLBACK_HASH_MISMATCH: oid=%s expected=%s got=%s", merchant_oid, expected[:20], hash[:20] if hash else "None")
-        return PlainTextResponse("ERR", status_code=400)
-
-    # 2) İlgili siparişi getir (merchant_oid = order_id)
-    ref = db.collection("orders").document(merchant_oid)
-    snap = ref.get()
-    if not snap.exists:
-        return PlainTextResponse("ERR", status_code=404)
-
-    now = datetime.now(timezone.utc)
-    doc = snap.to_dict() or {}
-    user_id = doc.get("user_id")
-
-    # 3) Idempotent transaction ile payment.status yaz
-    @firestore.transactional
-    def _txn(tx):
-        s = ref.get(transaction=tx)
-        d = s.to_dict() or {}
-        pay = d.get("payment") or {}
-        cur = (pay.get("status") or "").lower()
-
-        # Zaten finalize ise (succeeded/failed) tekrar yazma (idempotent)
-        if cur in ("succeeded", "failed"):
-            return d
-
-        new_status = "succeeded" if status == "success" else "failed"
-        update: Dict[str, Any] = {
-            "updated_at": now,
-            "payment": {
-                **pay,
-                "status": new_status,
-                "provider": pay.get("provider") or "PAYTR",
-                "merchant_oid": merchant_oid,
-                "total_amount": total_amount,  # kuruş string
-                "raw": {"status": status, "total_amount": total_amount},
-            },
-        }
-
-        # Başarısız ödemede siparişi iptal etmek istiyorsanız:
-        if new_status == "failed":
-            update["status"] = "canceled"
-            update["status_history"] = firestore.ArrayUnion([
-                {"status": "canceled", "at": now, "by": "system", "meta": {"reason": "payment_failed"}}
-            ])
-
-        tx.update(ref, update)
-        return {**d, **update}
-
-    tx = db.transaction()
-    merged = _txn(tx)
-    
-    log.info("PAYTR_CALLBACK_PROCESSED: oid=%s final_status=%s", merchant_oid, merged.get("payment", {}).get("status"))
-
-    # 4) Ödeme başarılı ise sepeti temizle (isteğe bağlı, yukarıdaki helper ile)
-    if status == "success" and user_id:
-        _clear_cart(user_id)
-        log.info("PAYTR_CALLBACK_CART_CLEARED: user_id=%s", user_id)
-
-    return PlainTextResponse("OK", status_code=200)
-
-
-# =========================
-# TAKSİT ORANLARI
-# =========================
-@router.get("/installments")
-async def installments():
-    url = "https://www.paytr.com/odeme/taksit-oranlari"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, data={"merchant_id": PAYTR_MERCHANT_ID})
-        r.raise_for_status()
-        return r.json()
-
-
-# =========================
-# TOKEN YENİLEME (Taksit değişikliği için)
-# =========================
-class RefreshTokenIn(BaseModel):
-    merchant_oid: str = Field(..., max_length=64, pattern=r"^[A-Za-z0-9]+$")
-    installment_count: int = Field(0, ge=0, le=12)
-    user_ip: Optional[str] = None
-
-
 @router.post("/direct/refresh-token", response_model=DirectInitOut)
 async def paytr_refresh_token(body: RefreshTokenIn, request: Request):
-    """
-    Mevcut sipariş için yeni taksit sayısı ile PayTR token yeniler.
-    Sipariş oluşturmaz, sadece yeni HMAC token üretir.
-    """
     ip = client_ip(request, body.user_ip)
     if not ip:
         raise HTTPException(400, "user_ip required")
 
-    # Siparişi getir
     order_ref = db.collection("orders").document(body.merchant_oid)
     order_snap = order_ref.get()
     if not order_snap.exists:
         raise HTTPException(404, "Sipariş bulunamadı")
 
     order_data = order_snap.to_dict() or {}
-    
-    # Sipariş bilgilerini al
     user_id = order_data.get("user_id")
-    items = order_data.get("items", [])
-    totals = order_data.get("totals", {})
-    
+    items = order_data.get("items", []) or []
+    totals = (order_data.get("totals") or {}) if isinstance(order_data.get("totals"), dict) else {}
+
     if not items:
         raise HTTPException(400, "Sipariş ürünleri bulunamadı")
 
-    # Kullanıcı bilgilerini al
-    user_ref = db.collection("users").document(user_id)
-    user_snap = user_ref.get()
-    user_data = user_snap.to_dict() if user_snap.exists else {}
-    
+    # user
+    user_data: Dict[str, Any] = {}
+    if user_id:
+        uref = db.collection("users").document(user_id)
+        usnap = uref.get()
+        if usnap.exists:
+            user_data = usnap.to_dict() or {}
+
     email = user_data.get("email", "customer@example.com")
     user_name = user_data.get("name", "Müşteri")
     user_phone = user_data.get("phone", "5000000000")
-    
-    # Adres bilgisi
-    address = order_data.get("shipping_address", {})
+
+    address = order_data.get("shipping_address", {}) or {}
     address_parts = [
         address.get("label", ""),
         address.get("street", ""),
@@ -670,34 +571,49 @@ async def paytr_refresh_token(body: RefreshTokenIn, request: Request):
         address.get("district", ""),
         address.get("city", ""),
     ]
-    user_address = ", ".join(p for p in address_parts if p)
-    if not user_address:
-        user_address = "Adres bilgisi yok"
+    user_address = ", ".join(p for p in address_parts if p) or "Adres bilgisi yok"
 
-    # Toplam tutarı hesapla (TL)
-    grand_total = totals.get("grandTotal", 0)
-    if grand_total == 0:
-        # items'dan hesapla
-        for item in items:
-            price = item.get("price", 0)
-            qty = item.get("quantity", 1)
-            grand_total += price * qty
+    # base total (TL)
+    base_total = _d(totals.get("grandTotal", 0)).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+    if base_total <= 0:
+        t = Decimal("0")
+        for it in items:
+            t += _d(it.get("price", 0)) * Decimal(str(it.get("quantity", 1)))
+        base_total = t.quantize(_DEC_2, rounding=ROUND_HALF_UP)
 
-    # Basket oluştur
-    basket_arr = []
-    for item in items:
-        name = item.get("title", item.get("name", "Ürün"))
-        price = item.get("price", 0)
-        qty = item.get("quantity", 1)
-        basket_arr.append([name, f"{price:.2f}", qty])
-    
+    basket_arr: List[List[Any]] = []
+    for it in items:
+        name = it.get("title", it.get("name", "Ürün"))
+        price = _d(it.get("price", 0)).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+        qty = int(it.get("quantity", 1))
+        basket_arr.append([name, tl_str(price), qty])
+
+    payable_total = base_total
+    resolved_brand: Optional[str] = None
+
+    if body.installment_count == 3:
+        if not body.bin_number:
+            raise HTTPException(400, "Taksitli refresh-token için bin_number zorunludur.")
+
+        bres = await paytr_bin_detail(body.bin_number)
+        if bres.get("status") != "success":
+            raise HTTPException(400, f"BIN doğrulanamadı: {bres.get('err_msg') or bres}")
+
+        if (bres.get("cardType") or "").lower() != "credit":
+            raise HTTPException(400, "Banka kartı (debit) ile taksit yapılamaz.")
+
+        brand = (bres.get("brand") or "").lower()
+        if not brand or brand == "none":
+            raise HTTPException(400, "Bu kart program ortaklığına dahil değil (brand=none); taksit yapılamaz.")
+
+        resolved_brand = brand
+        payable_total = apply_installment_rate(base_total, INSTALLMENT_SURCHARGE_PERCENT)
+
+        surcharge = (payable_total - base_total).quantize(_DEC_2, rounding=ROUND_HALF_UP)
+        if surcharge > 0:
+            basket_arr.append([f"3 Taksit Vade Farkı (%{tl_str(INSTALLMENT_SURCHARGE_PERCENT)})", tl_str(surcharge), 1])
+
     user_basket_b64 = b64_str(json.dumps(basket_arr, ensure_ascii=False, separators=(",", ":")))
-
-    # PayTR TL formatında
-    amount_tl = str(int(grand_total)) if grand_total == int(grand_total) else f"{grand_total:.2f}"
-
-    log.info("REFRESH_TOKEN: oid=%s installment=%d amount=%s", 
-             body.merchant_oid, body.installment_count, amount_tl)
 
     fields: Dict[str, str] = {
         "merchant_id": PAYTR_MERCHANT_ID,
@@ -705,7 +621,7 @@ async def paytr_refresh_token(body: RefreshTokenIn, request: Request):
         "merchant_oid": body.merchant_oid,
         "email": email,
         "payment_type": "card",
-        "payment_amount": amount_tl,
+        "payment_amount": tl_str(payable_total),
         "currency": "TL",
         "test_mode": PAYTR_TEST_MODE,
         "non_3d": "0",
@@ -720,25 +636,192 @@ async def paytr_refresh_token(body: RefreshTokenIn, request: Request):
         "debug_on": "1",
     }
 
-    token, _, _ = _calc_direct_token(fields, PAYTR_SIGN_MODE)
+    if body.installment_count == 3 and resolved_brand:
+        fields["card_type"] = resolved_brand
+
+    token, _, _ = _calc_direct_token(fields)
     fields["paytr_token"] = token
+
+    log.info("REFRESH_TOKEN oid=%s installment=%s amount=%s card_type=%s",
+             body.merchant_oid, body.installment_count, fields["payment_amount"], fields.get("card_type"))
 
     return DirectInitOut(action="https://www.paytr.com/odeme", fields=fields)
 
-# (İsteğe bağlı demo formu tutmak istersen bırak; prod'da gerekli değil)
+# =========================
+# iFRAME — init (taksiti PayTR iframe içinde seçer)
+# =========================
+@router.post("/iframe/init")
+async def paytr_iframe_init(body: IframeInitIn, request: Request):
+    ip = body.user_ip or client_ip(request, None)
+    if not ip:
+        raise HTTPException(400, "user_ip required")
 
-@router.get("/success", response_class=HTMLResponse)
-async def paytr_success():
-    return HTMLResponse("""
-    <!doctype html><meta charset="utf-8">
-    <h1>Ödeme Başarılı</h1>
-    <p>Teşekkürler! Ödemeniz alındı.</p>
-    """, status_code=200)
+    # basket total backend
+    b_total = basket_total_tl(body.basket)
 
-@router.get("/fail", response_class=HTMLResponse)
-async def paytr_fail():
-    return HTMLResponse("""
-    <!doctype html><meta charset="utf-8">
-    <h1>Ödeme Başarısız</h1>
-    <p>İşlem tamamlanamadı. Lütfen tekrar deneyin.</p>
-    """, status_code=200)
+    # iframe payment_amount: KURUŞ
+    amount_kurus = to_kurus_str(b_total)
+
+    basket = [[i.name, tl_str(_d(i.price).quantize(_DEC_2, rounding=ROUND_HALF_UP)), i.quantity] for i in body.basket]
+    user_basket = b64_str(json.dumps(basket, ensure_ascii=False, separators=(",", ":")))
+
+    token, s2s = _calc_iframe_token(
+        merchant_id=PAYTR_MERCHANT_ID,
+        user_ip=ip,
+        merchant_oid=body.merchant_oid,
+        email=body.email,
+        payment_amount_kurus=amount_kurus,
+        user_basket=user_basket,
+        no_installment=str(body.no_installment),
+        max_installment=str(body.max_installment),
+        currency=body.currency,
+        test_mode=PAYTR_TEST_MODE,
+    )
+
+    form = {
+        "merchant_id": PAYTR_MERCHANT_ID,
+        "user_ip": ip,
+        "merchant_oid": body.merchant_oid,
+        "email": body.email,
+        "payment_amount": amount_kurus,
+        "paytr_token": token,
+        "user_basket": user_basket,
+        "debug_on": str(body.debug_on),
+        "no_installment": str(body.no_installment),
+        "max_installment": str(body.max_installment),
+        "user_name": body.user_name,
+        "user_address": body.user_address,
+        "user_phone": body.user_phone,
+        "merchant_ok_url": PAYTR_OK_URL,
+        "merchant_fail_url": PAYTR_FAIL_URL,
+        "timeout_limit": "30",
+        "currency": body.currency,
+        "test_mode": PAYTR_TEST_MODE,
+    }
+
+    if body.debug_on == 1:
+        log.info("=" * 70)
+        log.info("PAYTR IFRAME INIT")
+        log.info("oid=%s ip=%s basket_total=%s TL payment_amount=%s (kuruş)", body.merchant_oid, ip, tl_str(b_total), amount_kurus)
+        log.info("str2sign=%s", s2s)
+        log.info("=" * 70)
+
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(PAYTR_IFRAME_GET_TOKEN_URL, data=form)
+
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, f"invalid response from get-token: {r.text[:200]}")
+
+    if data.get("status") != "success":
+        log.error("IFRAME get-token failed: %s | str2sign=%s", data, s2s)
+        raise HTTPException(502, f"get-token failed: {data}")
+
+    return {"token": data["token"]}
+
+# =========================
+# TAKSİT ORANLARI
+# =========================
+@router.get("/installments")
+async def installments():
+    return await paytr_installment_rates(single_ratio=1, abroad_ratio=0)
+
+# =========================
+# CALLBACK — PayTR bildirimi
+# =========================
+
+@router.api_route("/callback", methods=["POST"], response_class=PlainTextResponse)
+@router.api_route("/callback/", methods=["POST"], response_class=PlainTextResponse)  # trailing slash
+async def paytr_callback(request: Request):
+    form = await request.form()
+
+    merchant_oid = (form.get("merchant_oid") or "").strip()
+    status = (form.get("status") or "").strip()
+    total_amount = (form.get("total_amount") or "").strip()
+    incoming_hash = (form.get("hash") or "").strip()
+
+    # 1) HASH doğrulama
+    msg = f"{merchant_oid}{PAYTR_MERCHANT_SALT}{status}{total_amount}"
+    expected = _hmac_b64(PAYTR_MERCHANT_KEY, msg)
+
+    if expected != incoming_hash:
+        log.error("PAYTR_CALLBACK_HASH_MISMATCH oid=%s", merchant_oid)
+        return PlainTextResponse("ERR", status_code=400)
+
+    # 2) Sipariş yoksa bile OK dön (yoksa PayTR sonsuza kadar dener)
+    ref = db.collection("orders").document(merchant_oid)
+    snap = ref.get()
+    if not snap.exists:
+        log.error("PAYTR_CALLBACK_ORDER_NOT_FOUND oid=%s (OK returning)", merchant_oid)
+        # İstersen orphan olarak kaydet (opsiyonel)
+        return PlainTextResponse("OK", status_code=200)
+
+    # 3) Siparişi güncelle (idempotent)
+    now = datetime.now(timezone.utc)
+    doc = snap.to_dict() or {}
+    user_id = doc.get("user_id")
+
+    @firestore.transactional
+    def _txn(tx):
+        s = ref.get(transaction=tx)
+        d = s.to_dict() or {}
+        pay = d.get("payment") or {}
+        cur = (pay.get("status") or "").lower()
+
+        if cur in ("succeeded", "failed"):
+            return d
+
+        new_status = "succeeded" if status == "success" else "failed"
+
+        update = {
+            "updated_at": now,
+            "payment": {
+                **pay,
+                "status": new_status,
+                "provider": pay.get("provider") or "PAYTR",
+                "merchant_oid": merchant_oid,
+                "total_amount": total_amount,
+            },
+        }
+
+        if new_status == "failed":
+            update["status"] = "canceled"
+
+        tx.update(ref, update)
+        return {**d, **update}
+
+    merged = _txn(db.transaction())
+
+    if status == "success" and user_id:
+        _clear_cart(user_id)
+
+    # 4) Mutlaka sadece OK
+    return PlainTextResponse("OK", status_code=200)
+
+
+
+@router.api_route("/success", methods=["GET", "POST"], response_class=HTMLResponse)
+async def paytr_success(request: Request):
+    # İstersen POST form alanlarını da okuyabilirsin:
+    # form = await request.form()
+    return HTMLResponse(
+        """
+        <!doctype html><meta charset="utf-8">
+        <h1>Ödeme Başarılı</h1>
+        <p>Teşekkürler! Ödemeniz alındı.</p>
+        """,
+        status_code=200,
+    )
+
+@router.api_route("/fail", methods=["GET", "POST"], response_class=HTMLResponse)
+async def paytr_fail(request: Request):
+    # form = await request.form()
+    return HTMLResponse(
+        """
+        <!doctype html><meta charset="utf-8">
+        <h1>Ödeme Başarısız</h1>
+        <p>İşlem tamamlanamadı. Lütfen tekrar deneyin.</p>
+        """,
+        status_code=200,
+    )
