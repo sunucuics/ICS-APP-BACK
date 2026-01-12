@@ -7,7 +7,7 @@ from backend.app.routers import (
     services, carts, appointments,
     discounts, comments, auth_delete, featured,
     admin_dashboard, analytics, notifications,
-    settings as settings_router
+    settings as settings_router, admin_notifications
 )
 from backend.app.routers import user_notifications
 from backend.app.routers import categories as categories_router
@@ -87,6 +87,7 @@ app.include_router(users_router.admin_router, prefix="/admin")
 app.include_router(featured.admin_router, prefix="/admin")
 app.include_router(analytics.router, prefix="/admin")
 app.include_router(notifications.router, prefix="/admin")
+app.include_router(admin_notifications.router, prefix="/admin")
 app.include_router(settings_router.router, prefix="/admin")
 
 

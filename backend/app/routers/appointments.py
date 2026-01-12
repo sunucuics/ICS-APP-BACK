@@ -15,6 +15,7 @@ from backend.app.schemas.appointment import (
     AppointmentOut, AppointmentStatus, AppointmentAdminOut,
     ServiceAvailability, ServiceBrief, AppointmentWithDetails
 )
+from firebase_admin import messaging
 
 logger = logging.getLogger("ics.appointments")
 
@@ -46,6 +47,74 @@ def _coerce_dt(v: Any) -> Optional[datetime]:
             logger.debug("ISO parse failed for %r: %s", v, exc)
             return None
     return None
+
+
+# --- Admin Push Notification Helper -------------------------------------------
+def _send_admin_push_notification(title: str, body: str, appointment_id: str):
+    """
+    Admin kullanıcılara (admin=True) FCM push notification gönderir.
+    Uygulama kapalı olsa bile bildirim alınır.
+    """
+    try:
+        # Admin kullanıcıların FCM token'larını al
+        admin_users = db.collection("users").where("admin", "==", True).stream()
+        
+        fcm_tokens = []
+        for user_doc in admin_users:
+            user_data = user_doc.to_dict() or {}
+            fcm_token = user_data.get("fcm_token")
+            if fcm_token:
+                fcm_tokens.append(fcm_token)
+        
+        if not fcm_tokens:
+            logger.info("No admin FCM tokens found, skipping push notification")
+            return
+        
+        logger.info("Sending push notification to %d admin devices", len(fcm_tokens))
+        
+        # FCM multicast mesajı oluştur
+        multicast_message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data={
+                'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                'type': 'admin_appointment',
+                'appointment_id': appointment_id,
+                'title': title,
+                'body': body,
+            },
+            tokens=fcm_tokens,
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    sound='default',
+                    priority='high',
+                    channel_id='admin_notifications',
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound='default',
+                        badge=1,
+                        content_available=True,
+                    ),
+                ),
+            ),
+        )
+        
+        # Bildirimi gönder
+        response = messaging.send_each_for_multicast(multicast_message)
+        logger.info(
+            "FCM push sent to admins: success=%d, failure=%d",
+            response.success_count,
+            response.failure_count
+        )
+        
+    except Exception as e:
+        logger.error("Failed to send admin push notification: %s", e)
 
 
 # === Kullanıcı: Randevu Talebi ===============================================
@@ -99,6 +168,51 @@ def request_appointment(
     }
     ref.set(appt_data)
     appt_data["id"] = ref.id
+
+    # Admin bildirimi oluştur ve FCM push gönder
+    try:
+        service_data = service_doc.to_dict() or {}
+        user_doc = db.collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        
+        user_name = user_data.get("name") or user_data.get("email") or "Bir müşteri"
+        service_title = service_data.get("title") or "Hizmet"
+        
+        # Tarih formatla
+        date_str = start_norm.strftime("%d/%m/%Y")
+        time_str = start_norm.strftime("%H:%M")
+        
+        notification_title = "🗓️ Yeni Randevu Talebi"
+        notification_body = f"{user_name} - {service_title} için {date_str} tarihinde saat {time_str}'de randevu talebi oluşturdu."
+        
+        notification_data = {
+            "title": notification_title,
+            "body": notification_body,
+            "type": "appointment",
+            "is_read": False,
+            "created_at": datetime.utcnow(),
+            "data": {
+                "appointment_id": ref.id,
+                "user_id": user_id,
+                "user_name": user_data.get("name"),
+                "user_email": user_data.get("email"),
+                "user_phone": user_data.get("phone"),
+                "service_id": service_id,
+                "service_title": service_title,
+                "start": start_norm.isoformat(),
+                "end": end_time.isoformat()
+            }
+        }
+        db.collection("admin_notifications").document().set(notification_data)
+        logger.info("Admin notification created for appointment %s", ref.id)
+        
+        # Admin kullanıcılara FCM push notification gönder
+        _send_admin_push_notification(notification_title, notification_body, ref.id)
+        
+    except Exception as e:
+        # Bildirim oluşturma başarısız olursa log'la ama randevuyu engelleme
+        logger.error("Failed to create admin notification: %s", e)
+
     return appt_data
 
 

@@ -149,8 +149,15 @@ async def register(
 
     # 4) Firestore'da var mı?
     user_ref = db.collection("users").document(uid)
-    if user_ref.get().exists:
-        raise HTTPException(400, "Bu kullanıcı zaten kayıtlı")
+    doc_snap = user_ref.get()
+
+    if doc_snap.exists:
+        # DB'de kayıt var. Ancak "name" alanı boşsa (hatalı/eksik kayıt),
+        # tekrar kayıt olmaya (üzerine yazmaya) izin ver.
+        # Sadece "name" doluysa "Zaten kayıtlı" hatası at.
+        existing_data = doc_snap.to_dict() or {}
+        if existing_data.get("name"):
+            raise HTTPException(400, "Bu kullanıcı zaten kayıtlı")
 
     # 5) Profil yaz
     # Telefon gelmediyse "0" olarak kaydediyoruz
