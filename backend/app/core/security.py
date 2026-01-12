@@ -114,23 +114,25 @@ def get_current_user(
     provider = (decoded.get("firebase") or {}).get("sign_in_provider")
     is_guest = (provider == "anonymous")
 
-    # Kullanıcı profilini getir/oluştur
+    # Kullanıcı profilini getir (varsa)
     user_ref = db.collection("users").document(uid)
     doc = user_ref.get()
 
     if not doc.exists:
-        user_data = {
+        # ÖNEMLİ: Profil yoksa OTOMATİK OLUŞTURMA!
+        # /auth/register endpoint'inin name ile düzgün profil oluşturmasını bekliyoruz.
+        # Sadece token'dan gelen bilgileri döndür (Firestore'a yazmadan).
+        user = {
+            "id": uid,
             "name": decoded.get("name", "") or "",
             "email": decoded.get("email", "") or "",
             "phone": decoded.get("phone_number", "") or "",
             "email_verified": bool(decoded.get("email_verified")),
             "role": "customer",
             "addresses": [],
-            "created_at": firestore.SERVER_TIMESTAMP,
             "is_guest": is_guest,
         }
-        user_ref.set(user_data)
-        user = {**user_data, "id": uid}
+        # NOT: user_ref.set() çağrılmıyor - profil register endpoint'inde oluşturulacak
     else:
         user = doc.to_dict() or {}
         user["id"] = uid
