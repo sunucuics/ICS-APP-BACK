@@ -329,8 +329,16 @@ async def direct_bin_detail(body: BinDetailIn):
 async def direct_installment_quote(body: InstallmentQuoteIn):
     base_amount = _d(body.amount_tl).quantize(_DEC_2, rounding=ROUND_HALF_UP)
 
+    # Debug log: BIN sorgusu başlatılıyor
+    log.info("BIN_DETAIL_REQUEST bin=%s amount=%s test_mode=%s", body.bin_number, base_amount, PAYTR_TEST_MODE)
+
     bres = await paytr_bin_detail(body.bin_number)
+    
+    # Debug log: PayTR'den gelen yanıt
+    log.info("BIN_DETAIL_RESPONSE bin=%s response=%s", body.bin_number, bres)
+    
     if bres.get("status") != "success":
+        log.warning("BIN_DETAIL_FAILED bin=%s reason=%s", body.bin_number, bres.get("err_msg") or bres.get("reason"))
         return {
             "status": "failed",
             "reason": bres.get("err_msg") or bres.get("reason") or "BIN tanımsız",
@@ -348,11 +356,15 @@ async def direct_installment_quote(body: InstallmentQuoteIn):
     card_type = (bres.get("cardType") or "").lower()  # credit / debit
     brand = (bres.get("brand") or "").lower()
 
+    # Debug log: Parse edilen değerler
+    log.info("BIN_DETAIL_PARSED bin=%s cardType=%s brand=%s", body.bin_number, card_type, brand)
+
     options: List[Dict[str, Any]] = [
         {"installment_count": 0, "rate_percent": 0, "total_tl": tl_str(base_amount), "per_installment_tl": tl_str(base_amount)}
     ]
 
     if card_type != "credit" or not brand or brand == "none":
+        log.info("BIN_NO_INSTALLMENT bin=%s reason=cardType=%s brand=%s", body.bin_number, card_type, brand)
         return {"status": "success", "brand": brand, "cardType": card_type, "installments": options, "bin": bres}
 
     total = apply_installment_rate(base_amount, INSTALLMENT_SURCHARGE_PERCENT)
@@ -366,6 +378,9 @@ async def direct_installment_quote(body: InstallmentQuoteIn):
             "per_installment_tl": tl_str(per),
         }
     )
+
+    log.info("BIN_INSTALLMENT_ADDED bin=%s cardType=%s brand=%s installments=%s", 
+             body.bin_number, card_type, brand, len(options))
 
     return {"status": "success", "brand": brand, "cardType": card_type, "installments": options, "bin": bres}
 

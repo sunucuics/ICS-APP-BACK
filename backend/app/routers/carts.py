@@ -159,6 +159,7 @@ def remove_cart_item(product_id: str, current_user: dict = Depends(get_current_u
 
 
 @router.delete("/", status_code=204)
+@router.delete("", status_code=204)
 def clear_cart(current_user: dict = Depends(get_current_user)):
     """Clear the entire cart."""
     uid = current_user["id"]
