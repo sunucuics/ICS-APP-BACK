@@ -494,20 +494,37 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
 # -----------------------------------------------------------------------------
 # PUBLIC — Kullanıcının siparişlerini listele
 # -----------------------------------------------------------------------------
-@router.get("", summary="Kullanıcının siparişlerini listele (sayfalama destekli)")
+# Mevcut importlara 'Literal' eklememiz gerekecek (Type hint ve Swagger'da dropdown çıkması için)
+from typing import Literal
+
+@router.get("", summary="Kullanıcının siparişlerini listele (Aktif/Geçmiş)")
 async def list_my_orders(
     me: Dict = Depends(get_current_user),
-    status_filter: Optional[str] = Query(None, alias="status", pattern="^(preparing|shipped|delivered|canceled|payment_failed)$"),
+    view_type: Literal["active", "past"] = Query("active", description="'active': Devam edenler, 'past': Tamamlananlar"),
     limit: int = Query(20, ge=1, le=100),
     start_after: Optional[str] = Query(None, description="ISO datetime (created_at) ile sayfalama"),
-    include_awaiting_payment: bool = Query(False, description="Ödeme bekleyen siparişleri dahil et")
 ):
+    """
+    Siparişleri iki sekme mantığıyla listeler:
+    - **active**: Statüsü 'preparing' veya 'shipped' olanlar (Ödeme bekleyenler dahil buraya düşer).
+    - **past**: Statüsü 'delivered', 'canceled' veya 'payment_failed' olanlar.
+    """
     user_id = me["id"]
     q = db.collection("orders").where("user_id", "==", user_id).where("is_deleted", "==", False)
-    if status_filter:
-        q = q.where("status", "==", status_filter)
+
+    # --- View Type Mantığı ---
+    if view_type == "active":
+        # Aktif siparişler: Hazırlanıyor veya Yolda
+        # (Ödeme bekleyenler de status=preparing olduğu için buraya gelir)
+        q = q.where("status", "in", ["preparing", "shipped"])
+    else:
+        # Geçmiş siparişler: Teslim edildi, İptal edildi veya Ödeme Hatası
+        q = q.where("status", "in", ["delivered", "canceled", "payment_failed"])
+
+    # Tarihe göre tersten sırala (En yeni en üstte)
     q = q.order_by("created_at", direction=firestore.Query.DESCENDING)
 
+    # --- Sayfalama (Pagination) ---
     cursor_dt = None
     if start_after:
         try:
@@ -517,24 +534,26 @@ async def list_my_orders(
     if cursor_dt:
         q = q.start_after(cursor_dt)
 
+    # --- Sorguyu Çalıştır ---
     docs = list(q.limit(limit).stream())
     items = []
-    next_cursor = None
+    
     for d in docs:
         data = d.to_dict() or {}
         data["id"] = d.id
-        
-        # Ödeme bekleyen siparişleri filtrele (varsayılan olarak gösterme)
-        payment_status = (data.get("payment") or {}).get("status", "").lower()
-        if not include_awaiting_payment and payment_status == "awaiting":
-            continue
-            
+        # Artık burada python tarafında payment filtresi yapmamıza gerek yok,
+        # çünkü 'active' seçildiyse zaten preparing olan (ödeme bekleyen dahil) hepsi gelsin istenir.
         items.append(data)
+
+    next_cursor = None
     if docs:
         last_ct = (docs[-1].to_dict() or {}).get("created_at")
         if isinstance(last_ct, datetime):
             next_cursor = last_ct.isoformat()
+
     return {"items": items, "next_cursor": next_cursor, "count": len(items)}
+
+
 
 # -----------------------------------------------------------------------------
 # PUBLIC — Sipariş detayı

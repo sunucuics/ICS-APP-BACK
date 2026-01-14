@@ -5,75 +5,35 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PayTR Ödeme</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; }
-    .wrap { max-width: 520px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
-    label { display:block; margin-top: 10px; font-size: 14px; }
-    input, select { width: 100%; padding: 10px; margin-top: 6px; border: 1px solid #d1d5db; border-radius: 10px; }
-    button { width: 100%; margin-top: 16px; padding: 12px; border: 0; border-radius: 10px; cursor: pointer; }
+    body{font-family:Arial,Helvetica,sans-serif;background:#f6f6f6;margin:0;padding:24px;color:#111}
+    .card{max-width:520px;margin:0 auto;background:#fff;border:1px solid #e8e8e8;border-radius:14px;padding:20px;box-shadow:0 6px 18px rgba(0,0,0,.06)}
+    h1{font-size:18px;margin:0 0 10px}
+    p{font-size:13px;color:#444;margin:0 0 16px;line-height:1.4}
+    label{display:block;font-size:12px;color:#333;margin:10px 0 6px}
+    input,select{width:100%;padding:11px 12px;border:1px solid #ddd;border-radius:10px;font-size:14px;box-sizing:border-box}
+    .row{display:flex;gap:10px}
+    .row > div{flex:1}
+    button{width:100%;margin-top:14px;padding:12px 14px;border:0;border-radius:12px;background:#111;color:#fff;font-weight:700;font-size:14px;cursor:pointer}
+    .hint{margin-top:10px;font-size:12px;color:#666}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h2>Ödeme Bilgileri</h2>
+  <div class="card">
+    <h1>Kart ile Ödeme</h1>
+    <p>
+      Bu sayfada kart bilgilerini girip “Ödemeyi Tamamla” dediğinde form PayTR’ye gönderilir.
+      (Direct API – kart formu sizde)
+    </p>
 
-    <form id="paytr_form" method="post" action="https://www.paytr.com/odeme" accept-charset="UTF-8">
-      <!-- Kart Sahibi -->
-      <label>Kart Üzerindeki İsim</label>
-      <input name="cc_owner" autocomplete="cc-name" required />
-
-      <!-- Kart No -->
-      <label>Kart Numarası</label>
-      <input
-        name="card_number"
-        inputmode="numeric"
-        autocomplete="cc-number"
-        placeholder="XXXX XXXX XXXX XXXX"
-        required
-      />
-
-      <!-- SKT -->
-      <label>Son Kullanma Tarihi</label>
-      <div style="display:flex; gap:10px;">
-        <select name="expiry_month" required>
-          <option value="">Ay</option>
-          <option value="01">01</option><option value="02">02</option><option value="03">03</option>
-          <option value="04">04</option><option value="05">05</option><option value="06">06</option>
-          <option value="07">07</option><option value="08">08</option><option value="09">09</option>
-          <option value="10">10</option><option value="11">11</option><option value="12">12</option>
-        </select>
-
-        <select name="expiry_year" required>
-          <option value="">Yıl</option>
-          <option value="2026">2026</option>
-          <option value="2027">2027</option>
-          <option value="2028">2028</option>
-          <option value="2029">2029</option>
-          <option value="2030">2030</option>
-          <option value="2031">2031</option>
-          <option value="2032">2032</option>
-          <option value="2033">2033</option>
-          <option value="2034">2034</option>
-          <option value="2035">2035</option>
-        </select>
-      </div>
-
-      <!-- CVV -->
-      <label>CVV</label>
-      <input
-        name="cvv"
-        inputmode="numeric"
-        autocomplete="cc-csc"
-        placeholder="XXX"
-        required
-      />
-
-      <!-- Backend'den gelen fields (SENİN JSON) -->
+    <form id="paytr_form" method="post" action="https://www.paytr.com/odeme" accept-charset="UTF-8" autocomplete="off">
+      <!-- BACKEND'DEN GELEN FIELDS (HIDDEN) -->
       <input type="hidden" name="merchant_id" value="628320" />
       <input type="hidden" name="user_ip" value="31.155.23.172" />
-      <input type="hidden" name="merchant_oid" value="34653564523645622666" />
+      <input type="hidden" name="merchant_oid" value="3465322356452323645622666" />
       <input type="hidden" name="email" value="efehanh0@gmail.com" />
       <input type="hidden" name="payment_type" value="card" />
-      <input type="hidden" name="payment_amount" value="10.00" />
+      <input type="hidden" name="payment_amount" value="11.50" />
       <input type="hidden" name="currency" value="TL" />
       <input type="hidden" name="test_mode" value="0" />
       <input type="hidden" name="non_3d" value="0" />
@@ -83,13 +43,60 @@
       <input type="hidden" name="user_name" value="Efe Hüs" />
       <input type="hidden" name="user_address" value="Barbaros Mah., Örnek Sk. No:1 D:3, Beşiktaş, İstanbul" />
       <input type="hidden" name="user_phone" value="905456110745" />
-      <input type="hidden" name="user_basket" value="W1siVGVzdCDDnHLDvG4iLCIxMC4wMCIsMV1d" />
-      <input type="hidden" name="installment_count" value="0" />
+      <input type="hidden" name="user_basket" value="W1siVGVzdCDDnHLDvG4iLCIxMC4wMCIsMV0sWyIzIFRha3NpdCBWYWRlIEZhcmvEsSAoJTE1LjAwKSIsIjEuNTAiLDFdXQ==" />
+      <input type="hidden" name="installment_count" value="3" />
       <input type="hidden" name="debug_on" value="1" />
-      <input type="hidden" name="paytr_token" value="SIwX9/jmx4yDamvQ+kcx6X5Q8mKMlI5UXp9+yr/pqh8=" />
+      <input type="hidden" name="card_type" value="maximum" />
+      <input type="hidden" name="paytr_token" value="RSLUHZxlaPlOso9YI/lERDHGcxLcna+zd3JJmKuAK0c=" />
 
-      <button type="submit">Ödemeyi Başlat</button>
+      <!-- KART BİLGİLERİ (PAYTR'NİN İSTEDİĞİ ZORUNLU ALANLAR) -->
+      <label>Kart Üzerindeki İsim</label>
+      <input name="cc_owner" placeholder="AD SOYAD" required />
+
+      <label>Kart Numarası</label>
+      <input name="card_number" inputmode="numeric" autocomplete="cc-number"
+             placeholder="0000 0000 0000 0000" maxlength="19" required />
+
+      <div class="row">
+        <div>
+          <label>Son Kullanma Ay</label>
+          <select name="expiry_month" required>
+            <option value="">AA</option>
+            <option>01</option><option>02</option><option>03</option><option>04</option>
+            <option>05</option><option>06</option><option>07</option><option>08</option>
+            <option>09</option><option>10</option><option>11</option><option>12</option>
+          </select>
+        </div>
+        <div>
+          <label>Son Kullanma Yıl</label>
+          <select name="expiry_year" required>
+            <option value="">YY</option>
+            <option>2026</option><option>2027</option><option>2028</option><option>2029</option>
+            <option>2030</option><option>2031</option><option>2032</option><option>2033</option>
+            <option>2034</option><option>2035</option>
+          </select>
+        </div>
+      </div>
+
+      <label>CVV</label>
+      <input name="cvv" inputmode="numeric" autocomplete="cc-csc" placeholder="123" maxlength="4" required />
+
+      <button type="submit">Ödemeyi Tamamla</button>
+
+      <div class="hint">
+        <div>merchant_oid: <span class="mono">3465322356452323645622666</span></div>
+        <div>tutar: <span class="mono">11.50 TL</span> (3 taksit)</div>
+      </div>
     </form>
   </div>
+
+  <script>
+    // Basit kart numarası formatlama (opsiyonel)
+    const cn = document.querySelector('input[name="card_number"]');
+    cn.addEventListener('input', () => {
+      let v = cn.value.replace(/\D/g,'').slice(0,16);
+      cn.value = v.replace(/(\d{4})(?=\d)/g, '$1 ').trim();
+    });
+  </script>
 </body>
 </html>
