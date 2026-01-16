@@ -469,7 +469,10 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
     now = _now()
     customer = _build_customer(user_id)
 
-    ref = db.collection("orders").document()
+    pfx = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
+    cname = f"{pfx}orders" if pfx else "orders"
+    ref = db.collection(cname).document()
+    
     payload: Dict[str, Any] = {
         "user_id": user_id,
         "created_at": now,
@@ -488,6 +491,19 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
             "merchant_oid": ref.id},
     }
     ref.set(payload)
+
+    # Sepeti temizle
+    try:
+        carts_cname = f"{pfx}carts" if pfx else "carts"
+        cref = db.collection(carts_cname).document(user_id)
+        cref.set({"items": []}, merge=True)
+        # Varsa subcollection items'ı da (eğer yapı öyleyse) temizle
+        col_items = cref.collection("items")
+        blobs = list(col_items.list_documents())
+        for b in blobs:
+            b.delete()
+    except Exception as e:
+        print(f"CART_CLEAR_ERROR: {e}")
 
     return {"id": ref.id, "message": "Siparişiniz alındı, kargonuz hazırlanıyor.", **payload}
 

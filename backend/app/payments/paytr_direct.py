@@ -775,28 +775,154 @@ async def installments():
 # =========================
 
 @router.api_route("/callback", methods=["POST"], response_class=PlainTextResponse)
-@router.api_route("/callback/", methods=["POST"], response_class=PlainTextResponse)  # trailing slash
+@router.api_route("/callback/", methods=["POST"], response_class=PlainTextResponse)
 async def paytr_callback(request: Request):
-    form = await request.form()
+    # =========================================================================
+    # INLINE HELPERS (Self-Contained Logic)
+    # =========================================================================
+    def _create_order_from_session(session, payment_info, now):
+        """Session verisinden Sipariş Dökümanı oluşturur."""
+        user_id = session.get("user_id")
+        items = session.get("basket", [])
+        
+        # Totals hesapla
+        base_amt = session.get("base_amount", 0)
+        pay_amt = session.get("payable_amount", 0)
+        currency = "TL" # Default
+        
+        customer = {
+            "full_name": session.get("user_name", ""),
+            "email": session.get("email", ""),
+            "phone": session.get("user_phone", ""),
+            "address": {
+                "full_address": session.get("user_address", ""),
+                "ip": session.get("user_ip", "")
+            }
+        }
+        
+        shipping_info = {
+            "provider": "MANUAL", 
+            "address": session.get("user_address", "")
+        }
+        
+        return {
+            "user_id": user_id,
+            "items": items,
+            "totals": {
+                "subtotal": base_amt,
+                "grand_total": pay_amt,
+                "currency": currency
+            },
+            "customer": customer,
+            "shipping_info": shipping_info,
+            "payment": payment_info,
+            "status": "preparing", # Listede görünmesi için PREPARING olmalı
+            "created_at": now,
+            "updated_at": now,
+            "is_deleted": False,
+            "status_history": [
+                {"status": "preparing", "at": now, "by": "paytr_callback"}
+            ]
+        }
 
+    # =========================================================================
+
+    form = await request.form()
     merchant_oid = (form.get("merchant_oid") or "").strip()
     cb_status = (form.get("status") or "").strip()
     total_amount = (form.get("total_amount") or "").strip()
     incoming_hash = (form.get("hash") or "").strip()
 
-    log.info("PAYTR_CALLBACK_RECEIVED oid=%s status=%s amount=%s", merchant_oid, cb_status, total_amount)
+    log.info("PAYTR_CALLBACK oid=%s status=%s amt=%s", merchant_oid, cb_status, total_amount)
 
-    # 1) HASH doğrulama
+    # 1) HASH DOĞRULAMA
     msg = f"{merchant_oid}{PAYTR_MERCHANT_SALT}{cb_status}{total_amount}"
     expected = _hmac_b64(PAYTR_MERCHANT_KEY, msg)
-
     if expected != incoming_hash:
-        log.error("PAYTR_CALLBACK_HASH_MISMATCH oid=%s", merchant_oid)
+        log.error("PAYTR_HASH_FAIL oid=%s", merchant_oid)
         return PlainTextResponse("ERR", status_code=400)
 
+    # Collection Prefix (Dynamic)
+    pfx = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
+    orders_cname = f"{pfx}orders" if pfx else "orders"
+    sessions_cname = f"{pfx}payment_sessions" if pfx else "payment_sessions"
+
+    orders_col = db.collection(orders_cname)
+    sessions_col = db.collection(sessions_cname)
     now = datetime.now(timezone.utc)
-    orders_col = db.collection(_prefixed("orders"))
-    sessions_col = db.collection(_prefixed("payment_sessions"))
+
+    # 2) SİPARİŞ ZATEN VAR MI? (Update)
+    order_ref = orders_col.document(merchant_oid)
+    order_snap = order_ref.get()
+
+    if order_snap.exists:
+        # Sipariş zaten var, durumunu güncelle
+        doc = order_snap.to_dict() or {}
+        pay = doc.get("payment") or {}
+        
+        # Zaten bitmişse dokunma
+        if pay.get("status") in ("succeeded", "failed"):
+            return PlainTextResponse("OK", status_code=200)
+
+        new_pay_status = "succeeded" if cb_status == "success" else "failed"
+        new_order_status = "preparing" if new_pay_status == "succeeded" else "cancelled"
+        
+        order_ref.update({
+            "payment.status": new_pay_status,
+            "payment.total_amount": total_amount,
+            "status": new_order_status,
+            "updated_at": now
+        })
+        log.info("ORDER_UPDATED oid=%s status=%s", merchant_oid, new_order_status)
+        return PlainTextResponse("OK", status_code=200)
+
+    # 3) SİPARİŞ YOK -> SADECE SUCCESS İSE OLUŞTUR
+    if cb_status != "success":
+        log.warning("PAYMENT_FAILED_NO_ORDER oid=%s", merchant_oid)
+        return PlainTextResponse("OK", status_code=200)
+
+    # Session oku
+    sess_ref = sessions_col.document(merchant_oid)
+    sess_snap = sess_ref.get()
+    
+    if not sess_snap.exists:
+        log.error("SESSION_NOT_FOUND oid=%s", merchant_oid)
+        return PlainTextResponse("OK", status_code=200)
+
+    session = sess_snap.to_dict() or {}
+    
+    # Sipariş Dökümanı Hazırla
+    payment_info = {
+        "provider": "PAYTR",
+        "status": "succeeded",
+        "merchant_oid": merchant_oid,
+        "total_amount": total_amount,
+        "installment_count": session.get("installment_count", 0)
+    }
+    
+    new_order_doc = _create_order_from_session(session, payment_info, now)
+    
+    # Kaydet (ID = merchant_oid)
+    order_ref.set(new_order_doc)
+    log.info("ORDER_CREATED oid=%s user=%s", merchant_oid, session.get("user_id"))
+
+    # Sepet Temizle
+    user_id = session.get("user_id")
+    if user_id:
+        try:
+            carts_cname = f"{pfx}carts" if pfx else "carts"
+            cref = db.collection(carts_cname).document(user_id)
+            cref.set({"items": []}, merge=True)
+            # Alt koleksiyon (varsa) temizliği için loop gerekebilir ama basitçe items array temizlendi.
+            for subdoc in cref.collection("items").list_documents():
+                 subdoc.delete()
+        except Exception as e:
+            log.warning("CART_CLEAR_ERR user=%s err=%s", user_id, e)
+
+    # Session Güncelle
+    sess_ref.update({"status": "completed", "order_created": True})
+
+    return PlainTextResponse("OK", status_code=200)
 
     # 2) Önce sipariş var mı kontrol et
     order_ref = orders_col.document(merchant_oid)
