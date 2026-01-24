@@ -281,3 +281,13 @@ class RegisterResponse(BaseModel):
     id_token: str
     refresh_token: str
     expires_in: int
+
+class RefreshTokenRequest(BaseModel):
+    """Refresh token ile yeni access token almak için istek."""
+    refresh_token: str = Field(..., description="Firebase refresh token")
+
+class RefreshTokenResponse(BaseModel):
+    """Refresh token ile yeni token paketi."""
+    id_token: str = Field(..., description="Yeni Firebase ID token")
+    refresh_token: str = Field(..., description="Yeni refresh token (opsiyonel, aynı token dönebilir)")
+    expires_in: int = Field(..., description="Token geçerlilik süresi (saniye)")

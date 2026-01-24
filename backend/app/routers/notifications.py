@@ -19,19 +19,8 @@ from firebase_admin import firestore
 
 router = APIRouter(prefix="/notifications", tags=["Admin: Notifications"], dependencies=[Depends(get_current_admin)])
 
-@router.get("/")
-def get_notifications_data():
-    """
-    Get basic notifications data
-    """
-    return {"message": "Notifications management available", "endpoints": ["templates", "campaigns"]}
-
-@router.get("")
-def get_notifications_data_no_slash():
-    """
-    Get basic notifications data (no trailing slash)
-    """
-    return get_notifications_data()
+# Removed root endpoints to avoid conflict with admin_notifications router
+# Use /templates, /campaigns, /send endpoints instead
 
 class NotificationTemplate(BaseModel):
     id: str

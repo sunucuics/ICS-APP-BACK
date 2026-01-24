@@ -67,7 +67,7 @@ import os
 import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
 from starlette.concurrency import run_in_threadpool
-from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse
+from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse, RefreshTokenRequest, RefreshTokenResponse
 from backend.app.core.security import (get_current_user)
 from backend.app.config import db
 import re
@@ -315,6 +315,71 @@ async def login(
         expires_in    = int(data["expiresIn"]),
         user_id       = data["localId"],
     )
+
+
+# --------------------------------------------------------------------------- #
+# REFRESH TOKEN – refresh token ile yeni ID token al
+# --------------------------------------------------------------------------- #
+@router.post(
+    "/refresh",
+    response_model=RefreshTokenResponse,
+    summary="Refresh token ile yeni access token al",
+)
+async def refresh_token(request: RefreshTokenRequest):
+    """
+    Firebase refresh token kullanarak yeni ID token alır.
+    Refresh token geçersizse 401 döner.
+    """
+    if not settings.firebase_web_api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Server misconfigured: missing FIREBASE_WEB_API_KEY"
+        )
+
+    url = f"https://securetoken.googleapis.com/v1/token?key={settings.firebase_web_api_key}"
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": request.refresh_token,
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+
+        data = resp.json()
+        if resp.status_code != 200:
+            error_message = data.get("error", {}).get("message", "Invalid refresh token")
+            logging.warning(f"Firebase refresh token failed: {error_message}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=error_message
+            )
+
+        # Firebase'den dönen expires_in genelde 3600 (1 saat)
+        # Ancak biz 15 dakika (900 saniye) olarak döndürüyoruz
+        # Gerçek token hala 1 saat geçerli ama client tarafında 15 dakika olarak kabul edilecek
+        return RefreshTokenResponse(
+            id_token=data["id_token"],
+            refresh_token=data.get("refresh_token", request.refresh_token),  # Yeni refresh token varsa onu kullan
+            expires_in=900,  # 15 dakika
+        )
+    except httpx.HTTPError as e:
+        logging.exception("Refresh token HTTP error")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Token refresh service error: {e}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Refresh token unexpected error")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during token refresh: {e}"
+        )
 
 
 # --------------------------------------------------------------------------- #

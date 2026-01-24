@@ -86,8 +86,9 @@ app.include_router(comments_router.admin_router, prefix="/admin")
 app.include_router(users_router.admin_router, prefix="/admin")
 app.include_router(featured.admin_router, prefix="/admin")
 app.include_router(analytics.router, prefix="/admin")
-app.include_router(notifications.router, prefix="/admin")
+# admin_notifications must come before notifications to avoid route conflict
 app.include_router(admin_notifications.router, prefix="/admin")
+app.include_router(notifications.router, prefix="/admin")
 app.include_router(settings_router.router, prefix="/admin")
 
 

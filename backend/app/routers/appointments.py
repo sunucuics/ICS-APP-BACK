@@ -15,7 +15,7 @@ from backend.app.schemas.appointment import (
     AppointmentOut, AppointmentStatus, AppointmentAdminOut,
     ServiceAvailability, ServiceBrief, AppointmentWithDetails
 )
-from firebase_admin import messaging
+from firebase_admin import messaging, firestore
 
 logger = logging.getLogger("ics.appointments")
 
@@ -170,6 +170,7 @@ def request_appointment(
     appt_data["id"] = ref.id
 
     # Admin bildirimi oluştur ve FCM push gönder
+    # Bu işlem başarısız olsa bile randevu oluşturma işlemi devam etmeli
     try:
         service_data = service_doc.to_dict() or {}
         user_doc = db.collection("users").document(user_id).get()
@@ -190,7 +191,7 @@ def request_appointment(
             "body": notification_body,
             "type": "appointment",
             "is_read": False,
-            "created_at": datetime.utcnow(),
+            "created_at": firestore.SERVER_TIMESTAMP,  # Use Firestore server timestamp for consistency
             "data": {
                 "appointment_id": ref.id,
                 "user_id": user_id,
@@ -203,15 +204,23 @@ def request_appointment(
                 "end": end_time.isoformat()
             }
         }
-        db.collection("admin_notifications").document().set(notification_data)
-        logger.info("Admin notification created for appointment %s", ref.id)
         
-        # Admin kullanıcılara FCM push notification gönder
-        _send_admin_push_notification(notification_title, notification_body, ref.id)
+        # Create notification in Firestore (this will trigger SSE stream)
+        notification_ref = db.collection("admin_notifications").document()
+        notification_ref.set(notification_data)
+        logger.info("Admin notification created for appointment %s (notification_id: %s)", ref.id, notification_ref.id)
+        
+        # Admin kullanıcılara FCM push notification gönder (telefon bildirimi)
+        # Bu ayrı bir işlem, SSE'den bağımsız
+        try:
+            _send_admin_push_notification(notification_title, notification_body, ref.id)
+        except Exception as fcm_error:
+            # FCM hatası bildirim oluşturmayı engellemez
+            logger.warning("Failed to send FCM push notification: %s", fcm_error)
         
     except Exception as e:
         # Bildirim oluşturma başarısız olursa log'la ama randevuyu engelleme
-        logger.error("Failed to create admin notification: %s", e)
+        logger.error("Failed to create admin notification for appointment %s: %s", ref.id, e, exc_info=True)
 
     return appt_data
 
