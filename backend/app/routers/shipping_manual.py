@@ -1,6 +1,6 @@
 # backend/app/routers/shipping_manual.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from datetime import datetime, timezone
 from decimal import Decimal
 import asyncio, inspect, os, requests
@@ -13,16 +13,7 @@ from typing import Set, Iterable
 from backend.app.config import db, settings
 from backend.app.core.security import get_current_user, get_current_admin
 
-# --- E-posta gönderimi (mevcut implementasyonu kullan; yoksa fallback) -------
-_SEND_IMPL = None
-try:
-    from backend.app.core.security import send_email as _SEND_IMPL  # type: ignore
-except Exception:
-    try:
-        from backend.app.core.email_utils import send_email as _SEND_IMPL  # type: ignore
-    except Exception:
-        _SEND_IMPL = None
-
+# --- Mailer Import ---
 from backend.app.core.mailer import (
     mailer_send,
     tpl_shipped_html,
@@ -33,109 +24,69 @@ from backend.app.core.mailer import (
 import logging
 log = logging.getLogger("orders")
 
-
-async def _send_mail(*, to: str, subject: str, html: str, sender_name: str = "ICS") -> None:
-    if _SEND_IMPL is not None:
-        if inspect.iscoroutinefunction(_SEND_IMPL):
-            await _SEND_IMPL(to=to, subject=subject, html=html, sender_name=sender_name)
-            return
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: _SEND_IMPL(to=to, subject=subject, html=html, sender_name=sender_name))
-        return
-    # Fallback SMTP (konfigürasyon yoksa sessiz geç)
-    import ssl, smtplib
-    from email.message import EmailMessage
-    from_addr = getattr(settings, "smtp_from", None) or getattr(settings, "smtp_user", None)
-    host = getattr(settings, "smtp_host", None); port = getattr(settings, "smtp_port", None)
-    user = getattr(settings, "smtp_user", None); password = getattr(settings, "smtp_password", None)
-    use_starttls = bool(getattr(settings, "smtp_use_starttls", True))
-    if not (host and port and user and password and from_addr):
-        return
-    msg = EmailMessage()
-    msg["To"] = to; msg["From"] = f"{sender_name} <{from_addr}>"; msg["Subject"] = subject
-    msg.set_content("HTML içeriği göremiyorsanız e-postayı HTML olarak görüntüleyin.")
-    msg.add_alternative(html, subtype="html")
-    def _send_blocking():
-        context = ssl.create_default_context()
-        if use_starttls:
-            with smtplib.SMTP(host, port) as s:
-                s.ehlo(); s.starttls(context=context); s.ehlo(); s.login(user, password); s.send_message(msg)
-        else:
-            with smtplib.SMTP_SSL(host, port, context=context) as s:
-                s.login(user, password); s.send_message(msg)
-    loop = asyncio.get_event_loop(); await loop.run_in_executor(None, _send_blocking)
-
 # --- Routerlar ----------------------------------------------------------------
 router = APIRouter(prefix="/orders", tags=["Orders"])
 admin_router = APIRouter(prefix="/orders", tags=["Orders Admin"])
 
-# --- Prefix & koleksiyon adları ----------------------------------------------
+# --- Prefix & Koleksiyon Adları ----------------------------------------------
 _PREFIX = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
 def _prefixed(name: str) -> str:
     return f"{_PREFIX}{name}" if _PREFIX else name
-_CARTS = _prefixed("carts")
 
+# Merkezi Koleksiyon İsimleri
+_CARTS = _prefixed("carts")
+_ORDERS = _prefixed("orders")
+_PAYMENT_SESSIONS = _prefixed("payment_sessions") 
+
+# --- Yardımcı Fonksiyonlar ---------------------------------------------------
 
 def _fetch_products_by_ids_from_db(product_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     ids = [pid for pid in set(product_ids) if pid]
     if not ids:
         return {}
     idx: Dict[str, Dict[str, Any]] = {}
+    
+    # 1. Toplu sorgu denemesi
     try:
         for i in range(0, len(ids), 10):
             batch = ids[i:i+10]
             q = (db.collection_group("items")
-                 .where("id", "in", batch))  # document_id yerine düz 'id' alanı
+                 .where("id", "in", batch))
             for snap in q.stream():
                 d = snap.to_dict() or {}
                 d["id"] = snap.id
-                if d.get("is_deleted"):  # kod seviyesinde filtre
+                if d.get("is_deleted"):
                     continue
                 idx[snap.id] = d
-
-
+                
     except Exception as e:
-
+        # BUG FIX: Batch hatası olursa, 'batch' değişkeni tanımsız olabilir.
+        # Bu yüzden hata durumunda orijinal 'ids' listesi üzerinden dönüyoruz.
         log.warning("DB fallback query failed (index?) — trying per-id equality: %s", e)
-
-        # Tek tek eşitlik sorgusu (ek index gerekmez)
-
-        for pid in batch:
-
+        
+        for pid in ids:
             try:
-
                 q1 = db.collection_group("items").where(FieldPath.document_id(), "==", pid).limit(1).stream()
-
                 snap = next(q1, None)
-
                 if snap:
-
                     d = snap.to_dict() or {}
-
                     d["id"] = snap.id
-
                     if not d.get("is_deleted"):
                         idx[snap.id] = d
-
             except Exception as e2:
-
                 log.warning("Per-id fetch failed for %s: %s", pid, e2)
-
+                
     return idx
 
 
 def _product_index(product_ids: Set[str], request: Request) -> Dict[str, Dict[str, Any]]:
-    # 1) HTTP API
     api_products = _fetch_products_via_api(request)
     idx = _index_products_by_id(api_products)
-
-    # 2) Eksikler varsa DB fallback
     missing = [pid for pid in product_ids if pid not in idx]
     if missing:
         idx.update(_fetch_products_by_ids_from_db(missing))
     return idx
 
-# --- Yardımcılar --------------------------------------------------------------
 def _now():
     return datetime.now(timezone.utc)
 
@@ -194,28 +145,21 @@ def _get_product_from_db(product_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _fetch_products_current(request: Request, ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Önce /products/ ile tüm kataloğu tek istekle alır ve indexler.
-    Sonra sadece eksik ID'ler için Firestore fallback yapar.
-    """
     out: Dict[str, Dict[str, Any]] = {}
     wanted = [pid for pid in set(ids) if pid]
     if not wanted:
         return out
 
-    # 1) API'den tamamını çek & indexle
     api_products = _fetch_products_via_api(request)
     idx = _index_products_by_id(api_products)
     for pid in wanted:
         if pid in idx:
             out[pid] = idx[pid]
 
-    # 2) Eksikler için DB fallback
     missing = [pid for pid in wanted if pid not in out]
     if missing:
         out.update(_fetch_products_by_ids_from_db(missing))
     return out
-
 
 
 def _ensure_transition(current: str, target: str):
@@ -237,45 +181,14 @@ def _customer_email_from_order(order_doc: Dict[str, Any]) -> Optional[str]:
     user_id = order_doc.get("user_id")
     if not user_id:
         return None
+    # NOT: 'users' koleksiyonu genelde prefixlenmez, auth sistemi bozulmasın diye.
     usnap = db.collection("users").document(user_id).get()
     if usnap.exists:
         e = (usnap.to_dict() or {}).get("email") or ""
         return e.strip() or None
     return None
 
-def _render_mail_shipped(full_name: str, order_id: str, tracking_number: str) -> str:
-    base = getattr(settings, "frontend_base_url", "") or ""
-    link = f"{base}/orders/{order_id}" if base else "#"
-    return (
-        f"<h2>Kargonuz yola çıktı</h2>"
-        f"<p>Merhaba {full_name or ''}, siparişiniz kargoya verilmiştir.</p>"
-        f"<p>Takip numaranız: <b>{tracking_number}</b></p>"
-        f"<p>Detaylar: <a href='{link}'>{link}</a></p>"
-    )
-
-def _render_mail_delivered(full_name: str, order_id: str) -> str:
-    base = getattr(settings, "frontend_base_url", "") or ""
-    link = f"{base}/orders/{order_id}" if base else "#"
-    return (
-        f"<h2>Teslim edildi</h2>"
-        f"<p>Merhaba {full_name or ''}, siparişiniz başarıyla teslim edilmiştir.</p>"
-        f"<p>Detaylar: <a href='{link}'>{link}</a></p>"
-    )
-
-def _render_mail_canceled(full_name: str, order_id: str) -> str:
-    base = getattr(settings, "frontend_base_url", "") or ""
-    link = f"{base}/orders/{order_id}" if base else "#"
-    return (
-        f"<h2>Siparişiniz iptal edildi</h2>"
-        f"<p>Merhaba {full_name or ''}, siparişiniz iptal edilmiştir.</p>"
-        f"<p>Detaylar: <a href='{link}'>{link}</a></p>"
-    )
-
-# --- /products API'sini kullanarak katalog çekme (carts.py ile aynı yaklaşım) -
 def _fetch_products_via_api(request: Request) -> List[Dict[str, Any]]:
-    """
-    /products/ endpoint'ini çağırır; aynı ID ve alanları kullanırız.
-    """
     base = str(request.base_url).rstrip("/")
     url = f"{base}/products/"
     headers: Dict[str, str] = {}
@@ -309,24 +222,15 @@ def _money_from_product(p: Optional[Dict[str, Any]]) -> Decimal:
         return Decimal(str(p.get("final_price", 0)))
     return Decimal(str(p.get("price", 0)))
 
-# --- Sepeti oku ve /products ile zenginleştir --------------------------------
 def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
-    """
-    carts/{uid} dokümanındaki {product_id, qty} satırlarını alır,
-    /products ile eşleştirip {name, price, final_price, image_url} doldurur.
-    Subcollection (carts/{uid}/items) desteği de vardır.
-    /products API boş kalırsa Firestore collection_group('items') fallback kullanır.
-    """
     items_raw: List[Dict[str, Any]] = []
     cref = db.collection(_CARTS).document(user_id)
 
-    # 1) doc.items[]
     csnap = cref.get()
     if csnap.exists:
         cdoc = csnap.to_dict() or {}
         items_raw = list(cdoc.get("items") or [])
 
-    # 2) alt koleksiyon
     if not items_raw:
         try:
             for dsnap in cref.collection("items").stream():
@@ -335,12 +239,9 @@ def _load_cart_items(user_id: str, request: Request) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    # Sepet gerçekten boşsa direkt dönelim
     if not items_raw:
         return []
 
-    # 3) Ürün indeksini kur (API + DB fallback)
-    # ... items_raw vs toplandıktan sonra:
     wanted_ids: set[str] = set()
     for it in items_raw:
         pid = str((it or {}).get("product_id") or (it or {}).get("id") or "").strip()
@@ -398,52 +299,8 @@ def _calc_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"subtotal": float(grand), "grand_total": float(grand), "currency": cur}
 
 
-def _enrich_items_for_email(order_doc: Dict[str, Any], request: Request) -> (List[Dict[str, Any]], Dict[str, Any]):
-    items = list(order_doc.get("items") or [])
-    wanted_ids = {str((it or {}).get("product_id") or (it or {}).get("id") or "").strip() for it in items}
-    idx = _fetch_products_current(request, {pid for pid in wanted_ids if pid})
-
-    out = []
-    for it in items:
-        pid = str(it.get("product_id") or it.get("id") or "").strip()
-        qty = int(it.get("qty") or it.get("quantity") or 0)
-        p = idx.get(pid)
-
-        name = (
-                (p or {}).get("title") or (p or {}).get("name") or (p or {}).get("label")
-                or it.get("name") or it.get("title")
-                or (p or {}).get("sku") or pid
-        )
-
-        unit = _unit_price_from_product(p)
-        if unit <= 0:
-            # Sepet satırındaki muhtemel alan adları
-            for k in ("final_price", "price"):
-                unit = _parse_money((it or {}).get(k))
-                if unit > 0:
-                    break
-        if unit <= 0:
-            # line_total veya total varsa birim fiyatı türet
-            line_total = _parse_money((it or {}).get("line_total") or (it or {}).get("total"))
-            if qty > 0 and line_total > 0:
-                unit = line_total / float(qty)
-
-        img = it.get("image_url")
-        if not img and p and isinstance(p.get("images"), list) and p["images"]:
-            img = p["images"][0]
-
-        out.append({"product_id": pid, "name": name, "qty": qty, "price": unit, "final_price": unit, "image_url": img})
-
-    tdoc = order_doc.get("totals") or {}
-    try:
-        grand_in_doc = float(tdoc.get("grand_total", -1))
-    except Exception:
-        grand_in_doc = -1
-    totals = _calc_totals(out) if (grand_in_doc <= 0) else tdoc
-    return out, totals
-
-
 def _build_customer(user_id: str) -> Dict[str, Any]:
+    # NOT: 'users' koleksiyonu prefixlenmedi.
     usnap = db.collection("users").document(user_id).get()
     u = usnap.to_dict() or {} if usnap.exists else {}
     addrs = (u.get("addresses") or [])
@@ -469,10 +326,7 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
     now = _now()
     customer = _build_customer(user_id)
 
-    pfx = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
-    cname = f"{pfx}orders" if pfx else "orders"
-    ref = db.collection(cname).document()
-    
+    ref = db.collection(_ORDERS).document()
     payload: Dict[str, Any] = {
         "user_id": user_id,
         "created_at": now,
@@ -492,27 +346,11 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
     }
     ref.set(payload)
 
-    # Sepeti temizle
-    try:
-        carts_cname = f"{pfx}carts" if pfx else "carts"
-        cref = db.collection(carts_cname).document(user_id)
-        cref.set({"items": []}, merge=True)
-        # Varsa subcollection items'ı da (eğer yapı öyleyse) temizle
-        col_items = cref.collection("items")
-        blobs = list(col_items.list_documents())
-        for b in blobs:
-            b.delete()
-    except Exception as e:
-        print(f"CART_CLEAR_ERROR: {e}")
-
     return {"id": ref.id, "message": "Siparişiniz alındı, kargonuz hazırlanıyor.", **payload}
 
 # -----------------------------------------------------------------------------
 # PUBLIC — Kullanıcının siparişlerini listele
 # -----------------------------------------------------------------------------
-# Mevcut importlara 'Literal' eklememiz gerekecek (Type hint ve Swagger'da dropdown çıkması için)
-from typing import Literal
-
 @router.get("", summary="Kullanıcının siparişlerini listele (Aktif/Geçmiş)")
 async def list_my_orders(
     me: Dict = Depends(get_current_user),
@@ -520,27 +358,17 @@ async def list_my_orders(
     limit: int = Query(20, ge=1, le=100),
     start_after: Optional[str] = Query(None, description="ISO datetime (created_at) ile sayfalama"),
 ):
-    """
-    Siparişleri iki sekme mantığıyla listeler:
-    - **active**: Statüsü 'preparing' veya 'shipped' olanlar (Ödeme bekleyenler dahil buraya düşer).
-    - **past**: Statüsü 'delivered', 'canceled' veya 'payment_failed' olanlar.
-    """
     user_id = me["id"]
-    q = db.collection("orders").where("user_id", "==", user_id).where("is_deleted", "==", False)
+    # _ORDERS (prefixed) kullanımı
+    q = db.collection(_ORDERS).where("user_id", "==", user_id).where("is_deleted", "==", False)
 
-    # --- View Type Mantığı ---
     if view_type == "active":
-        # Aktif siparişler: Hazırlanıyor veya Yolda
-        # (Ödeme bekleyenler de status=preparing olduğu için buraya gelir)
         q = q.where("status", "in", ["preparing", "shipped"])
     else:
-        # Geçmiş siparişler: Teslim edildi, İptal edildi veya Ödeme Hatası
         q = q.where("status", "in", ["delivered", "canceled", "payment_failed"])
 
-    # Tarihe göre tersten sırala (En yeni en üstte)
     q = q.order_by("created_at", direction=firestore.Query.DESCENDING)
 
-    # --- Sayfalama (Pagination) ---
     cursor_dt = None
     if start_after:
         try:
@@ -550,15 +378,12 @@ async def list_my_orders(
     if cursor_dt:
         q = q.start_after(cursor_dt)
 
-    # --- Sorguyu Çalıştır ---
     docs = list(q.limit(limit).stream())
     items = []
     
     for d in docs:
         data = d.to_dict() or {}
         data["id"] = d.id
-        # Artık burada python tarafında payment filtresi yapmamıza gerek yok,
-        # çünkü 'active' seçildiyse zaten preparing olan (ödeme bekleyen dahil) hepsi gelsin istenir.
         items.append(data)
 
     next_cursor = None
@@ -570,33 +395,64 @@ async def list_my_orders(
     return {"items": items, "next_cursor": next_cursor, "count": len(items)}
 
 
-
 # -----------------------------------------------------------------------------
-# PUBLIC — Sipariş detayı
+# PUBLIC — Sipariş detayı (FALLBACK EKLENDİ)
 # -----------------------------------------------------------------------------
 @router.get("/{order_id}", summary="Sipariş detay ve kargo durumu (kullanıcı)")
 async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
     user_id = me["id"]
-    ref = db.collection("orders").document(order_id)
+    
+    # 1. Önce asıl ORDERS koleksiyonuna bak
+    ref = db.collection(_ORDERS).document(order_id)
     snap = ref.get()
-    if not snap.exists:
-        raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
-    doc = snap.to_dict() or {}
-    if doc.get("user_id") != user_id:
-        raise HTTPException(status_code=403, detail="Bu sipariş size ait değil")
-    if doc.get("is_deleted"):
-        raise HTTPException(status_code=404, detail="Sipariş silinmiş")
-    doc["id"] = order_id
-    return doc
+    
+    if snap.exists:
+        doc = snap.to_dict() or {}
+        if doc.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="Bu sipariş size ait değil")
+        if doc.get("is_deleted"):
+            raise HTTPException(status_code=404, detail="Sipariş silinmiş")
+        doc["id"] = order_id
+        return doc
+
+    # 2. FALLBACK: PAYMENT SESSION KONTROLÜ
+    session_ref = db.collection(_PAYMENT_SESSIONS).document(order_id)
+    session_snap = session_ref.get()
+
+    if session_snap.exists:
+        session = session_snap.to_dict() or {}
+        if session.get("user_id") == user_id:
+            # FIX: Frontend uyumluluğu için hem 'grand_total' hem 'grandTotal' gönderiyoruz.
+            payable = session.get("payable_amount", 0)
+            
+            return {
+                "id": order_id,
+                "user_id": user_id,
+                "status": "preparing", 
+                "payment": {
+                    "status": "processing",
+                    "provider": "PAYTR"
+                },
+                "items": session.get("basket", []),
+                "totals": {
+                    "grand_total": payable,  # Yeni standard
+                    "grandTotal": payable,   # PayTR/Frontend legacy uyumu
+                    "currency": "TRY",
+                    "subtotal": session.get("base_amount", 0)
+                },
+                "created_at": session.get("created_at", _now()),
+                "is_temp_loading": True 
+            }
+
+    raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
 
 # -----------------------------------------------------------------------------
 # PUBLIC — Ödeme bekleyen siparişi iptal et
 # -----------------------------------------------------------------------------
 @router.post("/{order_id}/cancel-awaiting", summary="Ödeme bekleyen siparişi iptal et")
 async def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_user)):
-    """Sadece payment.status='awaiting' olan siparişler iptal edilebilir."""
     user_id = me["id"]
-    ref = db.collection("orders").document(order_id)
+    ref = db.collection(_ORDERS).document(order_id)
     snap = ref.get()
     
     if not snap.exists:
@@ -632,7 +488,7 @@ async def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_us
 # -----------------------------------------------------------------------------
 @admin_router.get("/queue", summary="Kargoya verilecekler, kargoya verilenler ve teslim edilenler")
 async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)):
-    base = db.collection("orders").where("is_deleted", "==", False)
+    base = db.collection(_ORDERS).where("is_deleted", "==", False)
 
     preparing_q = (
         base.where("status", "==", "preparing")
@@ -657,7 +513,6 @@ async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)
     # Tüm siparişleri birleştir ve items'ları zenginleştir
     all_orders = preparing_raw + shipped_raw + delivered_raw
     
-    # Tüm product_id'leri topla
     all_product_ids = set()
     for order in all_orders:
         items = order.get("items") or []
@@ -666,10 +521,8 @@ async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)
             if pid:
                 all_product_ids.add(pid)
     
-    # Ürün bilgilerini çek
     product_index = _fetch_products_current(request, all_product_ids) if all_product_ids else {}
     
-    # Items'ları zenginleştir
     def _enrich_order(order_doc: Dict[str, Any]) -> Dict[str, Any]:
         items = list(order_doc.get("items") or [])
         enriched_items = []
@@ -677,14 +530,12 @@ async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)
             pid = str(it.get("product_id") or it.get("id") or "").strip()
             p = product_index.get(pid)
             
-            # Ürün adını belirle: önce product'tan, sonra item'dan, son olarak product_id
             name = (
                 (p or {}).get("title") or (p or {}).get("name") or (p or {}).get("label")
                 or it.get("name") or it.get("title")
                 or (p or {}).get("sku") or pid
             )
             
-            # Fiyat bilgisi
             unit_price = _unit_price_from_product(p)
             if unit_price <= 0:
                 for k in ("final_price", "price"):
@@ -692,7 +543,6 @@ async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)
                     if unit_price > 0:
                         break
             
-            # Resim bilgisi
             img = it.get("image_url")
             if not img and p and isinstance(p.get("images"), list) and p["images"]:
                 img = p["images"][0]
@@ -708,7 +558,6 @@ async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)
         
         return {**order_doc, "items": enriched_items}
     
-    # Tüm siparişleri zenginleştir
     preparing = [_enrich_order(o) for o in preparing_raw]
     shipped = [_enrich_order(o) for o in shipped_raw]
     delivered = [_enrich_order(o) for o in delivered_raw]
@@ -735,7 +584,7 @@ class AdminCancelRequest(BaseModel):
 @admin_router.patch("/{order_id}/ship", summary="Siparişi 'shipped' yap ve e-posta gönder")
 async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection("orders").document(order_id)
+    ref = db.collection(_ORDERS).document(order_id)
 
     @firestore.transactional
     def _txn(tx):
@@ -766,7 +615,6 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, 
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
@@ -796,7 +644,7 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, 
 @admin_router.patch("/{order_id}/deliver", summary="Siparişi 'delivered' yap ve e-posta gönder")
 async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection("orders").document(order_id)
+    ref = db.collection(_ORDERS).document(order_id)
 
     @firestore.transactional
     def _txn(tx):
@@ -820,7 +668,6 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
@@ -845,7 +692,7 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
 @admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap ve e-posta gönder")
 async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection("orders").document(order_id)
+    ref = db.collection(_ORDERS).document(order_id)
 
     @firestore.transactional
     def _txn(tx):
@@ -868,7 +715,6 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
     tx = db.transaction()
     merged = _txn(tx)
 
-    # Mail (yalın içerik)
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
     to_email = _customer_email_from_order(merged)
@@ -892,7 +738,7 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
 
 @admin_router.delete("/{order_id}", summary="Siparişi soft delete yap (is_deleted=true)")
 async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
-    ref = db.collection("orders").document(order_id)
+    ref = db.collection(_ORDERS).document(order_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
@@ -905,8 +751,7 @@ async def dev_create_order(_: Dict = Depends(get_current_admin)):
     Test siparişi oluşturur. Fiyatlar TL cinsinden saklanır.
     """
     now = _now()
-    ref = db.collection("orders").document()
-    # Fiyatlar TL cinsinden
+    ref = db.collection(_ORDERS).document()
     payload = {
         "user_id": "demo-user",
         "created_at": now,
@@ -935,10 +780,6 @@ async def dev_create_order(_: Dict = Depends(get_current_admin)):
 
 @admin_router.post("/_email-test", summary="SMTP health check (admin)")
 async def email_test(_: Dict = Depends(get_current_admin)):
-    """
-    SMTP yapılandırmasını ve port erişimini test etmek için baseline mail gönderir.
-    Konu: 'ICS SMTP Test' Gövde: basit HTML.
-    """
     to = getattr(settings, "smtp_test_to", None) or getattr(settings, "smtp_from", None) or getattr(settings, "smtp_user", None)
     if not to:
         raise HTTPException(status_code=400, detail="smtp_test_to/smtp_from/smtp_user tanımlı değil")
@@ -948,7 +789,6 @@ async def email_test(_: Dict = Depends(get_current_admin)):
         await mailer_send(to=to, subject="ICS SMTP Test", html=html, sender_name="ICS")
         return {"ok": True, "to": to}
     except Exception as e:
-        # İstisnayı döndür ki sebebi ekranda görülsün
         raise HTTPException(status_code=502, detail=f"SMTP error: {e.__class__.__name__}: {e}")
 
 
@@ -957,17 +797,11 @@ async def cleanup_awaiting_orders(
     minutes_old: int = Query(30, ge=5, le=1440, description="Kaç dakikadan eski siparişler iptal edilsin"),
     _: Dict = Depends(get_current_admin)
 ):
-    """
-    payment.status='awaiting' olan ve belirtilen dakikadan eski siparişleri otomatik iptal eder.
-    Varsayılan: 30 dakikadan eski siparişler.
-    """
     from datetime import timedelta
     
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes_old)
     
-    # Awaiting durumundaki tüm siparişleri çek
-    # Firestore nested field query desteği sınırlı olduğu için tümünü çekip filtrele
-    all_orders = db.collection("orders").where("is_deleted", "==", False).stream()
+    all_orders = db.collection(_ORDERS).where("is_deleted", "==", False).stream()
     
     canceled_count = 0
     canceled_ids = []
@@ -978,15 +812,12 @@ async def cleanup_awaiting_orders(
         payment_status = (data.get("payment") or {}).get("status", "").lower()
         created_at = data.get("created_at")
         
-        # Sadece awaiting olanları kontrol et
         if payment_status != "awaiting":
             continue
             
-        # Tarih kontrolü
         if created_at is None:
             continue
             
-        # Firestore timestamp'i datetime'a çevir
         if hasattr(created_at, 'timestamp'):
             created_dt = datetime.fromtimestamp(created_at.timestamp(), tz=timezone.utc)
         elif isinstance(created_at, datetime):
@@ -994,9 +825,7 @@ async def cleanup_awaiting_orders(
         else:
             continue
             
-        # Cutoff'tan eski mi?
         if created_dt < cutoff:
-            # İptal et
             doc.reference.update({
                 "status": "canceled",
                 "payment.status": "expired",
