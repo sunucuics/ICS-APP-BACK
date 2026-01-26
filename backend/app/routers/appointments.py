@@ -24,17 +24,26 @@ router = APIRouter(prefix="/appointments", tags=["Appointments"])
 # --- Güvenli tarih dönüştürücü ------------------------------------------------
 def _coerce_dt(v: Any) -> Optional[datetime]:
     """
-    Firestore Timestamp | str (ISO/ISOZ) | datetime(aware/naive) | None -> naive datetime (server local time)
+    Firestore Timestamp | str (ISO/ISOZ) | datetime(aware/naive) | None -> naive UTC datetime
+    Saklama için kullanılır - UTC olarak saklar.
     """
     if v is None:
         return None
     if isinstance(v, datetime):
-        # aware ise tz'yi at, lokale çevirip naive yap
-        return v.astimezone().replace(tzinfo=None) if v.tzinfo else v
+        # aware ise UTC'ye çevirip tzinfo'yu at
+        if v.tzinfo:
+            from datetime import timezone
+            utc_dt = v.astimezone(timezone.utc)
+            return utc_dt.replace(tzinfo=None)
+        return v  # already naive, assume UTC
     # Firestore Timestamp nesneleri to_datetime() destekler
     if hasattr(v, "to_datetime"):
-        dt = v.to_datetime()
-        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+        dt = v.to_datetime()  # Firestore genellikle UTC-aware döner
+        if dt.tzinfo:
+            from datetime import timezone
+            utc_dt = dt.astimezone(timezone.utc)
+            return utc_dt.replace(tzinfo=None)
+        return dt
     if isinstance(v, str):
         s = v.strip()
         try:
@@ -42,22 +51,41 @@ def _coerce_dt(v: Any) -> Optional[datetime]:
             if s.endswith("Z"):
                 s = s.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
-            return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+            if dt.tzinfo:
+                from datetime import timezone
+                utc_dt = dt.astimezone(timezone.utc)
+                return utc_dt.replace(tzinfo=None)
+            return dt  # already naive, assume UTC
         except Exception as exc:
             logger.debug("ISO parse failed for %r: %s", v, exc)
             return None
     return None
 
 
+def _to_local_dt(v: Any) -> Optional[datetime]:
+    """
+    Firestore'dan okunan UTC datetime'ı local (Türkiye) saatine çevirir.
+    API response'ları için kullanılır.
+    """
+    utc_dt = _coerce_dt(v)
+    if utc_dt is None:
+        return None
+    # UTC naive datetime'ı aware yap, sonra local'e çevir
+    from datetime import timezone
+    aware_utc = utc_dt.replace(tzinfo=timezone.utc)
+    local_dt = aware_utc.astimezone()  # Server'ın local timezone'una çevir
+    return local_dt.replace(tzinfo=None)  # Naive local datetime döndür
+
+
 # --- Admin Push Notification Helper -------------------------------------------
 def _send_admin_push_notification(title: str, body: str, appointment_id: str):
     """
-    Admin kullanıcılara (admin=True) FCM push notification gönderir.
+    Admin kullanıcılara (role="admin") FCM push notification gönderir.
     Uygulama kapalı olsa bile bildirim alınır.
     """
     try:
-        # Admin kullanıcıların FCM token'larını al
-        admin_users = db.collection("users").where("admin", "==", True).stream()
+        # Admin kullanıcıların FCM token'larını al (role alanı kullanılıyor)
+        admin_users = db.collection("users").where("role", "==", "admin").stream()
         
         fcm_tokens = []
         for user_doc in admin_users:
@@ -91,7 +119,7 @@ def _send_admin_push_notification(title: str, body: str, appointment_id: str):
                 notification=messaging.AndroidNotification(
                     sound='default',
                     priority='high',
-                    channel_id='admin_notifications',
+                    channel_id='high_importance_channel',  # Flutter'daki channel ile eşleşmeli
                 ),
             ),
             apns=messaging.APNSConfig(
@@ -280,19 +308,24 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
         uid = d.get("user_id")
         sid = d.get("service_id")
 
-        results.append({
-            "id":     doc.id,
-            "start":  _coerce_dt(d.get("start")),
-            "end":    _coerce_dt(d.get("end")),
-            "status": d.get("status", "pending"),
-            "notes":  d.get("notes"),
-            "user": {
+        # user_id null ise (bloklanmış saat) user objesi None olmalı
+        user_data = None
+        if uid:
+            user_data = {
                 "id":    uid,
                 "name":  (user_map.get(uid) or {}).get("name"),
                 "phone": (user_map.get(uid) or {}).get("phone"),
                 "email": (user_map.get(uid) or {}).get("email"),
                 "addresses": (user_map.get(uid) or {}).get("addresses"),
-            },
+            }
+
+        results.append({
+            "id":     doc.id,
+            "start":  _to_local_dt(d.get("start")),
+            "end":    _to_local_dt(d.get("end")),
+            "status": d.get("status", "pending"),
+            "notes":  d.get("notes"),
+            "user": user_data,
             "service": {
                 "id":    sid,
                 "title": (svc_map.get(sid) or {}).get("title"),
@@ -334,18 +367,23 @@ def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(
         uid = d.get("user_id")
         sid = d.get("service_id")
 
-        results.append({
-            "id":     doc.id,
-            "start":  _coerce_dt(d.get("start")),
-            "end":    _coerce_dt(d.get("end")),
-            "status": d.get("status", "pending"),
-            "user": {
+        # user_id null ise (bloklanmış saat) user objesi None olmalı
+        user_data = None
+        if uid:
+            user_data = {
                 "id":    uid,
                 "name":  (user_map.get(uid) or {}).get("name"),
                 "phone": (user_map.get(uid) or {}).get("phone"),
                 "email": (user_map.get(uid) or {}).get("email"),
                 "addresses": (user_map.get(uid) or {}).get("addresses"),
-            },
+            }
+
+        results.append({
+            "id":     doc.id,
+            "start":  _to_local_dt(d.get("start")),
+            "end":    _to_local_dt(d.get("end")),
+            "status": d.get("status", "pending"),
+            "user": user_data,
             "service": {
                 "id":    sid,
                 "title": (svc_map.get(sid) or {}).get("title"),
@@ -517,17 +555,21 @@ def get_all_busy_slots(
     busy = []
     for doc in docs:
         d = doc.to_dict() or {}
-        s = _coerce_dt(d.get("start"))
-        e = _coerce_dt(d.get("end")) or (s + timedelta(hours=1) if s else None)
-        if not s or not e:
+        # Filtreleme için UTC kullan
+        s_utc = _coerce_dt(d.get("start"))
+        e_utc = _coerce_dt(d.get("end")) or (s_utc + timedelta(hours=1) if s_utc else None)
+        if not s_utc or not e_utc:
             continue
-        if not (date_from <= s <= date_to):
+        if not (date_from <= s_utc <= date_to):
             continue
+        # Görüntüleme için local time kullan
+        s_local = _to_local_dt(d.get("start"))
+        e_local = _to_local_dt(d.get("end")) or (s_local + timedelta(hours=1) if s_local else None)
         busy.append({
             "service_id": d.get("service_id"),
-            "date": s.date().isoformat(),
-            "start": s.strftime("%H:%M"),
-            "end": e.strftime("%H:%M"),
+            "date": s_local.date().isoformat(),
+            "start": s_local.strftime("%H:%M"),
+            "end": e_local.strftime("%H:%M"),
             "status": d.get("status", "pending"),
             "appointment_id": doc.id,
         })
@@ -549,8 +591,8 @@ def get_my_appointments(current_user: dict = Depends(get_current_user)):
 
     for doc in docs:
         d = doc.to_dict() or {}
-        s = _coerce_dt(d.get("start"))
-        e = _coerce_dt(d.get("end"))
+        s = _to_local_dt(d.get("start"))
+        e = _to_local_dt(d.get("end"))
         svc_id = d.get("service_id")
         if svc_id:
             service_ids.add(svc_id)
