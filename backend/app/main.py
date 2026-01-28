@@ -22,6 +22,7 @@ from backend.app.payments.paytr_direct import router as paytr_direct_router
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import logging
 
 # Tek bir scheduler instance'ı oluştur
 scheduler = AsyncIOScheduler()
@@ -101,8 +102,14 @@ async def _startup_scheduler():
 
 @app.on_event("shutdown")
 async def _shutdown_scheduler():
+    # Scheduler'ı kapat
     if scheduler.running:
         scheduler.shutdown(wait=False)
+    
+    # HTTP client'ı kapat
+    from backend.app.core.http_client import close_http_client
+    await close_http_client()
+    logging.info("Application shutdown complete")
 
 
 @app.get("/healthz", include_in_schema=False)

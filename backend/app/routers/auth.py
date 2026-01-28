@@ -69,6 +69,7 @@ from firebase_admin import auth as firebase_auth , _auth_utils
 from starlette.concurrency import run_in_threadpool
 from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse, RefreshTokenRequest, RefreshTokenResponse
 from backend.app.core.security import (get_current_user)
+from backend.app.core.http_client import get_http_client, retry_with_backoff
 from backend.app.config import db
 import re
 from pydantic import EmailStr
@@ -183,8 +184,10 @@ async def register(
     id_tok, refresh_tok, exp = "", "", 3600
     if not authorization and settings.firebase_web_api_key:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
+            @retry_with_backoff(max_retries=2, backoff_factor=0.5)
+            async def _firebase_signin():
+                client = get_http_client()
+                return await client.post(
                     f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={settings.firebase_web_api_key}",
                     json={
                         "email": email,
@@ -192,6 +195,8 @@ async def register(
                         "returnSecureToken": True,
                     },
                 )
+            
+            r = await _firebase_signin()
             if r.status_code == 200:
                 data = r.json()
                 id_tok = data["idToken"]
@@ -199,6 +204,10 @@ async def register(
                 exp = int(data["expiresIn"])
             else:
                 logging.warning("Login proxy failed: %s %s", r.status_code, r.text)
+        except httpx.TimeoutException as e:
+            logging.warning(f"Login proxy timeout: {e}")
+        except httpx.ConnectError as e:
+            logging.warning(f"Login proxy connection error: {e}")
         except Exception as e:
             logging.warning(f"Login proxy error: {e}")
 
@@ -249,8 +258,13 @@ async def request_password_reset(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json=payload, headers=headers)
+        @retry_with_backoff(max_retries=2, backoff_factor=0.5)
+        async def _send_reset_email():
+            client = get_http_client()
+            return await client.post(url, json=payload, headers=headers)
+        
+        r = await _send_reset_email()
+        
         # Güvenli/generic response (EMAIL_NOT_FOUND vs. sızdırma yapma)
         if r.status_code == 200:
             return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama e-postası gönderildi."}
@@ -258,6 +272,12 @@ async def request_password_reset(
             # Sık görülen hata: EMAIL_NOT_FOUND (400). Yine generic dönüyoruz.
             logging.warning("sendOobCode response: %s %s", r.status_code, r.text)
             return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama e-postası gönderildi."}
+    except httpx.TimeoutException as e:
+        logging.error(f"Password reset timeout: {e}")
+        return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama e-postası gönderildi."}
+    except httpx.ConnectError as e:
+        logging.error(f"Password reset connection error: {e}")
+        return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama e-postası gönderildi."}
     except httpx.HTTPError as e:
         logging.exception("sendOobCode failed")
         raise HTTPException(status_code=502, detail=f"Password reset service error: {e}")
@@ -275,24 +295,46 @@ async def login(
     fcm_token: str = Form(None, description="FCM Token (opsiyonel)"),
 ):
     """Form verisiyle Firebase'e proxy olur, id_token + refresh_token döndürür."""
-    # Debug: API key'i logla
-    logging.error(f"🔥 DEBUG: FIREBASE_WEB_API_KEY = {settings.firebase_web_api_key}")
-    logging.error(f"🔥 DEBUG: FIREBASE_SIGNIN_ENDPOINT = {FIREBASE_SIGNIN_ENDPOINT}")
-    
     payload = {
         "email": email,
         "password": password,
         "returnSecureToken": True,
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(FIREBASE_SIGNIN_ENDPOINT, json=payload, timeout=10)
-
-    data = resp.json()
-    if resp.status_code != 200:
-        message = data.get("error", {}).get("message", "Invalid credentials")
-        logging.error(f"Firebase login failed: {message}, API Key: {settings.firebase_web_api_key[:10]}...")
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=message)
+    try:
+        @retry_with_backoff(max_retries=3, backoff_factor=1.0)
+        async def _firebase_login():
+            client = get_http_client()
+            return await client.post(FIREBASE_SIGNIN_ENDPOINT, json=payload)
+        
+        resp = await _firebase_login()
+        data = resp.json()
+        
+        if resp.status_code != 200:
+            message = data.get("error", {}).get("message", "Invalid credentials")
+            logging.error(f"Firebase login failed: {message}")
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=message)
+            
+    except httpx.TimeoutException as e:
+        logging.error(f"Firebase login timeout: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Authentication service timeout. Please try again."
+        )
+    except httpx.ConnectError as e:
+        logging.error(f"Firebase login connection error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Cannot connect to authentication service. Please try again."
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Unexpected login error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during login"
+        )
 
     # FCM token varsa kullanıcı profilini güncelle
     if fcm_token:
@@ -346,10 +388,16 @@ async def refresh_token(request: RefreshTokenRequest):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-
+        # Firebase token refresh with retry mechanism
+        @retry_with_backoff(max_retries=3, backoff_factor=1.0)
+        async def _firebase_refresh():
+            client = get_http_client()
+            return await client.post(url, json=payload, headers=headers)
+        
+        logging.info(f"Attempting token refresh for request token: {request.refresh_token[:20]}...")
+        resp = await _firebase_refresh()
         data = resp.json()
+        
         if resp.status_code != 200:
             error_message = data.get("error", {}).get("message", "Invalid refresh token")
             logging.warning(f"Firebase refresh token failed: {error_message}")
@@ -358,6 +406,7 @@ async def refresh_token(request: RefreshTokenRequest):
                 detail=error_message
             )
 
+        logging.info("Token refresh successful")
         # Firebase'den dönen expires_in genelde 3600 (1 saat)
         # Ancak biz 15 dakika (900 saniye) olarak döndürüyoruz
         # Gerçek token hala 1 saat geçerli ama client tarafında 15 dakika olarak kabul edilecek
@@ -366,19 +415,39 @@ async def refresh_token(request: RefreshTokenRequest):
             refresh_token=data.get("refresh_token", request.refresh_token),  # Yeni refresh token varsa onu kullan
             expires_in=900,  # 15 dakika
         )
-    except httpx.HTTPError as e:
-        logging.exception("Refresh token HTTP error")
+        
+    except httpx.TimeoutException as e:
+        logging.error(f"Token refresh timeout after retries: {e}")
         raise HTTPException(
-            status_code=502,
-            detail=f"Token refresh service error: {e}"
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Authentication service timeout. Please try again."
+        )
+    except httpx.ConnectError as e:
+        logging.error(f"Token refresh connection error after retries: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Cannot connect to authentication service. Please try again later."
+        )
+    except httpx.NetworkError as e:
+        logging.error(f"Token refresh network error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Network error occurred. Please check your connection."
+        )
+    except httpx.HTTPStatusError as e:
+        logging.error(f"Token refresh HTTP status error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Authentication service returned an error."
         )
     except HTTPException:
+        # Re-raise HTTPException as-is (401 from above)
         raise
     except Exception as e:
-        logging.exception("Refresh token unexpected error")
+        logging.exception(f"Unexpected token refresh error: {type(e).__name__}: {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error during token refresh: {e}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during token refresh. Please try logging in again."
         )
 
 
