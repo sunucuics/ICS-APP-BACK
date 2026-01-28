@@ -184,7 +184,7 @@ async def register(
     id_tok, refresh_tok, exp = "", "", 3600
     if not authorization and settings.firebase_web_api_key:
         try:
-            @retry_with_backoff(max_retries=2, backoff_factor=0.5)
+            @retry_with_backoff(max_retries=1, backoff_factor=0.3)
             async def _firebase_signin():
                 client = get_http_client()
                 return await client.post(
@@ -258,7 +258,7 @@ async def request_password_reset(
     }
 
     try:
-        @retry_with_backoff(max_retries=2, backoff_factor=0.5)
+        @retry_with_backoff(max_retries=1, backoff_factor=0.3)
         async def _send_reset_email():
             client = get_http_client()
             return await client.post(url, json=payload, headers=headers)
@@ -302,7 +302,7 @@ async def login(
     }
 
     try:
-        @retry_with_backoff(max_retries=3, backoff_factor=1.0)
+        @retry_with_backoff(max_retries=1, backoff_factor=0.3)
         async def _firebase_login():
             client = get_http_client()
             return await client.post(FIREBASE_SIGNIN_ENDPOINT, json=payload)
@@ -389,7 +389,7 @@ async def refresh_token(request: RefreshTokenRequest):
 
     try:
         # Firebase token refresh with retry mechanism
-        @retry_with_backoff(max_retries=3, backoff_factor=1.0)
+        @retry_with_backoff(max_retries=1, backoff_factor=0.3)
         async def _firebase_refresh():
             client = get_http_client()
             return await client.post(url, json=payload, headers=headers)

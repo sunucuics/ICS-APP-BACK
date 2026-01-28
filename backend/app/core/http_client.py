@@ -29,12 +29,12 @@ logger = logging.getLogger(__name__)
 _http_client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
 
-# Circuit breaker state
+# Circuit breaker state - DEVRE DIŞI (threshold çok yüksek)
 _circuit_breaker = {
     "failures": 0,
     "last_failure_time": None,
     "state": "closed",  # closed, open, half_open
-    "failure_threshold": 5,
+    "failure_threshold": 9999,  # Circuit breaker devre dışı
     "timeout_seconds": 60,
 }
 
@@ -53,17 +53,17 @@ def get_http_client() -> httpx.AsyncClient:
         # İlk kez çağrıldığında client oluştur
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=10.0,      # Bağlantı timeout
-                read=15.0,         # Okuma timeout
-                write=10.0,        # Yazma timeout
-                pool=5.0,          # Pool timeout
+                connect=5.0,       # Bağlantı timeout (10 -> 5)
+                read=10.0,         # Okuma timeout (15 -> 10)
+                write=5.0,         # Yazma timeout (10 -> 5)
+                pool=2.0,          # Pool timeout (5 -> 2)
             ),
             limits=httpx.Limits(
                 max_connections=100,        # Maksimum bağlantı sayısı
                 max_keepalive_connections=20,  # Keep-alive bağlantılar
                 keepalive_expiry=30.0,     # Keep-alive süresi
             ),
-            http2=True,  # HTTP/2 desteği
+            http2=False,  # HTTP/2 kapalı (daha stabil)
             follow_redirects=True,
         )
         logger.info("Global HTTP client initialized with connection pooling")
@@ -139,9 +139,9 @@ def _record_failure():
 
 
 def retry_with_backoff(
-    max_retries: int = 3,
-    backoff_factor: float = 1.0,
-    max_backoff: float = 10.0,
+    max_retries: int = 2,  # Default 2 retry (önceden 3)
+    backoff_factor: float = 0.3,  # Daha hızlı backoff (önceden 1.0)
+    max_backoff: float = 2.0,  # Max 2 saniye (önceden 10.0)
     retry_on: tuple = (
         httpx.TimeoutException,
         httpx.ConnectError,
