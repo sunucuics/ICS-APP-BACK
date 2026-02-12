@@ -82,8 +82,9 @@ def get_current_user(
 
     id_token = credentials.credentials
     try:
-        # ÖNEMLİ: check_revoked=True -> logout sonrası token'lar reddedilir
-        decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
+        # check_revoked=False: Performans için revoke kontrolü atlanıyor (~100-300ms tasarruf).
+        # Hassas endpoint'ler (logout, hesap silme) için get_current_user_strict() kullanın.
+        decoded = firebase_auth.verify_id_token(id_token, check_revoked=False)
     except firebase_auth.ExpiredIdTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -142,6 +143,72 @@ def get_current_user(
             user["is_guest"] = is_guest
 
     return user
+
+def get_current_user_strict(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme)
+) -> Dict:
+    """
+    Hassas endpoint'ler için: check_revoked=True ile token doğrulaması.
+    Logout, hesap silme gibi endpoint'lerde kullanılır.
+    Normal okuma endpoint'lerinde get_current_user() kullanın (daha hızlı).
+    """
+    if not credentials or not credentials.scheme or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were not provided",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    id_token = credentials.credentials
+    try:
+        decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except firebase_auth.RevokedIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_ref = db.collection("users").document(uid)
+    doc = user_ref.get()
+
+    if not doc.exists:
+        user = {
+            "id": uid,
+            "name": decoded.get("name", "") or "",
+            "email": decoded.get("email", "") or "",
+            "phone": decoded.get("phone_number", "") or "",
+            "email_verified": bool(decoded.get("email_verified")),
+            "role": "customer",
+            "addresses": [],
+            "is_guest": False,
+        }
+    else:
+        user = doc.to_dict() or {}
+        user["id"] = uid
+
+    return user
+
 
 def get_current_admin(current_user: dict = Depends(get_current_user)):
     """

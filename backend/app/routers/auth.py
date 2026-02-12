@@ -68,7 +68,7 @@ import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
 from starlette.concurrency import run_in_threadpool
 from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse, RefreshTokenRequest, RefreshTokenResponse
-from backend.app.core.security import (get_current_user)
+from backend.app.core.security import (get_current_user, get_current_user_strict)
 from backend.app.core.http_client import get_http_client, retry_with_backoff
 from backend.app.config import db
 import re
@@ -407,13 +407,12 @@ async def refresh_token(request: RefreshTokenRequest):
             )
 
         logging.info("Token refresh successful")
-        # Firebase'den dönen expires_in genelde 3600 (1 saat)
-        # Ancak biz 15 dakika (900 saniye) olarak döndürüyoruz
-        # Gerçek token hala 1 saat geçerli ama client tarafında 15 dakika olarak kabul edilecek
+        # Firebase'den dönen expires_in değerini olduğu gibi kullan (genelde 3600 = 1 saat)
+        # Client tarafı bu değere göre proaktif refresh zamanlayacak
         return RefreshTokenResponse(
             id_token=data["id_token"],
             refresh_token=data.get("refresh_token", request.refresh_token),  # Yeni refresh token varsa onu kullan
-            expires_in=900,  # 15 dakika
+            expires_in=int(data.get("expires_in", 3600)),
         )
         
     except httpx.TimeoutException as e:
@@ -455,7 +454,7 @@ async def refresh_token(request: RefreshTokenRequest):
 # LOGOUT – refresh token'ları iptal eder, ID token'ı geçersiz kılar
 # --------------------------------------------------------------------------- #
 @router.post("/logout", summary="Sunucu tarafında oturumu kapat (refresh revoke)")
-def logout(current_user: dict = Depends(get_current_user)):
+def logout(current_user: dict = Depends(get_current_user_strict)):
     """
     Tüm cihazlardaki refresh token'ları iptal eder.
     İstemci ayrıca firebase SDK'da signOut() çağırmalıdır.

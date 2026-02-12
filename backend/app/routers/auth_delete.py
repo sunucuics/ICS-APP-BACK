@@ -1,14 +1,14 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Form
 from pydantic import EmailStr
-from backend.app.core.security import get_current_user
+from backend.app.core.security import get_current_user_strict
 from backend.app.schemas.delete import DeleteVerifyRequest
 from backend.app.services import account_delete as svc
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @router.post("/delete-account/initiate", summary="Hesap silme talebi başlat (e-posta kodlu)")
-async def initiate_delete_account(current_user = Depends(get_current_user)):
+async def initiate_delete_account(current_user = Depends(get_current_user_strict)):
     uid = current_user["id"]
     email: Optional[EmailStr] = current_user.get("email")
     name = current_user.get("name") or ""
@@ -18,7 +18,7 @@ async def initiate_delete_account(current_user = Depends(get_current_user)):
     return {"detail": "Doğrulama kodu e-postana gönderildi (30 dk geçerli)."}
 
 @router.post("/delete-account/verify", summary="E-posta kodunu doğrula ve hesabı sil")
-async def verify_delete_account(payload: DeleteVerifyRequest, current_user = Depends(get_current_user)):
+async def verify_delete_account(payload: DeleteVerifyRequest, current_user = Depends(get_current_user_strict)):
     uid = current_user["id"]
     try:
         svc.verify_and_delete(uid, payload.code)

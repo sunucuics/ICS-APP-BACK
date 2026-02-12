@@ -11,5 +11,8 @@
     ],
     "cleanUrls": true,
     "trailingSlash": false
+  },
+  "firestore": {
+    "indexes": "firestore.indexes.json"
   }
 }

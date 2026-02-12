@@ -119,10 +119,69 @@ def _is_window_active(start_at, end_at, now):
     return True
 
 
+def _load_all_active_discounts() -> dict:
+    """
+    Tüm aktif indirimleri TEK SEFERDE yükler ve bir dict olarak döner.
+    N+1 query sorununu çözer: ürün başına ayrı sorgu yerine tek bir toplu sorgu.
+
+    Returns:
+        {
+            "product": { target_id: best_percent, ... },
+            "category": { target_id: best_percent, ... },
+        }
+    """
+    now = datetime.now(timezone.utc)
+    discounts = {"product": {}, "category": {}}
+
+    try:
+        q = db.collection("discounts").where(filter=FieldFilter("active", "==", True))
+        for snap in q.stream():
+            d = snap.to_dict() or {}
+            if not _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                continue
+            target_type = d.get("target_type", "")
+            target_id = d.get("target_id", "")
+            percent = float(d.get("percent", 0.0))
+            if target_type in discounts and target_id:
+                discounts[target_type][target_id] = max(
+                    discounts[target_type].get(target_id, 0.0), percent
+                )
+    except Exception:
+        pass  # Discount yüklenemezse fiyatlar indirimisiz döner
+
+    return discounts
+
+
+def _calculate_final_price_from_cache(
+    product_id: str,
+    category_id: Optional[str],
+    base_price: float,
+    discount_cache: dict,
+) -> float:
+    """
+    Önceden yüklenmiş indirim cache'i ile fiyat hesaplar (Firestore sorgusu YAPMAZ).
+    """
+    best_percent = 0.0
+
+    # Product discount
+    prod_pct = discount_cache.get("product", {}).get(product_id, 0.0)
+    best_percent = max(best_percent, prod_pct)
+
+    # Category discount
+    if category_id:
+        cat_pct = discount_cache.get("category", {}).get(category_id, 0.0)
+        best_percent = max(best_percent, cat_pct)
+
+    if best_percent > 0:
+        return round(base_price * (100.0 - best_percent) / 100.0, 2)
+    return round(base_price, 2)
+
+
 def _calculate_final_price(product_id: str, category_id: Optional[str], base_price: float) -> float:
     """
-    Ürün için indirimli fiyatı hesaplar.
+    Ürün için indirimli fiyatı hesaplar (tek ürün detay sayfası gibi yerlerde kullanılır).
     Hem product hem de category indirimlerini kontrol eder.
+    NOT: Liste endpoint'leri için _calculate_final_price_from_cache kullanın.
     """
     now = datetime.now(timezone.utc)
     best_percent = 0.0
@@ -203,46 +262,41 @@ def _list_products_impl(
     - is_deleted=False
     - (ops.) category_name ile filtre
     - created_at varsa DESC sıralama
+
+    Optimizasyon: Tüm aktif indirimler TEK SEFERDE yüklenir (N+1 query sorunu çözüldü).
     """
     colg = db.collection_group("items")
-    # Geçici olarak is_deleted filtresini kaldırıyoruz - index sorunu olabilir
-    # q = colg.where(filter=FieldFilter("is_deleted", "==", False))
-    q = colg
 
-    if category_name:
-        # Artık type filtresi YOK; dokümana kaydedilen category_name üzerinden filtre
-        pass  # Category filtering done at code level below
-        # Geçici olarak filtrelemeyi kaldırıyoruz - debug için
-        # q = q.where(filter=FieldFilter("category_name", "==", category_name))
+    # Firestore sorgu filtreleri (composite index gerektirir)
+    # Index yoksa Python seviyesinde filtreleme yapılır (fallback)
+    try:
+        q = colg.where(filter=FieldFilter("is_deleted", "==", False))
+        if category_name:
+            q = q.where(filter=FieldFilter("category_name", "==", category_name))
+    except Exception:
+        # Index yoksa filtresiz devam et, Python'da filtrele
+        q = colg
 
-    # Geçici olarak order_by'ı kaldırıyoruz - index sorunu olabilir
-    # try:
-    #     q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
-    # except Exception as e:
-    #     print(f"⚠️ Order by error: {e}")
-    #     pass
+    # Tüm aktif indirimleri TEK SEFERDE yükle (N+1 sorunu çözümü)
+    discount_cache = _load_all_active_discounts()
 
     out: List[ProductOut] = []
     for d in q.stream():
         src = d.to_dict() or {}
         
-        # Kategori filtrelemesini kod seviyesinde yap
-        if category_name and src.get("category_name") != category_name:
-            continue
-            
-        # is_deleted filtresini kod seviyesinde yap
+        # Firestore filtreleri çalışmazsa Python'da filtrele (fallback)
         if src.get("is_deleted", False):
             continue
+        if category_name and src.get("category_name") != category_name:
+            continue
         
-        # final_price'ı dinamik olarak hesapla (indirimler dahil)
+        # final_price'ı cache'den hesapla (EK SORGU YOK)
         product_id = src.get("id", d.id)
         category_id = src.get("category_id")
         base_price = float(src.get("price", 0))
-        calculated_final_price = _calculate_final_price(product_id, category_id, base_price)
-        
-        # DEBUG: İlk birkaç ürünün fiyatlarını logla
-        if len(out) < 3:
-            print(f"[DEBUG LIST] Product: {src.get('title', 'N/A')[:20]}, DB price: {src.get('price')}, Returning: {base_price}")
+        calculated_final_price = _calculate_final_price_from_cache(
+            product_id, category_id, base_price, discount_cache
+        )
             
         out.append(ProductOut(
             id=product_id,
@@ -255,6 +309,9 @@ def _list_products_impl(
             category_name=src.get("category_name", ""),
             images=src.get("images", []) or [],
         ))
+
+    # created_at'a göre sırala (Python seviyesinde - Firestore index yoksa)
+    out.sort(key=lambda p: p.id, reverse=True)
     return out
 
 

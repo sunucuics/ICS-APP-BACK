@@ -17,18 +17,21 @@ def _extract_bearer_token(request: Request) -> Optional[str]:
         return parts[1]
     return None
 
-def _decode_id_token(id_token: str) -> dict:
+def _decode_id_token(id_token: str, check_revoked: bool = False) -> dict:
     """
     Firebase ID token doğrulaması.
     Mock token'ları da geçerli kabul eder (development için).
     Geçersiz/iptal/expired durumda 401 döndürür.
+
+    check_revoked=False: Normal endpoint'ler için (hız için revoke kontrolü atlanır).
+    check_revoked=True: Hassas endpoint'ler için (logout, hesap silme vb.).
     """
     # Mock token kontrolü (development için)
     if id_token.startswith("mock_jwt_token_"):
         return _decode_mock_token(id_token)
     
     try:
-        return fb_auth.verify_id_token(id_token, check_revoked=True)
+        return fb_auth.verify_id_token(id_token, check_revoked=check_revoked)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
