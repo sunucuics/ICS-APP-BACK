@@ -55,7 +55,8 @@ Bu modül, **Firebase ID Token** doğrulaması ile kimlik denetimi yapan FastAPI
   "is_guest": false
 }
 """
-from fastapi import Depends, HTTPException, status
+import logging
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth as firebase_auth
 from backend.app.config import settings, db
@@ -63,6 +64,8 @@ from firebase_admin import firestore
 from backend.app.schemas.principal import Principal
 from backend.app.core.auth import get_principal
 from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)
 
@@ -86,18 +89,35 @@ def get_current_user(
         # Hassas endpoint'ler (logout, hesap silme) için get_current_user_strict() kullanın.
         decoded = firebase_auth.verify_id_token(id_token, check_revoked=False)
     except firebase_auth.ExpiredIdTokenError:
+        logger.warning("AUTH_401 | error_type: expired | check_revoked: false | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except firebase_auth.RevokedIdTokenError:
+        logger.warning("AUTH_401 | error_type: revoked | check_revoked: false | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session revoked",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except Exception:
+    except firebase_auth.InvalidIdTokenError as e:
+        logger.warning("AUTH_401 | error_type: invalid_id_token | check_revoked: false | detail: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except firebase_auth.CertificateFetchError as e:
+        logger.error("AUTH_401 | error_type: certificate_fetch_error | detail: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token verification temporarily unavailable",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception as e:
+        logger.error("AUTH_401 | error_type: %s | detail: %s", type(e).__name__, str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token",
@@ -106,6 +126,7 @@ def get_current_user(
 
     uid = decoded.get("uid")
     if not uid:
+        logger.warning("AUTH_401 | error_type: missing_uid | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
@@ -163,18 +184,35 @@ def get_current_user_strict(
     try:
         decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
     except firebase_auth.ExpiredIdTokenError:
+        logger.warning("AUTH_401 | error_type: expired | check_revoked: true | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except firebase_auth.RevokedIdTokenError:
+        logger.warning("AUTH_401 | error_type: revoked | check_revoked: true | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session revoked",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except Exception:
+    except firebase_auth.InvalidIdTokenError as e:
+        logger.warning("AUTH_401 | error_type: invalid_id_token | check_revoked: true | detail: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except firebase_auth.CertificateFetchError as e:
+        logger.error("AUTH_401 | error_type: certificate_fetch_error | detail: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token verification temporarily unavailable",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception as e:
+        logger.error("AUTH_401 | error_type: %s | detail: %s", type(e).__name__, str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token",
@@ -183,6 +221,7 @@ def get_current_user_strict(
 
     uid = decoded.get("uid")
     if not uid:
+        logger.warning("AUTH_401 | error_type: missing_uid | check_revoked: true | token_prefix: %s", id_token[:20] if id_token else "none")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
