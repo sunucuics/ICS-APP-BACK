@@ -68,7 +68,7 @@ import logging
 from firebase_admin import auth as firebase_auth , _auth_utils
 from starlette.concurrency import run_in_threadpool
 from backend.app.schemas.user import ProfileUpdateRequest, UserCreate, UserProfile , LoginRequest, LoginResponse , RegisterResponse, RefreshTokenRequest, RefreshTokenResponse
-from backend.app.core.security import (get_current_user, get_current_user_strict)
+from backend.app.core.security import (get_current_user, get_current_user_strict, invalidate_user_cache)
 from backend.app.core.http_client import get_http_client, retry_with_backoff
 from backend.app.config import db
 import re
@@ -460,6 +460,8 @@ def logout(current_user: dict = Depends(get_current_user_strict)):
     İstemci ayrıca firebase SDK'da signOut() çağırmalıdır.
     """
     uid = current_user["id"]
+    # Cache'den kullanıcı profilini temizle (yeni oturum güncel veri alsın)
+    invalidate_user_cache(uid)
     try:
         firebase_auth.revoke_refresh_tokens(uid)
     except Exception:
@@ -514,6 +516,8 @@ async def update_my_profile(
 
     updates["updated_at"] = gcf.SERVER_TIMESTAMP
     user_ref.update(updates)
+    # Profil değişti → cache'den eski veriyi temizle
+    invalidate_user_cache(uid)
 
     fresh = user_ref.get().to_dict() or {}
     return UserProfile(

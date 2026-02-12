@@ -56,6 +56,7 @@ Bu modül, **Firebase ID Token** doğrulaması ile kimlik denetimi yapan FastAPI
 }
 """
 import logging
+from cachetools import TTLCache
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth as firebase_auth
@@ -68,6 +69,25 @@ from typing import Optional, Dict
 logger = logging.getLogger(__name__)
 # HTTPBearer is a FastAPI provided security scheme for "Authorization: Bearer <token>" header
 oauth2_scheme = HTTPBearer(auto_error=False)
+
+# ── Kullanıcı profili TTL cache ──────────────────────────────────────────────
+# Her request'te Firestore'a gitmek yerine uid bazlı 5 dakika cache tutar.
+# 29+ endpoint get_current_user() kullanıyor; cache olmadan her biri ~50-200ms
+# ekstra Firestore read yapıyor. Bu cache özellikle admin→customer geçişinde
+# ve customer ana sayfası açılışında (2-3 ardışık authenticated endpoint)
+# belirgin performans iyileştirmesi sağlar.
+# maxsize=256: Eşzamanlı 256 farklı kullanıcıyı cache'de tutabilir.
+# ttl=300: 5 dakika sonra otomatik expire olur.
+_user_cache: TTLCache = TTLCache(maxsize=256, ttl=300)
+
+
+def invalidate_user_cache(uid: str) -> None:
+    """
+    Belirli bir kullanıcının cache'ini temizle.
+    Profil güncellemesi, adres değişikliği, logout gibi durumlarda çağır.
+    """
+    _user_cache.pop(uid, None)
+    logger.debug("USER_CACHE | invalidated uid=%s", uid)
 
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme)
@@ -136,6 +156,12 @@ def get_current_user(
     provider = (decoded.get("firebase") or {}).get("sign_in_provider")
     is_guest = (provider == "anonymous")
 
+    # ── Cache kontrolü ──
+    # Aynı uid için 5 dk içinde tekrar Firestore'a gitme
+    cached = _user_cache.get(uid)
+    if cached is not None:
+        return cached
+
     # Kullanıcı profilini getir (varsa)
     user_ref = db.collection("users").document(uid)
     doc = user_ref.get()
@@ -155,6 +181,7 @@ def get_current_user(
             "is_guest": is_guest,
         }
         # NOT: user_ref.set() çağrılmıyor - profil register endpoint'inde oluşturulacak
+        # Profil yoksa cache'leme — register sonrası güncel veriyi almak için
     else:
         user = doc.to_dict() or {}
         user["id"] = uid
@@ -162,6 +189,8 @@ def get_current_user(
         if "is_guest" not in user:
             user_ref.set({"is_guest": is_guest}, merge=True)
             user["is_guest"] = is_guest
+        # Firestore'dan okunan profili cache'e koy
+        _user_cache[uid] = user
 
     return user
 

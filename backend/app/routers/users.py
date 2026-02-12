@@ -73,7 +73,7 @@ from pydantic import BaseModel
 from uuid import uuid4
 from firebase_admin import auth as firebase_auth
 from firebase_admin import _auth_utils
-from backend.app.core.security import get_current_user , get_current_admin
+from backend.app.core.security import get_current_user , get_current_admin, invalidate_user_cache
 from backend.app.config import db
 from backend.app.schemas.user import UserProfile, AddressCreate, AddressUpdate , AddressOut
 
@@ -124,6 +124,7 @@ def add_address(
     addresses = snap.to_dict().get("addresses", [])
     addresses.append(new_addr)
     user_ref.update({"addresses": addresses})
+    invalidate_user_cache(user_id)
 
     return AddressOut(**new_addr)
 
@@ -153,6 +154,7 @@ def choose_current_address(addr_id: str, current_user: dict = Depends(get_curren
     
     # Update default address field in user profile
     user_ref.update({"defaultAddressId": addr_id})
+    invalidate_user_cache(user_id)
     
     return AddressOut(**target_address)
 
@@ -183,6 +185,7 @@ def update_address(addr_id: str, addr_update: AddressUpdate, current_user: dict 
     if not updated:
         raise HTTPException(status_code=404, detail="Address not found")
     user_ref.update({"addresses": addresses})
+    invalidate_user_cache(user_id)
     profile['addresses'] = addresses
     profile['id'] = user_id
     return profile
@@ -205,6 +208,7 @@ def delete_address(addr_id: str, current_user: dict = Depends(get_current_user))
         # no change, address not found
         raise HTTPException(status_code=404, detail="Address not found")
     user_ref.update({"addresses": new_addresses})
+    invalidate_user_cache(user_id)
     profile['addresses'] = new_addresses
     profile['id'] = user_id
     return profile
@@ -354,6 +358,7 @@ def update_user_role(user_id: str, role: str = Query(..., description="User role
         raise HTTPException(status_code=404, detail="User not found")
     
     user_ref.update({"role": role})
+    invalidate_user_cache(user_id)
     return {"message": f"User {user_id} role updated to {role}"}
 
 @admin_router.delete("/{user_id}")
