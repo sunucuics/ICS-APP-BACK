@@ -90,6 +90,7 @@ from uuid import uuid4
 from backend.app.config import db, bucket
 from backend.app.core.security import get_current_user, get_current_admin
 from backend.app.schemas.product import ProductOut , ProductCreate, ProductUpdate
+from backend.app.schemas.pagination import CursorPage
 from firebase_admin import firestore
 from datetime import datetime
 from google.cloud.firestore_v1.field_path import FieldPath
@@ -255,41 +256,64 @@ def _delete_discounts_for_product(product_id: str) -> int:
 router = APIRouter(prefix="/products", tags=["Products"])
 
 def _list_products_impl(
-    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
+    category_name: Optional[str] = None,
+    limit: int = 20,
+    start_after: Optional[str] = None,
 ):
     """
-    products/<slug>/items alt koleksiyonlarını listeler.
+    products/<slug>/items alt koleksiyonlarını cursor-based pagination ile listeler.
     - is_deleted=False
     - (ops.) category_name ile filtre
-    - created_at varsa DESC sıralama
+    - created_at DESC sıralama (Firestore seviyesinde)
+    - cursor-based pagination (start_after + limit)
 
     Optimizasyon: Tüm aktif indirimler TEK SEFERDE yüklenir (N+1 query sorunu çözüldü).
+
+    NOT: collection_group("items") üzerinde order_by("created_at") + start_after
+    composite index gerektirir. Index yoksa Python seviyesinde sıralama + slice yapılır (fallback).
     """
     colg = db.collection_group("items")
 
-    # Firestore sorgu filtreleri (composite index gerektirir)
-    # Index yoksa Python seviyesinde filtreleme yapılır (fallback)
+    # Firestore sorgu filtreleri
+    use_firestore_ordering = True
     try:
         q = colg.where(filter=FieldFilter("is_deleted", "==", False))
         if category_name:
             q = q.where(filter=FieldFilter("category_name", "==", category_name))
+
+        # Firestore seviyesinde sıralama
+        q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
+
+        # Cursor-based pagination: start_after varsa cursor'dan devam et
+        if start_after:
+            try:
+                cursor_dt = datetime.fromisoformat(start_after.replace("Z", "+00:00"))
+                q = q.start_after({"created_at": cursor_dt})
+            except Exception:
+                pass  # Geçersiz cursor → baştan başla
+
+        # limit + 1 ile sorgula: fazladan 1 tane çekerek has_more hesapla
+        docs = list(q.limit(limit + 1).stream())
+
     except Exception:
-        # Index yoksa filtresiz devam et, Python'da filtrele
+        # Index yoksa filtresiz devam et, Python'da filtrele ve sırala
+        use_firestore_ordering = False
         q = colg
+        docs = list(q.stream())
 
     # Tüm aktif indirimleri TEK SEFERDE yükle (N+1 sorunu çözümü)
     discount_cache = _load_all_active_discounts()
 
-    out: List[ProductOut] = []
-    for d in q.stream():
+    out: List[dict] = []  # (created_at, ProductOut) — sıralama için
+    for d in docs:
         src = d.to_dict() or {}
-        
+
         # Firestore filtreleri çalışmazsa Python'da filtrele (fallback)
         if src.get("is_deleted", False):
             continue
         if category_name and src.get("category_name") != category_name:
             continue
-        
+
         # final_price'ı cache'den hesapla (EK SORGU YOK)
         product_id = src.get("id", d.id)
         category_id = src.get("category_id")
@@ -297,38 +321,87 @@ def _list_products_impl(
         calculated_final_price = _calculate_final_price_from_cache(
             product_id, category_id, base_price, discount_cache
         )
-            
-        out.append(ProductOut(
-            id=product_id,
-            title=src.get("title", ""),
-            description=src.get("description", ""),
-            price=base_price,
-            final_price=calculated_final_price,
-            stock=int(src.get("stock", 0)),
-            is_upcoming=bool(src.get("is_upcoming", False)),
-            category_name=src.get("category_name", ""),
-            images=src.get("images", []) or [],
-        ))
 
-    # created_at'a göre sırala (Python seviyesinde - Firestore index yoksa)
-    out.sort(key=lambda p: p.id, reverse=True)
-    return out
+        created_at = src.get("created_at")
+
+        out.append({
+            "product": ProductOut(
+                id=product_id,
+                title=src.get("title", ""),
+                description=src.get("description", ""),
+                price=base_price,
+                final_price=calculated_final_price,
+                stock=int(src.get("stock", 0)),
+                is_upcoming=bool(src.get("is_upcoming", False)),
+                category_name=src.get("category_name", ""),
+                images=src.get("images", []) or [],
+            ),
+            "created_at": created_at,
+        })
+
+    # Firestore sıralaması çalışmadıysa Python'da sırala ve slice et
+    if not use_firestore_ordering:
+        # created_at'a göre sırala (DESC)
+        out.sort(
+            key=lambda x: x["created_at"] if isinstance(x["created_at"], datetime) else datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+
+        # Manual cursor: start_after varsa cursor'dan sonrasını al
+        if start_after:
+            try:
+                cursor_dt = datetime.fromisoformat(start_after.replace("Z", "+00:00"))
+                out = [
+                    item for item in out
+                    if isinstance(item["created_at"], datetime)
+                    and _to_aware_utc(item["created_at"]) < _to_aware_utc(cursor_dt)
+                ]
+            except Exception:
+                pass
+
+        # Limit + 1 ile has_more hesapla
+        has_more = len(out) > limit
+        out = out[:limit]
+    else:
+        # Firestore sıralaması çalıştıysa limit + 1 sonucundan has_more hesapla
+        has_more = len(out) > limit
+        out = out[:limit]
+
+    # next_cursor: son öğenin created_at'ı
+    next_cursor = None
+    if has_more and out:
+        last_created_at = out[-1]["created_at"]
+        if isinstance(last_created_at, datetime):
+            next_cursor = last_created_at.isoformat()
+
+    items = [item["product"] for item in out]
+
+    return CursorPage[ProductOut](
+        items=items,
+        count=len(items),
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
 
 
-@router.get("", response_model=List[ProductOut], summary="List Products")
+@router.get("", response_model=CursorPage[ProductOut], summary="List Products")
 def list_products_no_slash(
-    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
+    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)"),
+    limit: int = Query(20, ge=1, le=100, description="Sayfa başına ürün sayısı"),
+    start_after: Optional[str] = Query(None, description="ISO datetime cursor (önceki sayfanın next_cursor değeri)"),
 ):
-    """List products endpoint without trailing slash."""
-    return _list_products_impl(category_name)
+    """List products with cursor-based pagination."""
+    return _list_products_impl(category_name, limit, start_after)
 
 
-@router.get("/", response_model=List[ProductOut], summary="List Products")
+@router.get("/", response_model=CursorPage[ProductOut], summary="List Products")
 def list_products_with_slash(
-    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)")
+    category_name: Optional[str] = Query(None, description="Kategori adı (opsiyonel)"),
+    limit: int = Query(20, ge=1, le=100, description="Sayfa başına ürün sayısı"),
+    start_after: Optional[str] = Query(None, description="ISO datetime cursor (önceki sayfanın next_cursor değeri)"),
 ):
-    """List products endpoint with trailing slash."""
-    return _list_products_impl(category_name)
+    """List products with cursor-based pagination."""
+    return _list_products_impl(category_name, limit, start_after)
 
 
 @router.get("/{product_id}", response_model=ProductOut, summary="Get Product")

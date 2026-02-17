@@ -3,13 +3,15 @@ from fastapi import (
     APIRouter, Depends, HTTPException, File, UploadFile, Form,
     status, Response, Query, Request
 )
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from uuid import uuid4
 from enum import Enum
+from datetime import datetime
 
 from backend.app.config import db, bucket
 from backend.app.core.security import get_current_admin
 from backend.app.schemas.service import ServiceOut
+from backend.app.schemas.pagination import CursorPage
 
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import FieldFilter
@@ -99,7 +101,17 @@ def _service_to_out(doc_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-def _list_services_impl(response: Response):
+def _list_services_impl(
+    response: Response,
+    limit: int = 20,
+    start_after: Optional[str] = None,
+):
+    """
+    Servisleri cursor-based pagination ile listeler.
+    - is_deleted=False
+    - created_at DESC sıralama
+    - cursor-based pagination (start_after + limit)
+    """
     col = db.collection("services")
     q = col.where(filter=FieldFilter("is_deleted", "==", False))
     try:
@@ -107,26 +119,60 @@ def _list_services_impl(response: Response):
     except Exception:
         pass
 
-    docs = list(q.limit(50).stream())
+    # Cursor-based pagination
+    if start_after:
+        try:
+            cursor_dt = datetime.fromisoformat(start_after.replace("Z", "+00:00"))
+            q = q.start_after({"created_at": cursor_dt})
+        except Exception:
+            pass  # Geçersiz cursor → baştan başla
+
+    # limit + 1 ile sorgula: fazladan 1 tane çekerek has_more hesapla
+    docs = list(q.limit(limit + 1).stream())
     response.headers["Cache-Control"] = "public, max-age=60"
+
+    has_more = len(docs) > limit
+    docs = docs[:limit]
 
     out = []
     for d in docs:
         out.append(_service_to_out(d.id, d.to_dict()))
-    return out
+
+    # next_cursor: son öğenin created_at'ı
+    next_cursor = None
+    if has_more and docs:
+        last_data = docs[-1].to_dict() or {}
+        last_ct = last_data.get("created_at")
+        if isinstance(last_ct, datetime):
+            next_cursor = last_ct.isoformat()
+
+    return CursorPage[ServiceOut](
+        items=out,
+        count=len(out),
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
 
 
 # -------------------------
 # PUBLIC LIST
 # -------------------------
-@router.get("", response_model=List[ServiceOut], response_model_exclude_none=True, summary="List Services")
-def list_services_no_slash(response: Response):
-    return _list_services_impl(response)
+@router.get("", response_model=CursorPage[ServiceOut], response_model_exclude_none=True, summary="List Services")
+def list_services_no_slash(
+    response: Response,
+    limit: int = Query(20, ge=1, le=100, description="Sayfa başına servis sayısı"),
+    start_after: Optional[str] = Query(None, description="ISO datetime cursor (önceki sayfanın next_cursor değeri)"),
+):
+    return _list_services_impl(response, limit, start_after)
 
 
-@router.get("/", response_model=List[ServiceOut], response_model_exclude_none=True, summary="List Services")
-def list_services_with_slash(response: Response):
-    return _list_services_impl(response)
+@router.get("/", response_model=CursorPage[ServiceOut], response_model_exclude_none=True, summary="List Services")
+def list_services_with_slash(
+    response: Response,
+    limit: int = Query(20, ge=1, le=100, description="Sayfa başına servis sayısı"),
+    start_after: Optional[str] = Query(None, description="ISO datetime cursor (önceki sayfanın next_cursor değeri)"),
+):
+    return _list_services_impl(response, limit, start_after)
 
 
 # -------------------------
