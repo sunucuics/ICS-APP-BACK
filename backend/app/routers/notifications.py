@@ -211,20 +211,31 @@ def send_notification(notification_data: NotificationSendRequest):
             user_ids = notification_data.target_users
             fcm_tokens = []
             user_tokens_map = {}
-            
-            # Fetch specific users
-            for user_id in user_ids:
-                try:
-                    user_doc = users_ref.document(user_id).get()
+
+            # Batch fetch all target users in ONE RPC call (instead of N separate reads)
+            try:
+                user_refs = [users_ref.document(uid) for uid in user_ids]
+                user_docs = db.get_all(user_refs)
+                for user_doc in user_docs:
                     if user_doc.exists:
                         user_data = user_doc.to_dict()
-                        if "fcm_token" in user_data and user_data["fcm_token"]:
+                        if user_data and user_data.get("fcm_token"):
                             fcm_token = user_data["fcm_token"]
                             fcm_tokens.append(fcm_token)
-                            user_tokens_map[user_id] = fcm_token
-                except Exception as e:
-                    # Skip invalid user IDs
-                    continue
+                            user_tokens_map[user_doc.id] = fcm_token
+            except Exception:
+                # Fallback: individual reads
+                for user_id in user_ids:
+                    try:
+                        user_doc = users_ref.document(user_id).get()
+                        if user_doc.exists:
+                            user_data = user_doc.to_dict()
+                            if "fcm_token" in user_data and user_data["fcm_token"]:
+                                fcm_token = user_data["fcm_token"]
+                                fcm_tokens.append(fcm_token)
+                                user_tokens_map[user_id] = fcm_token
+                    except Exception:
+                        continue
         else:
             # Get all users or filter by segments
             if not target_segments:  # Send to all users

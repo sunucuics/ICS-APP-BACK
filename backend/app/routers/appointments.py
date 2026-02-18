@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Form, Query
 from typing import List, Optional, Any
 from datetime import timedelta, datetime
 import logging
+import threading
 
 from backend.app.core.security import get_current_user, get_current_admin
 from backend.app.config import db
@@ -197,58 +198,54 @@ def request_appointment(
     ref.set(appt_data)
     appt_data["id"] = ref.id
 
-    # Admin bildirimi oluştur ve FCM push gönder
-    # Bu işlem başarısız olsa bile randevu oluşturma işlemi devam etmeli
-    try:
-        service_data = service_doc.to_dict() or {}
-        user_doc = db.collection("users").document(user_id).get()
-        user_data = user_doc.to_dict() if user_doc.exists else {}
-        
-        user_name = user_data.get("name") or user_data.get("email") or "Bir müşteri"
-        service_title = service_data.get("title") or "Hizmet"
-        
-        # Tarih formatla
-        date_str = start_norm.strftime("%d/%m/%Y")
-        time_str = start_norm.strftime("%H:%M")
-        
-        notification_title = "🗓️ Yeni Randevu Talebi"
-        notification_body = f"{user_name} - {service_title} için {date_str} tarihinde saat {time_str}'de randevu talebi oluşturdu."
-        
-        notification_data = {
-            "title": notification_title,
-            "body": notification_body,
-            "type": "appointment",
-            "is_read": False,
-            "created_at": firestore.SERVER_TIMESTAMP,  # Use Firestore server timestamp for consistency
-            "data": {
-                "appointment_id": ref.id,
-                "user_id": user_id,
-                "user_name": user_data.get("name"),
-                "user_email": user_data.get("email"),
-                "user_phone": user_data.get("phone"),
-                "service_id": service_id,
-                "service_title": service_title,
-                "start": start_norm.isoformat(),
-                "end": end_time.isoformat()
-            }
-        }
-        
-        # Create notification in Firestore (this will trigger SSE stream)
-        notification_ref = db.collection("admin_notifications").document()
-        notification_ref.set(notification_data)
-        logger.info("Admin notification created for appointment %s (notification_id: %s)", ref.id, notification_ref.id)
-        
-        # Admin kullanıcılara FCM push notification gönder (telefon bildirimi)
-        # Bu ayrı bir işlem, SSE'den bağımsız
+    # Admin bildirimi ve FCM push'ı arka plan thread'inde çalıştır
+    # Kullanıcı yanıtı beklemeden hızlıca döner
+    service_data = service_doc.to_dict() or {}
+    service_title = service_data.get("title") or "Hizmet"
+
+    def _background_notify():
         try:
+            user_doc_bg = db.collection("users").document(user_id).get()
+            user_data = user_doc_bg.to_dict() if user_doc_bg.exists else {}
+
+            user_name = user_data.get("name") or user_data.get("email") or "Bir müşteri"
+
+            date_str = start_norm.strftime("%d/%m/%Y")
+            time_str = start_norm.strftime("%H:%M")
+
+            notification_title = "🗓️ Yeni Randevu Talebi"
+            notification_body = (
+                f"{user_name} - {service_title} için "
+                f"{date_str} tarihinde saat {time_str}'de randevu talebi oluşturdu."
+            )
+
+            # Firestore bildirim + FCM push aynı thread'de sıralı çalışır
+            notification_ref = db.collection("admin_notifications").document()
+            notification_ref.set({
+                "title": notification_title,
+                "body": notification_body,
+                "type": "appointment",
+                "is_read": False,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "data": {
+                    "appointment_id": ref.id,
+                    "user_id": user_id,
+                    "user_name": user_data.get("name"),
+                    "user_email": user_data.get("email"),
+                    "user_phone": user_data.get("phone"),
+                    "service_id": service_id,
+                    "service_title": service_title,
+                    "start": start_norm.isoformat(),
+                    "end": end_time.isoformat(),
+                },
+            })
+            logger.info("Admin notification created for appointment %s", ref.id)
+
             _send_admin_push_notification(notification_title, notification_body, ref.id)
-        except Exception as fcm_error:
-            # FCM hatası bildirim oluşturmayı engellemez
-            logger.warning("Failed to send FCM push notification: %s", fcm_error)
-        
-    except Exception as e:
-        # Bildirim oluşturma başarısız olursa log'la ama randevuyu engelleme
-        logger.error("Failed to create admin notification for appointment %s: %s", ref.id, e, exc_info=True)
+        except Exception as e:
+            logger.error("Background notification failed for appointment %s: %s", ref.id, e)
+
+    threading.Thread(target=_background_notify, daemon=True).start()
 
     return appt_data
 
@@ -277,12 +274,8 @@ def list_my_appointments(current_user: dict = Depends(get_current_user)):
 admin_router = APIRouter(prefix="/appointments", dependencies=[Depends(get_current_admin)])
 
 
-@admin_router.get("", response_model=List[AppointmentAdminOut])
-def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
-    """
-    Admin endpoint – lists all appointments.
-    Optional **status** filter.
-    """
+def _fetch_appointments_admin(status: Optional[str] = None) -> List[dict]:
+    """Admin randevu listesini döndüren ortak helper."""
     query = db.collection("appointments")
     if status:
         query = query.where("status", "==", status)
@@ -290,17 +283,17 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
     if not appt_docs:
         return []
 
-    # user_id / service_id kümeleri
-    user_ids = { (d.to_dict() or {}).get("user_id") for d in appt_docs }
-    service_ids = { (d.to_dict() or {}).get("service_id") for d in appt_docs }
+    # Batch fetch: user + service dokümanlarını tek seferde çek
+    user_ids = {(d.to_dict() or {}).get("user_id") for d in appt_docs}
+    service_ids = {(d.to_dict() or {}).get("service_id") for d in appt_docs}
     user_ids.discard(None)
     service_ids.discard(None)
 
     user_snaps = db.get_all([db.collection("users").document(uid) for uid in user_ids]) if user_ids else []
-    svc_snaps  = db.get_all([db.collection("services").document(sid) for sid in service_ids]) if service_ids else []
+    svc_snaps = db.get_all([db.collection("services").document(sid) for sid in service_ids]) if service_ids else []
 
     user_map = {s.id: s.to_dict() for s in user_snaps if s.exists}
-    svc_map  = {s.id: s.to_dict() for s in svc_snaps  if s.exists}
+    svc_map = {s.id: s.to_dict() for s in svc_snaps if s.exists}
 
     results = []
     for doc in appt_docs:
@@ -308,91 +301,44 @@ def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pe
         uid = d.get("user_id")
         sid = d.get("service_id")
 
-        # user_id null ise (bloklanmış saat) user objesi None olmalı
         user_data = None
         if uid:
             user_data = {
-                "id":    uid,
-                "name":  (user_map.get(uid) or {}).get("name"),
+                "id": uid,
+                "name": (user_map.get(uid) or {}).get("name"),
                 "phone": (user_map.get(uid) or {}).get("phone"),
                 "email": (user_map.get(uid) or {}).get("email"),
                 "addresses": (user_map.get(uid) or {}).get("addresses"),
             }
 
         results.append({
-            "id":     doc.id,
-            "start":  _to_local_dt(d.get("start")),
-            "end":    _to_local_dt(d.get("end")),
+            "id": doc.id,
+            "start": _to_local_dt(d.get("start")),
+            "end": _to_local_dt(d.get("end")),
             "status": d.get("status", "pending"),
-            "notes":  d.get("notes"),
+            "notes": d.get("notes"),
             "user": user_data,
             "service": {
-                "id":    sid,
+                "id": sid,
                 "title": (svc_map.get(sid) or {}).get("title"),
                 "price": (svc_map.get(sid) or {}).get("price"),
-            }
-        })
-
-    return results
-
-
-@admin_router.get("/", response_model=List[AppointmentAdminOut])
-def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
-    """
-    Admin endpoint – lists all appointments.
-    Optional **status** filter.
-    """
-    query = db.collection("appointments")
-    if status:
-        query = query.where("status", "==", status)
-    appt_docs = list(query.stream())
-    if not appt_docs:
-        return []
-
-    # user_id / service_id kümeleri
-    user_ids = { (d.to_dict() or {}).get("user_id") for d in appt_docs }
-    service_ids = { (d.to_dict() or {}).get("service_id") for d in appt_docs }
-    user_ids.discard(None)
-    service_ids.discard(None)
-
-    user_snaps = db.get_all([db.collection("users").document(uid) for uid in user_ids]) if user_ids else []
-    svc_snaps  = db.get_all([db.collection("services").document(sid) for sid in service_ids]) if service_ids else []
-
-    user_map = {s.id: s.to_dict() for s in user_snaps if s.exists}
-    svc_map  = {s.id: s.to_dict() for s in svc_snaps  if s.exists}
-
-    results = []
-    for doc in appt_docs:
-        d = doc.to_dict() or {}
-        uid = d.get("user_id")
-        sid = d.get("service_id")
-
-        # user_id null ise (bloklanmış saat) user objesi None olmalı
-        user_data = None
-        if uid:
-            user_data = {
-                "id":    uid,
-                "name":  (user_map.get(uid) or {}).get("name"),
-                "phone": (user_map.get(uid) or {}).get("phone"),
-                "email": (user_map.get(uid) or {}).get("email"),
-                "addresses": (user_map.get(uid) or {}).get("addresses"),
-            }
-
-        results.append({
-            "id":     doc.id,
-            "start":  _to_local_dt(d.get("start")),
-            "end":    _to_local_dt(d.get("end")),
-            "status": d.get("status", "pending"),
-            "user": user_data,
-            "service": {
-                "id":    sid,
-                "title": (svc_map.get(sid) or {}).get("title"),
-                "price": (svc_map.get(sid) or {}).get("price"),
-            }
+            },
         })
 
     results.sort(key=lambda x: x["start"] or datetime.min)
     return results
+
+
+@admin_router.get("", response_model=List[AppointmentAdminOut])
+def list_appointments_no_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
+    """Admin endpoint – lists all appointments. Optional **status** filter."""
+    return _fetch_appointments_admin(status)
+
+
+@admin_router.get("/", response_model=List[AppointmentAdminOut])
+def list_appointments_with_slash(status: Optional[str] = Query(None, pattern="^(pending|approved|completed|cancelled)$")):
+    """Admin endpoint – lists all appointments. Optional **status** filter."""
+    return _fetch_appointments_admin(status)
 
 
 @admin_router.post("/", response_model=AppointmentOut)
@@ -435,6 +381,63 @@ def create_appointment(
     return appt_data
 
 
+def _notify_user_status_change(appointment_id: str, new_status: str, appt_data: dict):
+    """
+    Randevu durumu değiştiğinde kullanıcıya FCM push bildirim gönderir.
+    Background thread'de çalıştırılmak üzere tasarlanmıştır.
+    """
+    try:
+        user_id = appt_data.get("user_id")
+        if not user_id:
+            return
+
+        user_doc = db.collection("users").document(user_id).get()
+        if not user_doc.exists:
+            return
+        user_data = user_doc.to_dict() or {}
+        fcm_token = user_data.get("fcm_token")
+        if not fcm_token:
+            return
+
+        status_labels = {
+            "approved": "onaylandı ✅",
+            "cancelled": "iptal edildi ❌",
+            "completed": "tamamlandı 🎉",
+        }
+        status_text = status_labels.get(new_status, f"güncellendi ({new_status})")
+
+        start_dt = _coerce_dt(appt_data.get("start"))
+        date_str = start_dt.strftime("%d/%m/%Y %H:%M") if start_dt else ""
+
+        title = "Randevu Durumu Güncellendi"
+        body = f"{date_str} tarihli randevunuz {status_text}."
+
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                "click_action": "FLUTTER_NOTIFICATION_CLICK",
+                "type": "appointment_status",
+                "appointment_id": appointment_id,
+            },
+            token=fcm_token,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default", priority="high", channel_id="high_importance_channel"
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound="default", badge=1, content_available=True)
+                )
+            ),
+        )
+        messaging.send(message)
+        logger.info("User notification sent for appointment %s status=%s", appointment_id, new_status)
+    except Exception as e:
+        logger.error("Failed to send user status notification: %s", e)
+
+
 @admin_router.put("/{appointment_id}")
 def update_appointment_status_form(
     appointment_id: str,
@@ -448,6 +451,15 @@ def update_appointment_status_form(
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Appointment not found")
     ref.update({"status": status})
+
+    # Kullanıcıya bildirim arka planda
+    appt_data = doc.to_dict() or {}
+    threading.Thread(
+        target=_notify_user_status_change,
+        args=(appointment_id, status, appt_data),
+        daemon=True,
+    ).start()
+
     return {"detail": f"Appointment {appointment_id} updated to {status}"}
 
 
@@ -463,12 +475,21 @@ def update_appointment_status_json(
     doc = ref.get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Appointment not found")
-    
+
     status = status_data.get("status")
     if not status:
         raise HTTPException(status_code=400, detail="Status field is required")
-    
+
     ref.update({"status": status})
+
+    # Kullanıcıya bildirim arka planda
+    appt_data = doc.to_dict() or {}
+    threading.Thread(
+        target=_notify_user_status_change,
+        args=(appointment_id, status, appt_data),
+        daemon=True,
+    ).start()
+
     return {"detail": f"Appointment {appointment_id} updated to {status}"}
 
 

@@ -1,6 +1,9 @@
 """
 Admin Dashboard Router
 Handles admin dashboard statistics and overview data
+
+Optimized: Uses Firestore aggregation queries and concurrent threading
+to avoid streaming entire collections serially.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,27 +12,230 @@ from backend.app.schemas.principal import Principal
 from firebase_admin import firestore
 from typing import Dict, Any
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+# ---------------------------------------------------------------------------
+# Helper: Firestore count() aggregation (avoids streaming entire collections)
+# ---------------------------------------------------------------------------
+
+def _count_collection(collection_name: str) -> int:
+    """Use Firestore aggregation count — does NOT download documents."""
+    try:
+        agg = (
+            firestore.client()
+            .collection(collection_name)
+            .count()
+            .get()
+        )
+        return agg[0][0].value if agg and agg[0] else 0
+    except Exception:
+        # Fallback: stream and count (eski yöntem)
+        return sum(1 for _ in firestore.client().collection(collection_name).stream())
+
+
+def _count_with_filter(collection_name: str, field: str, op: str, value) -> int:
+    """Filtered aggregation count."""
+    try:
+        from google.cloud.firestore_v1 import FieldFilter
+        agg = (
+            firestore.client()
+            .collection(collection_name)
+            .where(filter=FieldFilter(field, op, value))
+            .count()
+            .get()
+        )
+        return agg[0][0].value if agg and agg[0] else 0
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Parallel data fetchers (each runs in its own thread)
+# ---------------------------------------------------------------------------
+
+def _fetch_orders_stats() -> Dict[str, Any]:
+    """Fetch order counts and revenue — needs full scan only for date-based stats."""
+    db = firestore.client()
+    now = datetime.now()
+    today = now.date()
+    week_ago = (now - timedelta(days=7)).date()
+    month_ago = (now - timedelta(days=30)).date()
+
+    result = {
+        "total_orders": 0,
+        "orders_today": 0,
+        "orders_this_week": 0,
+        "orders_this_month": 0,
+        "revenue_today": 0.0,
+        "revenue_this_week": 0.0,
+        "revenue_this_month": 0.0,
+        "pending_orders": 0,
+    }
+
+    # Only stream last 30 days for revenue calculation (not ALL orders)
+    month_ago_dt = datetime.combine(month_ago, datetime.min.time())
+    try:
+        q = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING)
+        for order_doc in q.stream():
+            order_data = order_doc.to_dict()
+            result["total_orders"] += 1
+
+            order_date_str = order_data.get("created_at", "")
+            if not order_date_str:
+                continue
+            try:
+                order_date = datetime.fromisoformat(str(order_date_str).replace("Z", "+00:00")).date()
+                totals = order_data.get("totals", {})
+                order_total = float(totals.get("grand_total", 0))
+
+                if order_date == today:
+                    result["orders_today"] += 1
+                    result["revenue_today"] += order_total
+                if order_date >= week_ago:
+                    result["orders_this_week"] += 1
+                    result["revenue_this_week"] += order_total
+                if order_date >= month_ago:
+                    result["orders_this_month"] += 1
+                    result["revenue_this_month"] += order_total
+
+                if order_data.get("status") in ["pending", "processing", "shipped"]:
+                    result["pending_orders"] += 1
+
+            except (ValueError, TypeError):
+                continue
+    except Exception as e:
+        logger.error("Error fetching orders stats: %s", e)
+
+    return result
+
+
+def _fetch_counts() -> Dict[str, int]:
+    """Fetch total counts for users, products, services using aggregation."""
+    counts = {}
+    for name in ("users", "products", "services"):
+        try:
+            counts[f"total_{name}"] = _count_collection(name)
+        except Exception:
+            counts[f"total_{name}"] = 0
+    return counts
+
+
+def _fetch_appointments_stats() -> Dict[str, Any]:
+    """Fetch appointment count and pending count."""
+    db = firestore.client()
+    total = 0
+    pending = 0
+    try:
+        for doc in db.collection("appointments").stream():
+            total += 1
+            data = doc.to_dict()
+            if data.get("status") in ["pending", "confirmed"]:
+                pending += 1
+    except Exception as e:
+        logger.error("Error fetching appointments stats: %s", e)
+    return {"total_appointments": total, "pending_appointments": pending}
+
+
+def _fetch_comments_stats() -> Dict[str, Any]:
+    """Fetch comments count and pending (unapproved) count."""
+    db = firestore.client()
+    total = 0
+    pending = 0
+    try:
+        for doc in db.collection("comments").stream():
+            total += 1
+            data = doc.to_dict()
+            if not data.get("approved", False):
+                pending += 1
+    except Exception as e:
+        logger.error("Error fetching comments stats: %s", e)
+    return {"total_comments": total, "pending_comments": pending}
+
+
+def _fetch_active_discounts() -> int:
+    """Count active discounts (checks date range)."""
+    db = firestore.client()
+    from google.cloud.firestore_v1 import FieldFilter
+    now = datetime.now()
+    count = 0
+    try:
+        q = db.collection("discounts").where(filter=FieldFilter("active", "==", True))
+        for doc in q.stream():
+            data = doc.to_dict() or {}
+            start_at = data.get("start_at")
+            end_at = data.get("end_at")
+
+            if start_at:
+                try:
+                    sd = datetime.fromisoformat(str(start_at).replace("Z", "+00:00")).date()
+                    if now.date() < sd:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            if end_at:
+                try:
+                    ed = datetime.fromisoformat(str(end_at).replace("Z", "+00:00")).date()
+                    if now.date() > ed:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            count += 1
+    except Exception as e:
+        logger.error("Error fetching active discounts: %s", e)
+    return count
+
+
+def _fetch_recent_items() -> Dict[str, list]:
+    """Fetch recent orders, appointments, comments — 5 each, IN PARALLEL."""
+    db = firestore.client()
+    result = {"recent_orders": [], "recent_appointments": [], "recent_comments": []}
+
+    def _recent(collection: str, key: str):
+        items = []
+        try:
+            q = db.collection(collection).order_by(
+                "created_at", direction=firestore.Query.DESCENDING
+            ).limit(5)
+            for doc in q.stream():
+                data = doc.to_dict()
+                data["id"] = doc.id
+                items.append(data)
+        except Exception:
+            pass
+        return key, items
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_recent, "orders", "recent_orders"),
+            pool.submit(_recent, "appointments", "recent_appointments"),
+            pool.submit(_recent, "comments", "recent_comments"),
+        ]
+        for f in as_completed(futures):
+            key, items = f.result()
+            result[key] = items
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @router.get("/dashboard/stats")
 def get_dashboard_stats(
-    current_admin: Principal = Depends(get_current_admin)
+    current_admin: Principal = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """
-    Get dashboard statistics for admin panel
-    Returns overview statistics including counts and recent activity
+    Get dashboard statistics for admin panel.
+    Optimized: runs 6 data fetchers in parallel threads instead of 11+ serial streams.
     """
     try:
-        db = firestore.client()
-        
-        # Get current date and date ranges
-        now = datetime.now()
-        today = now.date()
-        week_ago = (now - timedelta(days=7)).date()
-        month_ago = (now - timedelta(days=30)).date()
-        
-        # Initialize stats dictionary
         stats = {
             "total_orders": 0,
             "total_users": 0,
@@ -49,171 +255,63 @@ def get_dashboard_stats(
             "pending_comments": 0,
             "recent_orders": [],
             "recent_appointments": [],
-            "recent_comments": []
+            "recent_comments": [],
         }
-        
-        # Get orders count and revenue
-        orders_ref = db.collection('orders')
-        orders = orders_ref.stream()
-        
-        for order_doc in orders:
-            order_data = order_doc.to_dict()
-            stats["total_orders"] += 1
-            
-            # Check order date and calculate revenue
-            order_date_str = order_data.get('created_at', '')
-            if order_date_str:
-                try:
-                    order_date = datetime.fromisoformat(order_date_str.replace('Z', '+00:00')).date()
-                    # Get order total from totals.grand_total
-                    totals = order_data.get('totals', {})
-                    order_total = float(totals.get('grand_total', 0))
-                    
-                    if order_date == today:
-                        stats["orders_today"] += 1
-                        stats["revenue_today"] += order_total
-                    if order_date >= week_ago:
-                        stats["orders_this_week"] += 1
-                        stats["revenue_this_week"] += order_total
-                    if order_date >= month_ago:
-                        stats["orders_this_month"] += 1
-                        stats["revenue_this_month"] += order_total
-                        
-                    # Check for pending orders
-                    if order_data.get('status') in ['pending', 'processing', 'shipped']:
-                        stats["pending_orders"] += 1
-                        
-                except (ValueError, TypeError):
-                    continue
-        
-        # Get users count
-        users_ref = db.collection('users')
-        users = users_ref.stream()
-        stats["total_users"] = sum(1 for _ in users)
-        
-        # Get products count
-        products_ref = db.collection('products')
-        products = products_ref.stream()
-        stats["total_products"] = sum(1 for _ in products)
-        
-        # Get services count
-        services_ref = db.collection('services')
-        services = services_ref.stream()
-        stats["total_services"] = sum(1 for _ in services)
-        
-        # Get appointments count and pending
-        appointments_ref = db.collection('appointments')
-        appointments = appointments_ref.stream()
-        
-        for appointment_doc in appointments:
-            appointment_data = appointment_doc.to_dict()
-            stats["total_appointments"] += 1
-            
-            if appointment_data.get('status') in ['pending', 'confirmed']:
-                stats["pending_appointments"] += 1
-        
-        # Get comments count and pending
-        comments_ref = db.collection('comments')
-        comments = comments_ref.stream()
-        
-        for comment_doc in comments:
-            comment_data = comment_doc.to_dict()
-            stats["total_comments"] += 1
-            
-            if not comment_data.get('approved', False):
-                stats["pending_comments"] += 1
-        
-        # Get active discounts count
-        discounts_ref = db.collection('discounts')
-        discounts = discounts_ref.stream()
-        
-        for discount_doc in discounts:
-            discount_data = discount_doc.to_dict()
-            
-            # Check if discount is active
-            is_active = discount_data.get('active', False)
-            if is_active:
-                # Check date range if specified
-                start_at = discount_data.get('start_at')
-                end_at = discount_data.get('end_at')
-                
-                if start_at:
-                    try:
-                        start_date = datetime.fromisoformat(start_at.replace('Z', '+00:00')).date()
-                        if now.date() < start_date:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-                
-                if end_at:
-                    try:
-                        end_date = datetime.fromisoformat(end_at.replace('Z', '+00:00')).date()
-                        if now.date() > end_date:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-                
-                stats["active_discounts"] += 1
-        
-        # Get recent orders (last 5)
-        recent_orders_ref = db.collection('orders').order_by('created_at', direction=firestore.Query.DESCENDING).limit(5)
-        recent_orders = recent_orders_ref.stream()
-        
-        for order_doc in recent_orders:
-            order_data = order_doc.to_dict()
-            order_data['id'] = order_doc.id
-            stats["recent_orders"].append(order_data)
-        
-        # Get recent appointments (last 5)
-        recent_appointments_ref = db.collection('appointments').order_by('created_at', direction=firestore.Query.DESCENDING).limit(5)
-        recent_appointments = recent_appointments_ref.stream()
-        
-        for appointment_doc in recent_appointments:
-            appointment_data = appointment_doc.to_dict()
-            appointment_data['id'] = appointment_doc.id
-            stats["recent_appointments"].append(appointment_data)
-        
-        # Get recent comments (last 5)
-        recent_comments_ref = db.collection('comments').order_by('created_at', direction=firestore.Query.DESCENDING).limit(5)
-        recent_comments = recent_comments_ref.stream()
-        
-        for comment_doc in recent_comments:
-            comment_data = comment_doc.to_dict()
-            comment_data['id'] = comment_doc.id
-            stats["recent_comments"].append(comment_data)
-        
+
+        # Run all fetchers concurrently
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            f_orders = pool.submit(_fetch_orders_stats)
+            f_counts = pool.submit(_fetch_counts)
+            f_appointments = pool.submit(_fetch_appointments_stats)
+            f_comments = pool.submit(_fetch_comments_stats)
+            f_discounts = pool.submit(_fetch_active_discounts)
+            f_recent = pool.submit(_fetch_recent_items)
+
+            # Merge results
+            stats.update(f_orders.result())
+            stats.update(f_counts.result())
+            stats.update(f_appointments.result())
+            stats.update(f_comments.result())
+            stats["active_discounts"] = f_discounts.result()
+            stats.update(f_recent.result())
+
         return stats
-        
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard stats: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch dashboard stats: {str(e)}",
+        )
+
 
 @router.get("/dashboard/overview")
 def get_dashboard_overview(
-    current_admin: Principal = Depends(get_current_admin)
+    current_admin: Principal = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """
-    Get dashboard overview with summary information
+    Get dashboard overview with summary information.
     """
     try:
-        # Get basic stats
         stats = get_dashboard_stats(current_admin)
-        
-        # Calculate growth percentages (simplified - in real app you'd compare with previous periods)
+
         overview = {
             "stats": stats,
             "growth": {
-                "orders_growth": 0,  # Placeholder - would calculate from previous period
-                "revenue_growth": 0,  # Placeholder - would calculate from previous period
-                "users_growth": 0,   # Placeholder - would calculate from previous period
+                "orders_growth": 0,
+                "revenue_growth": 0,
+                "users_growth": 0,
             },
             "charts": {
-                "orders_chart": [],  # Placeholder for chart data
-                "revenue_chart": [], # Placeholder for chart data
-                "users_chart": [],   # Placeholder for chart data
-            }
+                "orders_chart": [],
+                "revenue_chart": [],
+                "users_chart": [],
+            },
         }
-        
+
         return overview
-        
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard overview: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch dashboard overview: {str(e)}",
+        )

@@ -9,8 +9,6 @@ from datetime import datetime
 import asyncio
 import json
 import logging
-import threading
-from queue import Queue, Empty
 
 from backend.app.core.security import get_current_admin
 from backend.app.config import db
@@ -206,168 +204,114 @@ def clear_all_notifications(_: dict = Depends(get_current_admin)):
 
 
 @router.get("/stream")
-def stream_admin_notifications(_: dict = Depends(get_current_admin)):
+async def stream_admin_notifications(_: dict = Depends(get_current_admin)):
     """
     Server-Sent Events (SSE) endpoint for real-time admin notifications.
-    Streams new notifications as they are created in Firestore.
+    Uses asyncio.Queue to bridge Firestore's threaded listener with the
+    async event loop — no blocking calls on the event loop.
     """
     async def event_generator():
-        """Async generator that yields SSE events"""
-        message_queue = Queue()
-        listener_stopped = threading.Event()
+        loop = asyncio.get_event_loop()
+        aqueue: asyncio.Queue = asyncio.Queue()
         is_first_snapshot = True
-        existing_notification_ids = set()
-        connection_start_time = None  # Will be set after first snapshot
-        
+        existing_notification_ids: set = set()
+        connection_start_time = None
+        listener = None
+
         def on_snapshot(doc_snapshot, changes, read_time):
-            """Firestore listener callback"""
+            """Firestore listener callback — runs in a background thread."""
             nonlocal is_first_snapshot, existing_notification_ids, connection_start_time
-            
+
             try:
-                # On first snapshot, collect existing notification IDs to ignore them
                 if is_first_snapshot:
                     for doc in doc_snapshot:
                         existing_notification_ids.add(doc.id)
                     is_first_snapshot = False
-                    # Use naive datetime for comparison
                     connection_start_time = datetime.utcnow().replace(tzinfo=None)
                     logger.info(f"SSE: Initial snapshot with {len(existing_notification_ids)} existing notifications")
                     return
-                
-                # Process changes (only new notifications after initial snapshot)
+
                 for change in changes:
                     if change.type.name == 'ADDED':
-                        # New notification added (after initial snapshot)
                         doc = change.document
-                        
-                        # Skip if this was in the initial snapshot
                         if doc.id in existing_notification_ids:
                             continue
-                            
                         data = doc.to_dict() or {}
-                        
-                        # Only send unread notifications
                         if data.get("is_read", False):
                             continue
-                        
-                        # Parse created_at
                         created_at = _parse_datetime(data.get("created_at"))
-                        
-                        # Check if notification was created after connection start (safety check)
-                        # Skip this check if connection_start_time is not set yet
-                        if connection_start_time and created_at:
-                            if created_at < connection_start_time:
-                                # This notification was created before we connected, skip it
-                                existing_notification_ids.add(doc.id)
-                                continue
-                            
-                        # Format created_at for JSON serialization
+                        if connection_start_time and created_at and created_at < connection_start_time:
+                            existing_notification_ids.add(doc.id)
+                            continue
                         created_at_str = created_at.isoformat() if created_at else None
-                        
                         notification_data = {
                             "id": doc.id,
                             "title": data.get("title", ""),
                             "body": data.get("body", ""),
                             "type": data.get("type", "system"),
-                            "is_read": data.get("is_read", False),
+                            "is_read": False,
                             "created_at": created_at_str,
                             "data": data.get("data")
                         }
-                        
-                        message_queue.put({
-                            "type": "notification",
-                            "data": notification_data
-                        })
-                        logger.info(f"SSE: New notification {doc.id} queued - {notification_data.get('title', 'No title')}")
-                        
+                        loop.call_soon_threadsafe(
+                            aqueue.put_nowait,
+                            {"type": "notification", "data": notification_data}
+                        )
+                        logger.info(f"SSE: New notification {doc.id} queued")
+
                     elif change.type.name == 'MODIFIED':
-                        # Notification updated (e.g., marked as read)
                         doc = change.document
                         data = doc.to_dict() or {}
-                        
-                        # Only send if it affects unread count
-                        if data.get("is_read") == True:
-                            message_queue.put({
-                                "type": "notification_updated",
-                                "data": {
-                                    "id": doc.id,
-                                    "is_read": True
-                                }
-                            })
-                            logger.info(f"SSE: Notification {doc.id} marked as read")
-                            
-                            # Recalculate and send updated unread count
-                            try:
-                                all_notifications = db.collection("admin_notifications").stream()
-                                unread_count = 0
-                                for notification_doc in all_notifications:
-                                    notification_data = notification_doc.to_dict() or {}
-                                    if not notification_data.get("is_read", False):
-                                        unread_count += 1
-                                message_queue.put({
-                                    "type": "unread_count",
-                                    "count": unread_count
-                                })
-                                logger.info(f"SSE: Unread count updated to {unread_count}")
-                            except Exception as e:
-                                logger.error(f"Error calculating unread count after update: {e}")
+                        if data.get("is_read") is True:
+                            loop.call_soon_threadsafe(
+                                aqueue.put_nowait,
+                                {"type": "notification_updated", "data": {"id": doc.id, "is_read": True}}
+                            )
             except Exception as e:
                 logger.error(f"Error in Firestore listener: {e}")
-                message_queue.put({
-                    "type": "error",
-                    "data": {"message": str(e)}
-                })
-        
-        # Set up Firestore listener for new notifications
-        # Listen to all notifications (no order_by to avoid index requirement)
-        # We'll filter and process in the callback
+
+        # Start Firestore listener
         query = db.collection("admin_notifications")
-        
-        # Start listening
-        # Note: on_snapshot returns a Watch object that runs in a background thread
         listener = query.on_snapshot(on_snapshot)
-        
+
         try:
-            # Send initial heartbeat
+            # Connected event
             yield f"data: {json.dumps({'type': 'connected', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
-            
-            # Send initial unread count
-            # Count unread notifications manually to avoid index requirement
+
+            # Initial unread count — blocking Firestore call runs in thread
             try:
-                all_notifications = db.collection("admin_notifications").stream()
-                unread_count = 0
-                for doc in all_notifications:
-                    data = doc.to_dict() or {}
-                    if not data.get("is_read", False):
-                        unread_count += 1
+                def _count_unread():
+                    count = 0
+                    for doc in db.collection("admin_notifications").stream():
+                        d = doc.to_dict() or {}
+                        if not d.get("is_read", False):
+                            count += 1
+                    return count
+
+                unread_count = await asyncio.to_thread(_count_unread)
                 yield f"data: {json.dumps({'type': 'unread_count', 'count': unread_count})}\n\n"
             except Exception as e:
                 logger.error(f"Error getting initial unread count: {e}")
-                # Send 0 as fallback
                 yield f"data: {json.dumps({'type': 'unread_count', 'count': 0})}\n\n"
-            
-            # Heartbeat interval (30 seconds)
+
             last_heartbeat = datetime.utcnow()
             heartbeat_interval = 30
-            
+
             while True:
                 try:
-                    # Check for messages from Firestore listener (non-blocking)
+                    # Non-blocking wait on asyncio.Queue (max 1 sec)
                     try:
-                        message = message_queue.get(timeout=1)
+                        message = await asyncio.wait_for(aqueue.get(), timeout=1.0)
                         yield f"data: {json.dumps(message)}\n\n"
-                    except Empty:
+                    except asyncio.TimeoutError:
                         pass
-                    
-                    # Send heartbeat periodically
+
+                    # Heartbeat
                     now = datetime.utcnow()
                     if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
                         yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': now.isoformat()})}\n\n"
                         last_heartbeat = now
-                    
-                    # Small sleep to prevent busy waiting
-                    await asyncio.sleep(0.1)
-                    
+
                 except asyncio.CancelledError:
                     logger.info("SSE stream cancelled")
                     break
@@ -375,26 +319,22 @@ def stream_admin_notifications(_: dict = Depends(get_current_admin)):
                     logger.error(f"Error in event generator: {e}")
                     yield f"data: {json.dumps({'type': 'error', 'data': {'message': str(e)}})}\n\n"
                     await asyncio.sleep(1)
-        
+
         finally:
-            # Clean up: Firestore Watch object doesn't have stop() or unsubscribe()
-            # The listener will automatically stop when the connection closes
-            # We just need to mark it as stopped
-            try:
-                # Firestore Watch runs in a background thread and will stop automatically
-                # when the connection is closed. No explicit stop needed.
-                pass
-            except Exception as e:
-                logger.error(f"Error in cleanup: {e}")
-            listener_stopped.set()
-            logger.info("SSE stream closed, Firestore listener will stop automatically")
-    
+            # Properly unsubscribe the Firestore listener
+            if listener is not None:
+                try:
+                    listener.unsubscribe()
+                except Exception as e:
+                    logger.error(f"Error unsubscribing listener: {e}")
+            logger.info("SSE stream closed, Firestore listener unsubscribed")
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # Disable nginx buffering
+            "X-Accel-Buffering": "no"
         }
     )

@@ -40,17 +40,15 @@ def _list_categories_impl(response: Response):
     - `created_at` varsa DESC sıralama
     - Varsayılan limit: 50
     - Sabit kategori (is_fixed=True) ilk sırada döner
+
+    Optimized: Tek Firestore sorgusu ile hem fixed hem diğer kategorileri alır.
     """
     col = db.collection("categories")
 
-    fixed_id = _get_fixed_category_id()
-
-    # Diğerleri (non-deleted), created_at DESC sıralı
     q = col.where(filter=FieldFilter("is_deleted", "==", False))
     try:
         q = q.order_by("created_at", direction=gcf.Query.DESCENDING)
     except Exception:
-        # created_at olmayan eski kayıtlar için sıralama yutulur
         pass
 
     docs = list(q.limit(50).stream())
@@ -69,7 +67,8 @@ def _list_categories_impl(response: Response):
             cover_image=data.get("cover_image"),
             is_fixed=bool(data.get("is_fixed", False)),
         )
-        if d.id == fixed_id and fixed_out is None:
+        # Detect fixed category from the same query results (no extra query)
+        if data.get("is_fixed", False) and fixed_out is None:
             fixed_out = item
         else:
             others.append(item)

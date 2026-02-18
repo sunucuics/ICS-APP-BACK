@@ -420,20 +420,12 @@ def get_product(product_id: str):
         raise HTTPException(status_code=404, detail="Product not found")
 
     src = snap.to_dict() or {}
-    
-    # DEBUG: Veritabanından gelen ham değerleri logla
-    print(f"[DEBUG PRODUCT] ID: {product_id}")
-    print(f"[DEBUG PRODUCT] Raw price from DB: {src.get('price')}")
-    print(f"[DEBUG PRODUCT] Raw final_price from DB: {src.get('final_price')}")
-    
+
     # final_price'ı dinamik olarak hesapla (indirimler dahil)
     p_id = src.get("id", snap.id)
     category_id = src.get("category_id")
     base_price = float(src.get("price", 0))
     calculated_final_price = _calculate_final_price(p_id, category_id, base_price)
-    
-    print(f"[DEBUG PRODUCT] Calculated final_price: {calculated_final_price}")
-    print(f"[DEBUG PRODUCT] Returning price: {base_price}, final_price: {calculated_final_price}")
     
     return ProductOut(
         id=p_id,
@@ -718,37 +710,10 @@ def update_product(product_id: str, product_update: ProductUpdate):
     updated_doc["id"] = product_id
 
     base_price = float(updated_doc.get("price", 0.0))
-    now = datetime.now(timezone.utc)
-
-    best_percent = 0.0
-
-    # 1) Product discount
-    prod_q = (
-        db.collection("discounts")
-        .where(filter=FieldFilter("active", "==", True))
-        .where(filter=FieldFilter("target_type", "==", "product"))
-        .where(filter=FieldFilter("target_id", "==", product_id))
-    )
-    for ds in prod_q.stream():
-        d = ds.to_dict() or {}
-        if _is_window_active(d.get("start_at"), d.get("end_at"), now):
-            best_percent = max(best_percent, float(d.get("percent", 0.0)))
-
-    # 2) Category discount (category_id varsa)
     category_id = updated_doc.get("category_id")
-    if category_id:
-        cat_q = (
-            db.collection("discounts")
-            .where(filter=FieldFilter("active", "==", True))
-            .where(filter=FieldFilter("target_type", "==", "category"))
-            .where(filter=FieldFilter("target_id", "==", category_id))
-        )
-        for ds in cat_q.stream():
-            d = ds.to_dict() or {}
-            if _is_window_active(d.get("start_at"), d.get("end_at"), now):
-                best_percent = max(best_percent, float(d.get("percent", 0.0)))
 
-    final_price = round(base_price * (100.0 - best_percent) / 100.0, 2) if best_percent else round(base_price, 2)
+    # Reuse existing helper (single function, 1-2 queries max)
+    final_price = _calculate_final_price(product_id, category_id, base_price)
     updated_doc["final_price"] = final_price
 
     # final_price'ı da db'ye yazalım ki listelerde tutarlı olsun

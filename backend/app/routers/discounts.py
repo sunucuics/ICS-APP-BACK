@@ -12,9 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status, Form
 from pydantic import BaseModel
 from google.cloud.firestore_v1 import FieldFilter
 
+import logging
+
 from backend.app.config import db
 from backend.app.core.security import get_current_admin
 from backend.app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountOut
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -169,44 +173,78 @@ def _recalc_product_final_price(product_id: str, category_id: Optional[str] = No
             item.reference.update({"final_price": new_final})
 
 
+def _load_all_active_discounts_map() -> dict:
+    """
+    Tüm aktif indirimleri TEK SEFERDE yükler.
+    Returns: { "product": {target_id: best_pct}, "category": {target_id: best_pct} }
+    """
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+    result = {"product": {}, "category": {}}
+    try:
+        q = db.collection("discounts").where(filter=FieldFilter("active", "==", True))
+        for snap in q.stream():
+            d = snap.to_dict() or {}
+            if not _is_window_active(d.get("start_at"), d.get("end_at"), now):
+                continue
+            t_type = d.get("target_type", "")
+            t_id = d.get("target_id", "")
+            pct = float(d.get("percent", 0.0))
+            if t_type in result and t_id:
+                result[t_type][t_id] = max(result[t_type].get(t_id, 0.0), pct)
+    except Exception:
+        pass
+    return result
+
+
 def _recalc_category_products_final_price(category_id: str) -> int:
     """
     Belirli bir kategorideki TÜM ürünlerin final_price değerlerini yeniden hesaplar.
-    Kategori indirimi oluşturulduğunda/güncellendiğinde/silindiğinde çağrılır.
-    Returns: Güncellenen ürün sayısı
+
+    Optimized: Tüm aktif indirimler TEK SEFERDE yüklenir, sonra her ürün için
+    cache'den hesaplanır. N+1 query sorunu çözüldü.
     """
+    import logging
+    logger = logging.getLogger(__name__)
     updated_count = 0
-    
-    # collection_group("items") ile category_id filtresi index gerektirdiğinden,
-    # tüm ürünleri çekip kod seviyesinde filtreliyoruz
+
     try:
+        # 1) Tüm aktif indirimleri TEK SORGUDA yükle
+        discount_map = _load_all_active_discounts_map()
+
+        # 2) Kategorideki ürünleri stream et
         items = db.collection_group("items").stream()
-        
+
         for item in items:
             pdata = item.to_dict() or {}
-            
-            # Sadece bu kategorideki ürünleri işle
+
             if pdata.get("category_id") != category_id:
                 continue
-            
+
             product_id = pdata.get("id")
             if not product_id:
                 continue
-                
-            # is_deleted ürünleri atla
+
             if pdata.get("is_deleted", False):
                 continue
-                
+
             base_price = float(pdata.get("price", 0.0))
-            pct = _best_discount_percent_for_product(product_id, category_id)
-            new_final = round(base_price * (100.0 - pct) / 100.0, 2)
-            
+
+            # Cache'den en iyi indirimi bul (EK SORGU YOK)
+            best_pct = 0.0
+            prod_pct = discount_map.get("product", {}).get(product_id, 0.0)
+            cat_pct = discount_map.get("category", {}).get(category_id, 0.0)
+            best_pct = max(prod_pct, cat_pct)
+
+            new_final = round(base_price * (100.0 - best_pct) / 100.0, 2)
+
             if pdata.get("final_price") != new_final:
                 item.reference.update({"final_price": new_final})
                 updated_count += 1
+
     except Exception as e:
-        print(f"⚠️ Error recalculating category products: {e}")
-    
+        logger.error("Error recalculating category products: %s", e)
+
     return updated_count
 
 
@@ -214,14 +252,11 @@ def _recalc_category_products_final_price(category_id: str) -> int:
 # Routes (form tabanlı)
 # ---------------------------------------------------------------------
 
-@router.get("", response_model=List[DiscountOut], summary="List Discounts (no slash)")
-def list_discounts_no_slash(
-    product_id: Optional[str] = Query(None, description="Belirli ürün ID'sine ait indirimler"),
-    active: Optional[bool] = Query(None, description="Aktif filtre"),
-):
-    """
-    Tüm indirimleri listeler (product ve category). Opsiyonel ürün ve aktiflik filtresi.
-    """
+def _list_discounts_impl(
+    product_id: Optional[str] = None,
+    active: Optional[bool] = None,
+) -> List[DiscountOut]:
+    """Shared implementation for list discounts."""
     q = db.collection("discounts")
     if product_id:
         q = q.where(filter=FieldFilter("target_id", "==", product_id))
@@ -232,19 +267,25 @@ def list_discounts_no_slash(
     for doc in q.stream():
         data = doc.to_dict() or {}
         target_type = data.get("target_type", "product")
-        # Only include product and category discounts
         if target_type in ["product", "category"]:
-            target_id = data.get("target_id") or ""
             out.append(DiscountOut(
                 id=doc.id,
                 target_type=target_type,
-                target_id=target_id,
+                target_id=data.get("target_id") or "",
                 percent=float(data.get("percent", 0.0)),
                 active=bool(data.get("active", False)),
                 start_at=data.get("start_at"),
                 end_at=data.get("end_at"),
             ))
     return out
+
+
+@router.get("", response_model=List[DiscountOut], summary="List Discounts (no slash)")
+def list_discounts_no_slash(
+    product_id: Optional[str] = Query(None, description="Belirli ürün ID'sine ait indirimler"),
+    active: Optional[bool] = Query(None, description="Aktif filtre"),
+):
+    return _list_discounts_impl(product_id, active)
 
 
 @router.get("/", response_model=List[DiscountOut], summary="List Discounts")
@@ -252,32 +293,7 @@ def list_discounts(
     product_id: Optional[str] = Query(None, description="Belirli ürün ID'sine ait indirimler"),
     active: Optional[bool] = Query(None, description="Aktif filtre"),
 ):
-    """
-    Tüm indirimleri listeler (product ve category). Opsiyonel ürün ve aktiflik filtresi.
-    """
-    q = db.collection("discounts")
-    if product_id:
-        q = q.where(filter=FieldFilter("target_id", "==", product_id))
-    if active is not None:
-        q = q.where(filter=FieldFilter("active", "==", bool(active)))
-
-    out: List[DiscountOut] = []
-    for doc in q.stream():
-        data = doc.to_dict() or {}
-        target_type = data.get("target_type", "product")
-        # Only include product and category discounts
-        if target_type in ["product", "category"]:
-            target_id = data.get("target_id") or ""
-            out.append(DiscountOut(
-                id=doc.id,
-                target_type=target_type,
-                target_id=target_id,
-                percent=float(data.get("percent", 0.0)),
-                active=bool(data.get("active", False)),
-                start_at=data.get("start_at"),
-                end_at=data.get("end_at"),
-            ))
-    return out
+    return _list_discounts_impl(product_id, active)
 
 
 @router.get("/{discount_id}", response_model=DiscountOut, summary="Get Discount")
@@ -340,7 +356,7 @@ def create_discount_json_no_slash(request: DiscountCreateRequest):
         elif request.targetType == "category":
             # Kategori indirimi: Bu kategorideki TÜM ürünlerin fiyatlarını güncelle
             updated = _recalc_category_products_final_price(request.targetId)
-            print(f"✅ Category discount created: {updated} products updated")
+            logger.info("Category discount created: %d products updated", updated)
 
     return DiscountOut(
         id=ref.id,
@@ -456,7 +472,7 @@ def update_discount_json(
             _recalc_product_final_price(final_target_id)
         elif final_target_type == "category":
             updated = _recalc_category_products_final_price(final_target_id)
-            print(f"✅ Category discount updated: {updated} products updated")
+            logger.info("Category discount updated: %d products updated", updated)
     
     # Eski hedef değiştiyse, eski hedefi de güncelle
     if old_target_id and old_target_id != final_target_id:
@@ -464,7 +480,7 @@ def update_discount_json(
             _recalc_product_final_price(old_target_id)
         elif old_target_type == "category":
             updated = _recalc_category_products_final_price(old_target_id)
-            print(f"✅ Old category products updated: {updated} products")
+            logger.info("Old category products updated: %d products", updated)
 
     fresh = ref.get().to_dict() or {}
     final_target_type = fresh.get("target_type", target_type)
@@ -533,7 +549,7 @@ def update_discount_product(
             _recalc_product_final_price(target_id)
         elif target_type == "category":
             updated = _recalc_category_products_final_price(target_id)
-            print(f"✅ Category discount updated (form): {updated} products updated")
+            logger.info("Category discount updated (form): %d products updated", updated)
 
     fresh = ref.get().to_dict() or {}
     return DiscountOut(
@@ -575,10 +591,10 @@ def delete_discount(discount_id: str):
             elif target_type == "category":
                 # Kategori indirimi silindi: Bu kategorideki TÜM ürünlerin fiyatlarını güncelle
                 updated = _recalc_category_products_final_price(target_id)
-                print(f"✅ Category discount deleted: {updated} products updated")
+                logger.info("Category discount deleted: %d products updated", updated)
     except Exception as e:
         # Fiyat güncelleme hatası olsa bile indirim silindi, sadece logla
-        print(f"⚠️ Warning: Discount deleted but price recalculation failed: {e}")
+        logger.warning("Discount deleted but price recalculation failed: %s", e)
         # Response yine de başarılı dön (indirim silindi)
 
     return {"detail": "Discount deleted"}

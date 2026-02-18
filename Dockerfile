@@ -20,12 +20,11 @@ RUN pip install --upgrade pip --root-user-action=ignore
 COPY requirements.txt .
 RUN pip install --root-user-action=ignore -r requirements.txt
 
-# Uygulama + opsiyonel dosyalar (alembic varsa gelir, yoksa sorun olmaz)
+# Uygulama + opsiyonel dosyalar
 COPY backend/ ./backend/
 COPY entrypoint.sh ./
-
-# Debug: Check if firebase service account file was copied
-RUN ls -la /app/backend/ | grep firebase || echo "Firebase file not found!"
+COPY .env .env
+COPY firebase_service_account.json ./backend/firebase_service_account.json
 
 # Windows satır sonu düzelt + izinler
 RUN sed -i 's/\r$//' ./entrypoint.sh || true \

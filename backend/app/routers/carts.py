@@ -1,28 +1,18 @@
 """
 app/routers/carts.py
-Cart endpoints (logged-in users): add by id, remove one, clear, get full cart (via /products),
-and get current total (via /products).
+Cart endpoints (logged-in users): add by id, remove one, clear, get full cart, get total.
 
-Behavior
-- Add uses ONLY product_id + quantity (no DB read).
-- GET /cart fetches the current catalog from your existing /products API and returns:
-  title, description, images[0], price/final_price, stock, category_name, qty, base_subtotal, total_base.
-  (No discounts applied here: it mirrors the info users expect in an Amazon-style cart page.)
-- GET /cart/total fetches the same catalog and returns only total_quantity and total_price,
-  using final_price when provided (so if admin adds a discount → your total updates automatically).
-
-Notes
-- Prefix-aware carts collection via FIREBASE_COLLECTION_PREFIX.
-- Zero unnecessary complexity; fast and predictable.
+Optimized: Removed self-referencing HTTP loopback (_fetch_products_via_api).
+Now queries Firestore directly with batch get (db.get_all) for O(1) per product.
 """
 
 import os
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, validator
+from google.cloud.firestore_v1 import FieldFilter
 
 from backend.app.core.security import get_current_user
 from backend.app.config import db
@@ -32,8 +22,10 @@ router = APIRouter(prefix="/cart", tags=["Cart"])
 # ---------- prefix-aware carts storage ----------
 _PREFIX = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
 
+
 def _prefixed(name: str) -> str:
     return f"{_PREFIX}{name}" if _PREFIX else name
+
 
 _CARTS = _prefixed("carts")
 
@@ -61,6 +53,7 @@ def _first_image(images: Any) -> Optional[str]:
         return str(val) if val is not None else None
     return None
 
+
 def _money_from_product(p: Dict[str, Any]) -> Decimal:
     # Prefer final_price if present; else price
     if p.get("final_price") is not None:
@@ -77,48 +70,61 @@ def _load_cart(uid: str) -> Dict[str, Any]:
         return data
     return {"items": []}
 
+
 def _save_cart(uid: str, cart: Dict[str, Any]) -> None:
     db.collection(_CARTS).document(uid).set(cart)
 
 
-# ---------- catalog (via your /products API) ----------
-def _fetch_products_via_api(request: Request) -> List[Dict[str, Any]]:
+# ---------- catalog (direct Firestore query — replaces self-referencing HTTP) ----------
+def _fetch_products_by_ids(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """
-    Calls your own /products endpoint to ensure we use the SAME IDs and fields users see in Swagger.
-    Works even if products live in a prefixed or nested collection.
+    Fetch products directly from Firestore collection_group by their IDs.
+    Uses individual queries since collection_group doesn't support get_all.
+    Returns a dict keyed by product ID.
     """
-    base = str(request.base_url).rstrip("/")
-    url = f"{base}/products/"
-    # If /products is public you can omit Authorization; including it is harmless.
-    headers = {}
-    auth = request.headers.get("authorization")
-    if auth:
-        headers["Authorization"] = auth
-    try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        # Accept either a list or {"items":[...]}
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-            return data["items"]
-        return []
-    except Exception:
-        # If the API call fails for any reason, return empty -> cart lines will appear unresolved instead of crashing
-        return []
+    if not product_ids:
+        return {}
 
+    catalog: Dict[str, Dict[str, Any]] = {}
 
-def _index_products_by_id(products: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Build a lookup by the 'id' field coming from /products.
-    """
-    idx: Dict[str, Dict[str, Any]] = {}
-    for p in products:
-        pid = str(p.get("id", "")).strip()
-        if pid:
-            idx[pid] = p
-    return idx
+    # Query collection_group("items") for each unique product_id
+    # Batch them: Firestore WHERE IN supports up to 30 items
+    unique_ids = list(set(product_ids))
+
+    for i in range(0, len(unique_ids), 30):
+        batch_ids = unique_ids[i : i + 30]
+        try:
+            q = (
+                db.collection_group("items")
+                .where(filter=FieldFilter("id", "in", batch_ids))
+                .where(filter=FieldFilter("is_deleted", "==", False))
+            )
+            for doc in q.stream():
+                src = doc.to_dict() or {}
+                pid = src.get("id", doc.id)
+                if pid and pid not in catalog:
+                    catalog[pid] = src
+        except Exception:
+            # Fallback: query one by one
+            for pid in batch_ids:
+                if pid in catalog:
+                    continue
+                try:
+                    snap = next(
+                        db.collection_group("items")
+                        .where(filter=FieldFilter("id", "==", pid))
+                        .where(filter=FieldFilter("is_deleted", "==", False))
+                        .limit(1)
+                        .stream(),
+                        None,
+                    )
+                    if snap:
+                        src = snap.to_dict() or {}
+                        catalog[pid] = src
+                except Exception:
+                    pass
+
+    return catalog
 
 
 # ---------- routes ----------
@@ -167,25 +173,30 @@ def clear_cart(current_user: dict = Depends(get_current_user)):
     return  # 204 No Content
 
 
-def _get_cart_impl(request: Request, current_user: dict = Depends(get_current_user)):
+def _get_cart_impl(current_user: dict):
     """
-    Return FULL cart with product information (like Amazon):
-    - title, description, image, price/final_price, stock, category_name, etc.
-    - base_subtotal per item (uses final_price if present; otherwise price)
-    - total_base = sum of base_subtotals (no extra discount logic here—just what /products shows)
+    Return FULL cart with product information.
+    Optimized: fetches products directly from Firestore (no self-referencing HTTP call).
     """
     uid = current_user["id"]
     cart = _load_cart(uid)
 
-    # Pull what the user sees in /products (guarantees IDs match)
-    products = _fetch_products_via_api(request)
-    catalog = _index_products_by_id(products)
+    # Collect product IDs from cart
+    cart_items = cart.get("items", [])
+    product_ids = [
+        str(it.get("product_id", "")).strip()
+        for it in cart_items
+        if str(it.get("product_id", "")).strip()
+    ]
+
+    # Fetch all products in batch
+    catalog = _fetch_products_by_ids(product_ids)
 
     items_out: List[Dict[str, Any]] = []
     total_qty = 0
     total_base = Decimal("0")
 
-    for it in cart.get("items", []):
+    for it in cart_items:
         pid = str(it.get("product_id", "")).strip()
         qty = int(it.get("qty", 0) or 0)
         if not pid or qty <= 0:
@@ -193,7 +204,6 @@ def _get_cart_impl(request: Request, current_user: dict = Depends(get_current_us
 
         p = catalog.get(pid)
         if not p:
-            # Show unresolved row so you can spot bad IDs; don't break the whole cart
             items_out.append({
                 "product_id": pid,
                 "qty": qty,
@@ -215,7 +225,7 @@ def _get_cart_impl(request: Request, current_user: dict = Depends(get_current_us
             "category_name": p.get("category_name"),
             "stock": p.get("stock"),
             "price": float(Decimal(str(p.get("price", 0) or 0))),
-            "final_price": float(unit),  # uses final_price if present; else price
+            "final_price": float(unit),
             "qty": qty,
             "base_subtotal": float(subtotal),
         })
@@ -229,21 +239,27 @@ def _get_cart_impl(request: Request, current_user: dict = Depends(get_current_us
 
 
 @router.get("/total")
-def cart_total(request: Request, current_user: dict = Depends(get_current_user)):
+def cart_total(current_user: dict = Depends(get_current_user)):
     """
-    Return ONLY the up-to-date final total (and quantity), computed from /products.
-    If admin changes a product's final_price (or price), your total here updates immediately.
+    Return ONLY the up-to-date final total (and quantity).
+    Optimized: uses direct Firestore query instead of self-referencing HTTP.
     """
     uid = current_user["id"]
     cart = _load_cart(uid)
 
-    products = _fetch_products_via_api(request)
-    catalog = _index_products_by_id(products)
+    cart_items = cart.get("items", [])
+    product_ids = [
+        str(it.get("product_id", "")).strip()
+        for it in cart_items
+        if str(it.get("product_id", "")).strip()
+    ]
+
+    catalog = _fetch_products_by_ids(product_ids)
 
     total_qty = 0
     total_price = Decimal("0")
 
-    for it in cart.get("items", []):
+    for it in cart_items:
         pid = str(it.get("product_id", "")).strip()
         qty = int(it.get("qty", 0) or 0)
         if not pid or qty <= 0:
@@ -253,10 +269,9 @@ def cart_total(request: Request, current_user: dict = Depends(get_current_user))
         total_qty += qty
 
         if not p:
-            # If we can't match the product in /products, treat as $0 rather than failing
             continue
 
-        unit = _money_from_product(p)  # final_price if present, else price
+        unit = _money_from_product(p)
         total_price += unit * qty
 
     return {
@@ -267,12 +282,12 @@ def cart_total(request: Request, current_user: dict = Depends(get_current_user))
 
 
 @router.get("")
-def get_cart_no_slash(request: Request, current_user: dict = Depends(get_current_user)):
+def get_cart_no_slash(current_user: dict = Depends(get_current_user)):
     """Get cart endpoint without trailing slash."""
-    return _get_cart_impl(request, current_user)
+    return _get_cart_impl(current_user)
 
 
 @router.get("/")
-def get_cart_with_slash(request: Request, current_user: dict = Depends(get_current_user)):
+def get_cart_with_slash(current_user: dict = Depends(get_current_user)):
     """Get cart endpoint with trailing slash."""
-    return _get_cart_impl(request, current_user)
+    return _get_cart_impl(current_user)
