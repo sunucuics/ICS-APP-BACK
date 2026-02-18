@@ -482,7 +482,7 @@ admin_router = APIRouter(prefix="/products", dependencies=[Depends(get_current_a
         }
     },
 )
-async def create_product(
+def create_product(
     # ürün alanları (form)
     product_in: ProductCreate = Depends(ProductCreate.as_form),
     # fotoğraflar (1 zorunlu + 4 opsiyonel)
@@ -554,7 +554,7 @@ async def create_product(
     status_code=status.HTTP_201_CREATED,
     summary="Create Product (JSON)",
 )
-async def create_product_json(
+def create_product_json(
     product_in: ProductCreate,
 ):
     """
@@ -597,7 +597,7 @@ async def create_product_json(
 
 
 @admin_router.post("/_fix-prices", summary="Fiyatları 100'e böl (kuruş -> TL dönüşümü)")
-async def fix_prices_kurus_to_tl():
+def fix_prices_kurus_to_tl():
     """
     Tüm ürün fiyatlarını 100'e böler.
     Bu endpoint, fiyatlar yanlışlıkla kuruş cinsinden girilmişse düzeltmek için kullanılır.
@@ -642,7 +642,7 @@ async def fix_prices_kurus_to_tl():
 
 
 @admin_router.get("/_check-prices", summary="Fiyatları kontrol et")
-async def check_prices():
+def check_prices():
     """
     Tüm ürün fiyatlarını listeler - kuruş/TL tutarsızlığını tespit etmek için.
     """
@@ -680,7 +680,7 @@ async def check_prices():
 
 
 @admin_router.put("/{product_id}", response_model=ProductOut)
-async def update_product(product_id: str, product_update: ProductUpdate):
+def update_product(product_id: str, product_update: ProductUpdate):
 
 
 

@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # App misc
     # App misc
     debug: bool = Field(False, env="DEBUG")
-    allowed_origins: str = Field("*", env="ALLOWED_ORIGINS")
+    allowed_origins: str = Field("", env="ALLOWED_ORIGINS")
     firebase_web_api_key: str = Field(..., env="FIREBASE_WEB_API_KEY")
 
     # Mail  ✅ ENV bağlama eklendi + opsiyonel alanlar

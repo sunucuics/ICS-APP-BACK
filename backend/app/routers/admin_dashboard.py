@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 router = APIRouter()
 
 @router.get("/dashboard/stats")
-async def get_dashboard_stats(
+def get_dashboard_stats(
     current_admin: Principal = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
@@ -188,7 +188,7 @@ async def get_dashboard_stats(
         raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard stats: {str(e)}")
 
 @router.get("/dashboard/overview")
-async def get_dashboard_overview(
+def get_dashboard_overview(
     current_admin: Principal = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
@@ -196,7 +196,7 @@ async def get_dashboard_overview(
     """
     try:
         # Get basic stats
-        stats = await get_dashboard_stats(current_admin)
+        stats = get_dashboard_stats(current_admin)
         
         # Calculate growth percentages (simplified - in real app you'd compare with previous periods)
         overview = {

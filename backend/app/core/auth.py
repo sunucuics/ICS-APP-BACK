@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import Request, HTTPException, status
 from firebase_admin import auth as fb_auth
 from backend.app.schemas.principal import Principal
+from backend.app.config import settings
 
 def _extract_bearer_token(request: Request) -> Optional[str]:
     """
@@ -26,8 +27,8 @@ def _decode_id_token(id_token: str, check_revoked: bool = False) -> dict:
     check_revoked=False: Normal endpoint'ler için (hız için revoke kontrolü atlanır).
     check_revoked=True: Hassas endpoint'ler için (logout, hesap silme vb.).
     """
-    # Mock token kontrolü (development için)
-    if id_token.startswith("mock_jwt_token_"):
+    # Mock token kontrolü (sadece development ortamında aktif)
+    if settings.debug and id_token.startswith("mock_jwt_token_"):
         return _decode_mock_token(id_token)
     
     try:

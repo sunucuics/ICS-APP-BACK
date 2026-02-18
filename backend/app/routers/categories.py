@@ -117,7 +117,7 @@ def _make_fixed(transaction, target_ref):
     status_code=status.HTTP_201_CREATED,
     summary="Create Category"
 )
-async def create_category(
+def create_category(
     category_in: CategoryCreate = Depends(CategoryCreate.as_form),
     cover_image: UploadFile = File(..., description="Kapak görseli (zorunlu)")
 ):
@@ -173,7 +173,7 @@ async def create_category(
     )
 
 @admin_router.put("/{category_id}", response_model=CategoryOut, summary="Update Category")
-async def update_category(
+def update_category(
     category_id: str,
     name: Optional[str] = Form(None),
     description: Optional[str] = Form(None),

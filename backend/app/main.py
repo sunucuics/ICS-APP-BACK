@@ -41,8 +41,11 @@ def paytr_direct_form(request: Request):
     # statik HTML ise Jinja şart değil; yine de Request gerekir
     return templates.TemplateResponse("paytr_direct_form.html", {"request": request})
 
-# Configure CORS (allow front-end domain or all origins as specified)
-allow_origins = [origin.strip() for origin in settings.allowed_origins.split(',')] if settings.allowed_origins else ["*"]
+# Configure CORS (allow front-end domain or fallback to localhost)
+allow_origins = [origin.strip() for origin in settings.allowed_origins.split(',') if origin.strip()] if settings.allowed_origins else []
+if not allow_origins:
+    logging.warning("CORS: No ALLOWED_ORIGINS configured, defaulting to localhost only")
+    allow_origins = ["http://localhost:3000", "http://localhost:8080"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,

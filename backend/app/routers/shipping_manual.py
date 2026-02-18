@@ -316,7 +316,7 @@ def _build_customer(user_id: str) -> Dict[str, Any]:
 # PUBLIC — (BODY YOK) Sepetten sipariş oluştur
 # -----------------------------------------------------------------------------
 @router.post("", summary="Sepetten sipariş oluştur (status=preparing)")
-async def create_order(request: Request, me: Dict = Depends(get_current_user)):
+def create_order(request: Request, me: Dict = Depends(get_current_user)):
     user_id = me["id"]
     items = _load_cart_items(user_id, request)
     if not items:
@@ -352,7 +352,7 @@ async def create_order(request: Request, me: Dict = Depends(get_current_user)):
 # PUBLIC — Kullanıcının siparişlerini listele
 # -----------------------------------------------------------------------------
 @router.get("", summary="Kullanıcının siparişlerini listele (Aktif/Geçmiş)")
-async def list_my_orders(
+def list_my_orders(
     me: Dict = Depends(get_current_user),
     view_type: Literal["active", "past"] = Query("active", description="'active': Devam edenler, 'past': Tamamlananlar"),
     limit: int = Query(20, ge=1, le=100),
@@ -399,7 +399,7 @@ async def list_my_orders(
 # PUBLIC — Sipariş detayı (FALLBACK EKLENDİ)
 # -----------------------------------------------------------------------------
 @router.get("/{order_id}", summary="Sipariş detay ve kargo durumu (kullanıcı)")
-async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
+def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
     user_id = me["id"]
     
     # 1. Önce asıl ORDERS koleksiyonuna bak
@@ -450,7 +450,7 @@ async def get_order_public(order_id: str, me: Dict = Depends(get_current_user)):
 # PUBLIC — Ödeme bekleyen siparişi iptal et
 # -----------------------------------------------------------------------------
 @router.post("/{order_id}/cancel-awaiting", summary="Ödeme bekleyen siparişi iptal et")
-async def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_user)):
+def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_user)):
     user_id = me["id"]
     ref = db.collection(_ORDERS).document(order_id)
     snap = ref.get()
@@ -487,7 +487,7 @@ async def cancel_awaiting_order(order_id: str, me: Dict = Depends(get_current_us
 # ADMIN — Kargoya verilecekler / ship / deliver / cancel / delete
 # -----------------------------------------------------------------------------
 @admin_router.get("/queue", summary="Kargoya verilecekler, kargoya verilenler ve teslim edilenler")
-async def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)):
+def list_ship_queue(request: Request, _: Dict = Depends(get_current_admin)):
     base = db.collection(_ORDERS).where("is_deleted", "==", False)
 
     preparing_q = (
@@ -584,36 +584,40 @@ class AdminCancelRequest(BaseModel):
 @admin_router.patch("/{order_id}/ship", summary="Siparişi 'shipped' yap ve e-posta gönder")
 async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection(_ORDERS).document(order_id)
 
-    @firestore.transactional
-    def _txn(tx):
-        snap = ref.get(transaction=tx)
-        if not snap.exists:
-            raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
-        doc = snap.to_dict() or {}
-        _ensure_transition(doc.get("status") or "preparing", "shipped")
-        if not body.tracking_number:
-            raise HTTPException(status_code=400, detail="Takip numarası zorunlu")
-        now = _now()
-        update = {
-            "status": "shipped",
-            "shipping": {
-                "provider": body.provider,
-                "tracking_number": body.tracking_number,
-                "shipped_at": now,
-                "delivered_at": (doc.get("shipping") or {}).get("delivered_at"),
-            },
-            "updated_at": now,
-            "status_history": firestore.ArrayUnion([
-                {"status": "shipped", "at": now, "by": admin_id, "meta": {"tracking_number": body.tracking_number}}
-            ]),
-        }
-        tx.update(ref, update)
-        return {**doc, **update}
+    def _do_firestore_work():
+        ref = db.collection(_ORDERS).document(order_id)
 
-    tx = db.transaction()
-    merged = _txn(tx)
+        @firestore.transactional
+        def _txn(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+            doc = snap.to_dict() or {}
+            _ensure_transition(doc.get("status") or "preparing", "shipped")
+            if not body.tracking_number:
+                raise HTTPException(status_code=400, detail="Takip numarası zorunlu")
+            now = _now()
+            update = {
+                "status": "shipped",
+                "shipping": {
+                    "provider": body.provider,
+                    "tracking_number": body.tracking_number,
+                    "shipped_at": now,
+                    "delivered_at": (doc.get("shipping") or {}).get("delivered_at"),
+                },
+                "updated_at": now,
+                "status_history": firestore.ArrayUnion([
+                    {"status": "shipped", "at": now, "by": admin_id, "meta": {"tracking_number": body.tracking_number}}
+                ]),
+            }
+            tx.update(ref, update)
+            return {**doc, **update}
+
+        tx = db.transaction()
+        return _txn(tx), ref
+
+    merged, ref = await asyncio.to_thread(_do_firestore_work)
 
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
@@ -633,7 +637,7 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, 
                 html=html,
                 sender_name="ICS",
             )
-            ref.update({"email_flags.shipped_sent": True})
+            await asyncio.to_thread(ref.update, {"email_flags.shipped_sent": True})
         except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
@@ -644,29 +648,33 @@ async def mark_shipped(order_id: str, body: AdminShipRequest, request: Request, 
 @admin_router.patch("/{order_id}/deliver", summary="Siparişi 'delivered' yap ve e-posta gönder")
 async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection(_ORDERS).document(order_id)
 
-    @firestore.transactional
-    def _txn(tx):
-        snap = ref.get(transaction=tx)
-        if not snap.exists:
-            raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
-        doc = snap.to_dict() or {}
-        _ensure_transition(doc.get("status") or "preparing", "delivered")
-        now = _now()
-        update = {
-            "status": "delivered",
-            "shipping": {**(doc.get("shipping") or {}), "delivered_at": now},
-            "updated_at": now,
-            "status_history": firestore.ArrayUnion([
-                {"status": "delivered", "at": now, "by": admin_id, "meta": {}}
-            ]),
-        }
-        tx.update(ref, update)
-        return {**doc, **update}
+    def _do_firestore_work():
+        ref = db.collection(_ORDERS).document(order_id)
 
-    tx = db.transaction()
-    merged = _txn(tx)
+        @firestore.transactional
+        def _txn(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+            doc = snap.to_dict() or {}
+            _ensure_transition(doc.get("status") or "preparing", "delivered")
+            now = _now()
+            update = {
+                "status": "delivered",
+                "shipping": {**(doc.get("shipping") or {}), "delivered_at": now},
+                "updated_at": now,
+                "status_history": firestore.ArrayUnion([
+                    {"status": "delivered", "at": now, "by": admin_id, "meta": {}}
+                ]),
+            }
+            tx.update(ref, update)
+            return {**doc, **update}
+
+        tx = db.transaction()
+        return _txn(tx), ref
+
+    merged, ref = await asyncio.to_thread(_do_firestore_work)
 
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
@@ -681,7 +689,7 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
                 html=html,
                 sender_name="ICS",
             )
-            ref.update({"email_flags.delivered_sent": True})
+            await asyncio.to_thread(ref.update, {"email_flags.delivered_sent": True})
         except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
@@ -692,28 +700,32 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
 @admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap ve e-posta gönder")
 async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
-    ref = db.collection(_ORDERS).document(order_id)
 
-    @firestore.transactional
-    def _txn(tx):
-        snap = ref.get(transaction=tx)
-        if not snap.exists:
-            raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
-        doc = snap.to_dict() or {}
-        _ensure_transition(doc.get("status") or "preparing", "canceled")
-        now = _now()
-        update = {
-            "status": "canceled",
-            "updated_at": now,
-            "status_history": firestore.ArrayUnion([
-                {"status": "canceled", "at": now, "by": admin_id, "meta": {"reason": body.reason}}
-            ]),
-        }
-        tx.update(ref, update)
-        return {**doc, **update}
+    def _do_firestore_work():
+        ref = db.collection(_ORDERS).document(order_id)
 
-    tx = db.transaction()
-    merged = _txn(tx)
+        @firestore.transactional
+        def _txn(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise HTTPException(status_code=404, detail="Sipariş bulunamadı")
+            doc = snap.to_dict() or {}
+            _ensure_transition(doc.get("status") or "preparing", "canceled")
+            now = _now()
+            update = {
+                "status": "canceled",
+                "updated_at": now,
+                "status_history": firestore.ArrayUnion([
+                    {"status": "canceled", "at": now, "by": admin_id, "meta": {"reason": body.reason}}
+                ]),
+            }
+            tx.update(ref, update)
+            return {**doc, **update}
+
+        tx = db.transaction()
+        return _txn(tx), ref
+
+    merged, ref = await asyncio.to_thread(_do_firestore_work)
 
     customer = merged.get("customer") or {}
     full_name = (customer.get("full_name") or "").strip()
@@ -728,7 +740,7 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
                 html=html,
                 sender_name="ICS",
             )
-            ref.update({"email_flags.canceled_sent": True})
+            await asyncio.to_thread(ref.update, {"email_flags.canceled_sent": True})
         except Exception:
             log.exception("E-posta gönderilemedi | order_id=%s", order_id)
 
@@ -737,7 +749,7 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
 
 
 @admin_router.delete("/{order_id}", summary="Siparişi soft delete yap (is_deleted=true)")
-async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
+def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
     ref = db.collection(_ORDERS).document(order_id)
     snap = ref.get()
     if not snap.exists:
@@ -746,7 +758,7 @@ async def delete_order(order_id: str, _: Dict = Depends(get_current_admin)):
     return {"ok": True}
 
 @admin_router.post("/dev", summary="Test amaçlı örnek sipariş oluştur (sadece admin)")
-async def dev_create_order(_: Dict = Depends(get_current_admin)):
+def dev_create_order(_: Dict = Depends(get_current_admin)):
     """
     Test siparişi oluşturur. Fiyatlar TL cinsinden saklanır.
     """
@@ -793,7 +805,7 @@ async def email_test(_: Dict = Depends(get_current_admin)):
 
 
 @admin_router.post("/_cleanup-awaiting", summary="Eski awaiting siparişleri iptal et (admin)")
-async def cleanup_awaiting_orders(
+def cleanup_awaiting_orders(
     minutes_old: int = Query(30, ge=5, le=1440, description="Kaç dakikadan eski siparişler iptal edilsin"),
     _: Dict = Depends(get_current_admin)
 ):

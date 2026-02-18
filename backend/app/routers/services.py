@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from uuid import uuid4
 from enum import Enum
 from datetime import datetime
+import asyncio
 
 from backend.app.config import db, bucket
 from backend.app.core.security import get_current_admin
@@ -203,7 +204,7 @@ def list_services_admin_no_slash():
     status_code=status.HTTP_201_CREATED,
     response_model_exclude_none=True
 )
-async def create_service(
+def create_service(
     title: str = Form(...),
     description: str = Form(""),
     is_upcoming: bool = Form(False),
@@ -250,7 +251,7 @@ async def create_service(
     status_code=status.HTTP_201_CREATED,
     response_model_exclude_none=True
 )
-async def create_service_no_slash(
+def create_service_no_slash(
     title: str = Form(...),
     description: str = Form(""),
     is_upcoming: bool = Form(False),
@@ -258,7 +259,7 @@ async def create_service_no_slash(
     image2: UploadFile = File(None, description="Görsel 2 (optional)"),
     image3: UploadFile = File(None, description="Görsel 3 (optional)"),
 ):
-    return await create_service(title, description, is_upcoming, image1, image2, image3)
+    return create_service(title, description, is_upcoming, image1, image2, image3)
 
 
 # -------------------------
@@ -290,96 +291,101 @@ async def update_service(
     remove_image2: bool = Form(False),
     remove_image3: bool = Form(False),
 ):
-    doc_ref = db.collection("services").document(service_id)
-    snap = doc_ref.get()
-    if not snap.exists:
-        raise HTTPException(status_code=404, detail="Service not found")
+    # await request.form() gerçek async çağrı — hangi form alanları gönderilmiş kontrol et
+    form = await request.form()
 
-    data = snap.to_dict() or {}
+    # Tüm blocking I/O (Firestore + Storage) threadpool'da çalıştır
+    def _do_update():
+        doc_ref = db.collection("services").document(service_id)
+        snap = doc_ref.get()
+        if not snap.exists:
+            raise HTTPException(status_code=404, detail="Service not found")
 
-    # mevcutları image_items formatına normalize et
-    items = data.get("image_items")
-    if not isinstance(items, list):
-        normalized = _normalize_images_fields(data)
-        # path yoksa storage delete yapılamaz, url-only item
-        items = [{"url": u, "path": None} for u in normalized.get("images", [])]
+        data = snap.to_dict() or {}
 
-    # yardımcı: slot replace / append
-    def _replace_at(slot_idx: int, file: UploadFile):
-        nonlocal items
-        if slot_idx < len(items):
-            old = items[slot_idx]
-            old_path = old.get("path") if isinstance(old, dict) else None
-            if old_path:
+        # mevcutları image_items formatına normalize et
+        items = data.get("image_items")
+        if not isinstance(items, list):
+            normalized = _normalize_images_fields(data)
+            # path yoksa storage delete yapılamaz, url-only item
+            items = [{"url": u, "path": None} for u in normalized.get("images", [])]
+
+        # yardımcı: slot replace / append
+        def _replace_at(slot_idx: int, file: UploadFile):
+            nonlocal items
+            if slot_idx < len(items):
+                old = items[slot_idx]
+                old_path = old.get("path") if isinstance(old, dict) else None
+                if old_path:
+                    try:
+                        bucket.blob(old_path).delete()
+                    except Exception:
+                        pass
+                items[slot_idx] = _upload_one_image(service_id, file)
+            else:
+                items.append(_upload_one_image(service_id, file))
+
+        # silme: sadece remove true ve aynı slota yeni dosya yoksa
+        if remove_image3 and not _is_valid_upload_file(image3) and len(items) > 2:
+            removed = items.pop(2)
+            path = removed.get("path") if isinstance(removed, dict) else None
+            if path:
                 try:
-                    bucket.blob(old_path).delete()
+                    bucket.blob(path).delete()
                 except Exception:
                     pass
-            items[slot_idx] = _upload_one_image(service_id, file)
-        else:
-            items.append(_upload_one_image(service_id, file))
 
-    # silme: sadece remove true ve aynı slota yeni dosya yoksa
-    if remove_image3 and not _is_valid_upload_file(image3) and len(items) > 2:
-        removed = items.pop(2)
-        path = removed.get("path") if isinstance(removed, dict) else None
-        if path:
-            try:
-                bucket.blob(path).delete()
-            except Exception:
-                pass
+        if remove_image2 and not _is_valid_upload_file(image2) and len(items) > 1:
+            removed = items.pop(1)
+            path = removed.get("path") if isinstance(removed, dict) else None
+            if path:
+                try:
+                    bucket.blob(path).delete()
+                except Exception:
+                    pass
 
-    if remove_image2 and not _is_valid_upload_file(image2) and len(items) > 1:
-        removed = items.pop(1)
-        path = removed.get("path") if isinstance(removed, dict) else None
-        if path:
-            try:
-                bucket.blob(path).delete()
-            except Exception:
-                pass
+        if remove_image1 and not _is_valid_upload_file(image1) and len(items) > 0:
+            removed = items.pop(0)
+            path = removed.get("path") if isinstance(removed, dict) else None
+            if path:
+                try:
+                    bucket.blob(path).delete()
+                except Exception:
+                    pass
 
-    if remove_image1 and not _is_valid_upload_file(image1) and len(items) > 0:
-        removed = items.pop(0)
-        path = removed.get("path") if isinstance(removed, dict) else None
-        if path:
-            try:
-                bucket.blob(path).delete()
-            except Exception:
-                pass
+        # yeni upload varsa replace
+        if _is_valid_upload_file(image1):
+            _replace_at(0, image1)
+        if _is_valid_upload_file(image2):
+            _replace_at(1, image2)
+        if _is_valid_upload_file(image3):
+            _replace_at(2, image3)
 
-    # yeni upload varsa replace
-    if _is_valid_upload_file(image1):
-        _replace_at(0, image1)
-    if _is_valid_upload_file(image2):
-        _replace_at(1, image2)
-    if _is_valid_upload_file(image3):
-        _replace_at(2, image3)
+        # max 3
+        if len(items) > MAX_IMAGES:
+            items = items[:MAX_IMAGES]
 
-    # max 3
-    if len(items) > MAX_IMAGES:
-        items = items[:MAX_IMAGES]
+        update_data: Dict[str, Any] = {}
 
-    # Formda hangi alanlar gerçekten gönderilmiş -> buna göre update
-    form = await request.form()
-    update_data: Dict[str, Any] = {}
+        if "title" in form:
+            update_data["title"] = title.strip()
+        if "description" in form:
+            update_data["description"] = (description or "").strip()
 
-    if "title" in form:
-        update_data["title"] = title.strip()
-    if "description" in form:
-        update_data["description"] = (description or "").strip()
+        # is_upcoming dropdown: keep ise dokunma
+        if "is_upcoming" in form and is_upcoming != UpcomingAction.keep:
+            update_data["is_upcoming"] = (is_upcoming == UpcomingAction.yes)
 
-    # is_upcoming dropdown: keep ise dokunma
-    if "is_upcoming" in form and is_upcoming != UpcomingAction.keep:
-        update_data["is_upcoming"] = (is_upcoming == UpcomingAction.yes)
+        urls = [x.get("url") for x in items if isinstance(x, dict) and x.get("url")]
+        update_data["image_items"] = items
+        update_data["images"] = urls
+        update_data["image"] = urls[0] if urls else None
 
-    urls = [x.get("url") for x in items if isinstance(x, dict) and x.get("url")]
-    update_data["image_items"] = items
-    update_data["images"] = urls
-    update_data["image"] = urls[0] if urls else None
+        doc_ref.update(update_data)
+        out = doc_ref.get().to_dict() or {}
+        return _service_to_out(service_id, out)
 
-    doc_ref.update(update_data)
-    out = doc_ref.get().to_dict() or {}
-    return _service_to_out(service_id, out)
+    return await asyncio.to_thread(_do_update)
 
 
 # -------------------------
