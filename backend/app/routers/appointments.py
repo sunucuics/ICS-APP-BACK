@@ -95,10 +95,13 @@ def _send_admin_push_notification(title: str, body: str, appointment_id: str):
             if fcm_token:
                 fcm_tokens.append(fcm_token)
         
+        # Duplicate token'ları kaldır (aynı cihaza çift bildirim gitmesin)
+        fcm_tokens = list(set(fcm_tokens))
+
         if not fcm_tokens:
             logger.info("No admin FCM tokens found, skipping push notification")
             return
-        
+
         logger.info("Sending push notification to %d admin devices", len(fcm_tokens))
         
         # FCM multicast mesajı oluştur

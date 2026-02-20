@@ -151,7 +151,7 @@ def _fetch_comments_stats() -> Dict[str, Any]:
         for doc in db.collection("comments").stream():
             total += 1
             data = doc.to_dict()
-            if not data.get("approved", False):
+            if data.get("is_hidden", False) or data.get("is_deleted", False):
                 pending += 1
     except Exception as e:
         logger.error("Error fetching comments stats: %s", e)

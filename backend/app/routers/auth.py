@@ -462,6 +462,11 @@ def logout(current_user: dict = Depends(get_current_user_strict)):
     uid = current_user["id"]
     # Cache'den kullanıcı profilini temizle (yeni oturum güncel veri alsın)
     invalidate_user_cache(uid)
+    # FCM token'ı Firestore'dan sil — çıkış yapan cihaza artık bildirim gitmesin
+    try:
+        db.collection("users").document(uid).update({"fcm_token": gcf.DELETE_FIELD})
+    except Exception:
+        pass
     try:
         firebase_auth.revoke_refresh_tokens(uid)
     except Exception:

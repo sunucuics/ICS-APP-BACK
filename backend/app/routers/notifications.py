@@ -321,6 +321,9 @@ def send_notification(notification_data: NotificationSendRequest):
         if batch_count > 0:
             batch.commit()
         
+        # Duplicate token'ları kaldır (aynı cihaza çift bildirim gitmesin)
+        fcm_tokens = list(dict.fromkeys(fcm_tokens))
+
         # Send FCM push notifications if we have tokens
         if fcm_tokens:
             try:

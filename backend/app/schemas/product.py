@@ -116,12 +116,13 @@ class ProductCreate(BaseModel):
 class ProductUpdate(BaseModel):
     """Schema for updating product fields (admin)."""
     title: Optional[str] = None
+    name: Optional[str] = None  # Frontend 'name' gönderiyor, title alias
     description: Optional[str] = None
     price: Optional[float] = None
     stock: Optional[int] = None
     category_id: Optional[str] = None
+    category_name: Optional[str] = None  # Frontend category_name gönderiyor
     is_upcoming: Optional[bool] = None
-    # Not handling image updates here, might be separate endpoint or form in create.
 
 class ProductOut(BaseModel):
     id: str

@@ -689,8 +689,10 @@ def update_product(product_id: str, product_update: ProductUpdate):
     doc_ref = snap.reference
 
     update_data = {}
-    if product_update.title is not None:
-        update_data["title"] = product_update.title
+    # title veya name (frontend 'name' gönderiyor)
+    effective_title = product_update.title or product_update.name
+    if effective_title is not None:
+        update_data["title"] = effective_title
     if product_update.description is not None:
         update_data["description"] = product_update.description
     if product_update.price is not None:
@@ -699,6 +701,16 @@ def update_product(product_id: str, product_update: ProductUpdate):
         update_data["stock"] = int(product_update.stock)
     if product_update.category_id is not None:
         update_data["category_id"] = product_update.category_id
+    # category_name geldiyse category_id'ye çevir
+    if product_update.category_name is not None and product_update.category_id is None:
+        cat_snap = next(
+            db.collection("categories")
+              .where(filter=FieldFilter("name", "==", product_update.category_name))
+              .limit(1).stream(),
+            None,
+        )
+        if cat_snap:
+            update_data["category_id"] = cat_snap.id
     if product_update.is_upcoming is not None:
         update_data["is_upcoming"] = bool(product_update.is_upcoming)
 
