@@ -7,6 +7,7 @@ Now queries Firestore directly with batch get (db.get_all) for O(1) per product.
 """
 
 import os
+import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,8 @@ from google.cloud.firestore_v1 import FieldFilter
 
 from backend.app.core.security import get_current_user
 from backend.app.config import db
+
+logger = logging.getLogger("ics.carts")
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
 
@@ -94,17 +97,22 @@ def _fetch_products_by_ids(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     for i in range(0, len(unique_ids), 30):
         batch_ids = unique_ids[i : i + 30]
         try:
+            # is_deleted filtresini Firestore'dan kaldırdık — composite index
+            # ihtiyacını ortadan kaldırır, Python tarafında kontrol edilir
             q = (
                 db.collection_group("items")
                 .where(filter=FieldFilter("id", "in", batch_ids))
-                .where(filter=FieldFilter("is_deleted", "==", False))
             )
             for doc in q.stream():
                 src = doc.to_dict() or {}
+                # Silinmiş ürünleri Python tarafında filtrele
+                if src.get("is_deleted", False):
+                    continue
                 pid = src.get("id", doc.id)
                 if pid and pid not in catalog:
                     catalog[pid] = src
-        except Exception:
+        except Exception as exc:
+            logger.warning("collection_group batch query failed: %s — falling back to single queries", exc)
             # Fallback: query one by one
             for pid in batch_ids:
                 if pid in catalog:
@@ -113,17 +121,18 @@ def _fetch_products_by_ids(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                     snap = next(
                         db.collection_group("items")
                         .where(filter=FieldFilter("id", "==", pid))
-                        .where(filter=FieldFilter("is_deleted", "==", False))
                         .limit(1)
                         .stream(),
                         None,
                     )
                     if snap:
                         src = snap.to_dict() or {}
-                        catalog[pid] = src
-                except Exception:
-                    pass
+                        if not src.get("is_deleted", False):
+                            catalog[pid] = src
+                except Exception as exc2:
+                    logger.warning("Fallback single query failed for product %s: %s", pid, exc2)
 
+    logger.info("_fetch_products_by_ids: requested=%d, found=%d, ids=%s", len(unique_ids), len(catalog), unique_ids)
     return catalog
 
 
@@ -204,11 +213,20 @@ def _get_cart_impl(current_user: dict):
 
         p = catalog.get(pid)
         if not p:
+            logger.warning("Cart item unresolved: product_id=%s not found in Firestore", pid)
             items_out.append({
                 "product_id": pid,
+                "title": "Ürün bulunamadı",
+                "description": "",
+                "image": None,
+                "price": 0.0,
+                "final_price": 0.0,
+                "stock": 0,
+                "category_name": None,
                 "qty": qty,
-                "unresolved": True,
                 "base_subtotal": 0.0,
+                "total_base": 0.0,
+                "unresolved": True,
             })
             continue
 
@@ -228,6 +246,7 @@ def _get_cart_impl(current_user: dict):
             "final_price": float(unit),
             "qty": qty,
             "base_subtotal": float(subtotal),
+            "total_base": float(subtotal),
         })
 
     return {

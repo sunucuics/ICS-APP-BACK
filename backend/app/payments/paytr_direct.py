@@ -19,6 +19,8 @@ from fastapi import APIRouter, HTTPException, Request, Form, Body, Depends
 from pydantic import BaseModel, Field, EmailStr, validator
 from starlette.responses import PlainTextResponse, HTMLResponse
 
+from google.cloud.firestore_v1 import FieldFilter
+
 from backend.app.config import db
 from backend.app.core.security import get_current_user
 
@@ -774,22 +776,68 @@ async def installments():
 # CALLBACK — PayTR bildirimi
 # =========================
 
+def _check_and_deduct_stock(items: list) -> list:
+    """
+    Stok kontrolü yap ve düş. Başarısız olursa HTTPException fırlatır.
+    Returns: [(product_ref, qty)] — geri yükleme için kullanılabilir.
+    """
+    stock_updates = []
+    for item in items:
+        pid = item.get("product_id") or item.get("id")
+        qty = int(item.get("quantity", item.get("qty", 0)))
+        if not pid or qty <= 0:
+            continue
+        try:
+            docs = list(
+                db.collection_group("items")
+                .where(filter=FieldFilter("id", "==", str(pid)))
+                .limit(1)
+                .stream()
+            )
+            if not docs:
+                log.warning("STOCK_CHECK product not found: %s", pid)
+                continue
+            product_doc = docs[0]
+            product_data = product_doc.to_dict() or {}
+            current_stock = int(product_data.get("stock", 0))
+            if current_stock < qty:
+                product_name = product_data.get("title", pid)
+                log.error("INSUFFICIENT_STOCK pid=%s stock=%d requested=%d", pid, current_stock, qty)
+                raise HTTPException(400, f"Yetersiz stok: {product_name} (Stok: {current_stock}, İstenen: {qty})")
+            product_doc.reference.update({"stock": current_stock - qty})
+            stock_updates.append((product_doc.reference, qty))
+            log.info("STOCK_DEDUCTED pid=%s qty=%d new_stock=%d", pid, qty, current_stock - qty)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning("STOCK_CHECK_FAILED pid=%s err=%s", pid, e)
+    return stock_updates
+
+
+def _restore_stock_from_refs(stock_updates: list) -> None:
+    """Stok düşüldükten sonra hata olursa geri yükler."""
+    for product_ref, qty in stock_updates:
+        try:
+            snap = product_ref.get()
+            current = int((snap.to_dict() or {}).get("stock", 0))
+            product_ref.update({"stock": current + qty})
+        except Exception as e:
+            log.warning("STOCK_RESTORE_FAILED ref=%s err=%s", product_ref.path, e)
+
+
 @router.api_route("/callback", methods=["POST"], response_class=PlainTextResponse)
 @router.api_route("/callback/", methods=["POST"], response_class=PlainTextResponse)
 async def paytr_callback(request: Request):
     # =========================================================================
-    # INLINE HELPERS (Self-Contained Logic)
+    # INLINE HELPER
     # =========================================================================
     def _create_order_from_session(session, payment_info, now):
         """Session verisinden Sipariş Dökümanı oluşturur."""
         user_id = session.get("user_id")
         items = session.get("basket", [])
-        
-        # Totals hesapla
         base_amt = session.get("base_amount", 0)
         pay_amt = session.get("payable_amount", 0)
-        currency = "TL" # Default
-        
+
         customer = {
             "full_name": session.get("user_name", ""),
             "email": session.get("email", ""),
@@ -799,24 +847,22 @@ async def paytr_callback(request: Request):
                 "ip": session.get("user_ip", "")
             }
         }
-        
-        shipping_info = {
-            "provider": "MANUAL", 
-            "address": session.get("user_address", "")
-        }
-        
+
         return {
             "user_id": user_id,
             "items": items,
             "totals": {
                 "subtotal": base_amt,
                 "grand_total": pay_amt,
-                "currency": currency
+                "currency": "TL"
             },
             "customer": customer,
-            "shipping_info": shipping_info,
+            "shipping_info": {
+                "provider": "MANUAL",
+                "address": session.get("user_address", "")
+            },
             "payment": payment_info,
-            "status": "preparing", # Listede görünmesi için PREPARING olmalı
+            "status": "preparing",
             "created_at": now,
             "updated_at": now,
             "is_deleted": False,
@@ -842,7 +888,7 @@ async def paytr_callback(request: Request):
         log.error("PAYTR_HASH_FAIL oid=%s", merchant_oid)
         return PlainTextResponse("ERR", status_code=400)
 
-    # Collection Prefix (Dynamic)
+    # Collection Prefix
     pfx = (os.getenv("FIREBASE_COLLECTION_PREFIX") or "").strip()
     orders_cname = f"{pfx}orders" if pfx else "orders"
     sessions_cname = f"{pfx}payment_sessions" if pfx else "payment_sessions"
@@ -851,32 +897,46 @@ async def paytr_callback(request: Request):
     sessions_col = db.collection(sessions_cname)
     now = datetime.now(timezone.utc)
 
-    # 2) SİPARİŞ ZATEN VAR MI? (Update)
+    # 2) SİPARİŞ ZATEN VAR MI? → Transaction ile güncelle (duplicate koruması)
     order_ref = orders_col.document(merchant_oid)
     order_snap = order_ref.get()
 
     if order_snap.exists:
-        # Sipariş zaten var, durumunu güncelle
         doc = order_snap.to_dict() or {}
         pay = doc.get("payment") or {}
-        
-        # Zaten bitmişse dokunma
+
+        # Zaten bitmişse dokunma (idempotent)
         if pay.get("status") in ("succeeded", "failed"):
+            log.info("CALLBACK_ALREADY_PROCESSED oid=%s pay_status=%s", merchant_oid, pay.get("status"))
             return PlainTextResponse("OK", status_code=200)
 
         new_pay_status = "succeeded" if cb_status == "success" else "failed"
         new_order_status = "preparing" if new_pay_status == "succeeded" else "cancelled"
-        
-        order_ref.update({
-            "payment.status": new_pay_status,
-            "payment.total_amount": total_amount,
-            "status": new_order_status,
-            "updated_at": now
-        })
-        log.info("ORDER_UPDATED oid=%s status=%s", merchant_oid, new_order_status)
+
+        # Transaction ile güncelle (race condition koruması)
+        @firestore.transactional
+        def _update_order_txn(transaction):
+            snap = order_ref.get(transaction=transaction)
+            if not snap.exists:
+                return False
+            d = snap.to_dict() or {}
+            p = d.get("payment") or {}
+            if p.get("status") in ("succeeded", "failed"):
+                return False  # Zaten işlenmiş
+            transaction.update(order_ref, {
+                "payment.status": new_pay_status,
+                "payment.total_amount": total_amount,
+                "status": new_order_status,
+                "updated_at": now,
+            })
+            return True
+
+        updated = _update_order_txn(db.transaction())
+        if updated:
+            log.info("ORDER_UPDATED_TXN oid=%s status=%s", merchant_oid, new_order_status)
         return PlainTextResponse("OK", status_code=200)
 
-    # 3) SİPARİŞ YOK -> SADECE SUCCESS İSE OLUŞTUR
+    # 3) SİPARİŞ YOK → SADECE SUCCESS İSE OLUŞTUR
     if cb_status != "success":
         log.warning("PAYMENT_FAILED_NO_ORDER oid=%s", merchant_oid)
         return PlainTextResponse("OK", status_code=200)
@@ -884,13 +944,47 @@ async def paytr_callback(request: Request):
     # Session oku
     sess_ref = sessions_col.document(merchant_oid)
     sess_snap = sess_ref.get()
-    
+
     if not sess_snap.exists:
         log.error("SESSION_NOT_FOUND oid=%s", merchant_oid)
         return PlainTextResponse("OK", status_code=200)
 
     session = sess_snap.to_dict() or {}
-    
+
+    # Tutar doğrulaması — PayTR kuruş gönderir
+    expected_amount = session.get("payable_amount", 0)
+    try:
+        received_amount = int(total_amount) / 100  # PayTR kuruş → TL
+        if abs(expected_amount - received_amount) > 1.0:  # 1 TL tolerans
+            log.error("AMOUNT_MISMATCH oid=%s expected=%.2f received=%.2f",
+                      merchant_oid, expected_amount, received_amount)
+            # Yine de sipariş oluştur ama logla (PayTR'nin gönderdiği güvenilir)
+    except (ValueError, TypeError):
+        log.warning("AMOUNT_PARSE_ERROR oid=%s total_amount=%s", merchant_oid, total_amount)
+
+    # Stok kontrolü ve düşümü
+    basket_items = session.get("basket", [])
+    stock_updates = []
+    try:
+        stock_updates = _check_and_deduct_stock(basket_items)
+    except HTTPException as e:
+        log.error("STOCK_CHECK_FAILED_CALLBACK oid=%s err=%s", merchant_oid, e.detail)
+        # Stok yetersiz — siparişi oluştur ama durumu "stock_error" yap
+        payment_info = {
+            "provider": "PAYTR",
+            "status": "succeeded",
+            "merchant_oid": merchant_oid,
+            "total_amount": total_amount,
+            "installment_count": session.get("installment_count", 0)
+        }
+        error_order = _create_order_from_session(session, payment_info, now)
+        error_order["status"] = "stock_error"
+        error_order["stock_error"] = str(e.detail)
+        order_ref.set(error_order)
+        sess_ref.update({"status": "stock_error", "order_created": True})
+        log.error("ORDER_CREATED_STOCK_ERROR oid=%s", merchant_oid)
+        return PlainTextResponse("OK", status_code=200)
+
     # Sipariş Dökümanı Hazırla
     payment_info = {
         "provider": "PAYTR",
@@ -899,9 +993,9 @@ async def paytr_callback(request: Request):
         "total_amount": total_amount,
         "installment_count": session.get("installment_count", 0)
     }
-    
+
     new_order_doc = _create_order_from_session(session, payment_info, now)
-    
+
     # Kaydet (ID = merchant_oid)
     order_ref.set(new_order_doc)
     log.info("ORDER_CREATED oid=%s user=%s", merchant_oid, session.get("user_id"))
@@ -913,121 +1007,14 @@ async def paytr_callback(request: Request):
             carts_cname = f"{pfx}carts" if pfx else "carts"
             cref = db.collection(carts_cname).document(user_id)
             cref.set({"items": []}, merge=True)
-            # Alt koleksiyon (varsa) temizliği için loop gerekebilir ama basitçe items array temizlendi.
             for subdoc in cref.collection("items").list_documents():
-                 subdoc.delete()
+                subdoc.delete()
         except Exception as e:
             log.warning("CART_CLEAR_ERR user=%s err=%s", user_id, e)
 
     # Session Güncelle
     sess_ref.update({"status": "completed", "order_created": True})
 
-    return PlainTextResponse("OK", status_code=200)
-
-    # 2) Önce sipariş var mı kontrol et
-    order_ref = orders_col.document(merchant_oid)
-    order_snap = order_ref.get()
-
-    if order_snap.exists:
-        # Sipariş zaten var -> sadece güncelle
-        doc = order_snap.to_dict() or {}
-        user_id = doc.get("user_id")
-
-        @firestore.transactional
-        def _update_order(tx):
-            s = order_ref.get(transaction=tx)
-            d = s.to_dict() or {}
-            pay = d.get("payment") or {}
-            cur = (pay.get("status") or "").lower()
-
-            if cur in ("succeeded", "failed"):
-                return d  # idempotent
-
-            new_status = "succeeded" if cb_status == "success" else "failed"
-
-            update = {
-                "updated_at": now,
-                "payment": {
-                    **pay,
-                    "status": new_status,
-                    "provider": pay.get("provider") or "PAYTR",
-                    "merchant_oid": merchant_oid,
-                    "total_amount": total_amount,
-                },
-            }
-
-            if new_status == "failed":
-                update["status"] = "canceled"
-
-            tx.update(order_ref, update)
-            return {**d, **update}
-
-        _update_order(db.transaction())
-        log.info("PAYTR_CALLBACK_ORDER_UPDATED oid=%s status=%s", merchant_oid, cb_status)
-
-        if cb_status == "success" and user_id:
-            _clear_cart(user_id)
-
-        return PlainTextResponse("OK", status_code=200)
-
-    # 3) Sipariş yok -> Payment session'dan oluştur
-    session_ref = sessions_col.document(merchant_oid)
-    session_snap = session_ref.get()
-
-    if not session_snap.exists:
-        log.error("PAYTR_CALLBACK_SESSION_NOT_FOUND oid=%s (OK returning)", merchant_oid)
-        return PlainTextResponse("OK", status_code=200)
-
-    session = session_snap.to_dict() or {}
-    user_id = session.get("user_id")
-
-    # Siparişi oluştur
-    payment_status = "succeeded" if cb_status == "success" else "failed"
-    order_status = "confirmed" if cb_status == "success" else "canceled"
-
-    order_data = {
-        "id": merchant_oid,
-        "user_id": user_id,
-        "items": session.get("basket", []),
-        "status": order_status,
-        "payment": {
-            "status": payment_status,
-            "provider": "PAYTR",
-            "merchant_oid": merchant_oid,
-            "total_amount": total_amount,
-            "installment_count": session.get("installment_count", 0),
-        },
-        "totals": {
-            "subtotal": session.get("base_amount", 0),
-            "grandTotal": session.get("payable_amount", 0),
-        },
-        "shipping_address": {
-            "full_address": session.get("user_address", ""),
-        },
-        "contact": {
-            "name": session.get("user_name", ""),
-            "email": session.get("email", ""),
-            "phone": session.get("user_phone", ""),
-        },
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    order_ref.set(order_data)
-    log.info("PAYTR_CALLBACK_ORDER_CREATED oid=%s user=%s status=%s", merchant_oid, user_id, order_status)
-
-    # Session'ı güncelle
-    session_ref.update({
-        "status": "completed" if cb_status == "success" else "failed",
-        "updated_at": now,
-    })
-
-    # Başarılıysa sepeti temizle
-    if cb_status == "success" and user_id:
-        _clear_cart(user_id)
-        log.info("PAYTR_CALLBACK_CART_CLEARED user=%s", user_id)
-
-    # 4) Mutlaka sadece OK
     return PlainTextResponse("OK", status_code=200)
 
 

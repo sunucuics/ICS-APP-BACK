@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from firebase_admin import firestore
 from typing import Set, Iterable
 
+from google.cloud.firestore_v1 import FieldFilter
+
 from backend.app.config import db, settings
 from backend.app.core.security import get_current_user, get_current_admin
 
@@ -315,6 +317,55 @@ def _build_customer(user_id: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # PUBLIC — (BODY YOK) Sepetten sipariş oluştur
 # -----------------------------------------------------------------------------
+def _find_product_refs(items: List[Dict[str, Any]]) -> List[tuple]:
+    """Her sipariş item'ı için (product_doc_ref, required_qty, product_data) döndürür."""
+    stock_updates = []
+    for item in items:
+        pid = item.get("product_id")
+        qty = item.get("qty", 0)
+        if not pid or qty <= 0:
+            continue
+        docs = list(
+            db.collection_group("items")
+            .where(filter=FieldFilter("id", "==", pid))
+            .limit(1)
+            .stream()
+        )
+        if not docs:
+            raise HTTPException(400, f"Ürün bulunamadı: {pid}")
+        product_doc = docs[0]
+        product_data = product_doc.to_dict() or {}
+        current_stock = int(product_data.get("stock", 0))
+        if current_stock < qty:
+            product_name = product_data.get("title", pid)
+            raise HTTPException(400, f"Yetersiz stok: {product_name} (Stok: {current_stock}, İstenen: {qty})")
+        stock_updates.append((product_doc.reference, qty, product_data))
+    return stock_updates
+
+
+def _restore_stock(items: List[Dict[str, Any]]) -> None:
+    """İptal edilen siparişin stoğunu geri yükler."""
+    for item in items:
+        pid = item.get("product_id")
+        qty = item.get("qty", 0)
+        if not pid or qty <= 0:
+            continue
+        try:
+            docs = list(
+                db.collection_group("items")
+                .where(filter=FieldFilter("id", "==", pid))
+                .limit(1)
+                .stream()
+            )
+            if docs:
+                ref = docs[0].reference
+                current = int((docs[0].to_dict() or {}).get("stock", 0))
+                ref.update({"stock": current + qty})
+                log.info("STOCK_RESTORED pid=%s qty=%d new_stock=%d", pid, qty, current + qty)
+        except Exception as e:
+            log.warning("STOCK_RESTORE_FAILED pid=%s err=%s", pid, e)
+
+
 @router.post("", summary="Sepetten sipariş oluştur (status=preparing)")
 def create_order(request: Request, me: Dict = Depends(get_current_user)):
     user_id = me["id"]
@@ -322,11 +373,14 @@ def create_order(request: Request, me: Dict = Depends(get_current_user)):
     if not items:
         raise HTTPException(status_code=400, detail="Sepet boş.")
 
+    # Stok kontrolü (transaction öncesi — ürün ref'lerini bul)
+    stock_updates = _find_product_refs(items)
+
     totals = _calc_totals(items)
     now = _now()
     customer = _build_customer(user_id)
 
-    ref = db.collection(_ORDERS).document()
+    order_ref = db.collection(_ORDERS).document()
     payload: Dict[str, Any] = {
         "user_id": user_id,
         "created_at": now,
@@ -342,11 +396,40 @@ def create_order(request: Request, me: Dict = Depends(get_current_user)):
         "payment": {
             "provider": "PAYTR",
             "status": "awaiting",
-            "merchant_oid": ref.id},
+            "merchant_oid": order_ref.id},
     }
-    ref.set(payload)
 
-    return {"id": ref.id, "message": "Siparişiniz alındı, kargonuz hazırlanıyor.", **payload}
+    # Atomik transaction: stok düş + sipariş oluştur
+    @firestore.transactional
+    def _create_order_txn(transaction):
+        # 1) Stok kontrol (transaction read)
+        for product_ref, required_qty, _ in stock_updates:
+            snap = product_ref.get(transaction=transaction)
+            data = snap.to_dict() or {}
+            current_stock = int(data.get("stock", 0))
+            if current_stock < required_qty:
+                raise HTTPException(400, f"Yetersiz stok: {data.get('title', '')} (Stok: {current_stock}, İstenen: {required_qty})")
+
+        # 2) Stok düş (transaction write)
+        for product_ref, required_qty, _ in stock_updates:
+            snap = product_ref.get(transaction=transaction)
+            current = int((snap.to_dict() or {}).get("stock", 0))
+            transaction.update(product_ref, {"stock": current - required_qty})
+
+        # 3) Sipariş oluştur (transaction write)
+        transaction.set(order_ref, payload)
+
+    tx = db.transaction()
+    _create_order_txn(tx)
+    log.info("ORDER_CREATED oid=%s user=%s items=%d", order_ref.id, user_id, len(items))
+
+    # Sepeti temizle (transaction dışında — sipariş oluştuysa temizle)
+    try:
+        db.collection(_CARTS).document(user_id).set({"items": []}, merge=True)
+    except Exception:
+        pass  # Sipariş oluştu, sepet temizleme başarısız olsa da devam et
+
+    return {"id": order_ref.id, "message": "Siparişiniz alındı, kargonuz hazırlanıyor.", **payload}
 
 # -----------------------------------------------------------------------------
 # PUBLIC — Kullanıcının siparişlerini listele
@@ -697,7 +780,7 @@ async def mark_delivered(order_id: str, request: Request, admin: Dict = Depends(
     return merged
 
 
-@admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap ve e-posta gönder")
+@admin_router.patch("/{order_id}/cancel", summary="Siparişi 'canceled' yap, stoğu geri yükle ve e-posta gönder")
 async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request, admin: Dict = Depends(get_current_admin)):
     admin_id = admin["id"]
 
@@ -723,7 +806,15 @@ async def cancel_order(order_id: str, body: AdminCancelRequest, request: Request
             return {**doc, **update}
 
         tx = db.transaction()
-        return _txn(tx), ref
+        result = _txn(tx)
+
+        # Stok iadesi — transaction dışında (iptal kesinleştikten sonra)
+        order_items = result.get("items", [])
+        if order_items:
+            _restore_stock(order_items)
+            log.info("CANCEL_STOCK_RESTORED order=%s items=%d", order_id, len(order_items))
+
+        return result, ref
 
     merged, ref = await asyncio.to_thread(_do_firestore_work)
 

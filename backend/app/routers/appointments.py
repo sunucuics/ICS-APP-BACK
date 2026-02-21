@@ -5,7 +5,7 @@ Bu modül, kullanıcıların randevu talebi oluşturabilmesini, kendi randevular
 Hem **kullanıcı** hem de **admin** işlemleri için ayrı router’lar tanımlanmıştır.
 """
 from fastapi import APIRouter, Depends, HTTPException, Form, Query
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from datetime import timedelta, datetime
 import logging
 import threading
@@ -65,17 +65,35 @@ def _coerce_dt(v: Any) -> Optional[datetime]:
 
 def _to_local_dt(v: Any) -> Optional[datetime]:
     """
-    Firestore'dan okunan UTC datetime'ı local (Türkiye) saatine çevirir.
+    Firestore'dan okunan UTC datetime'ı Türkiye saatine (UTC+3) çevirir.
     API response'ları için kullanılır.
+    Server timezone'undan bağımsız çalışır (Cloud Run UTC kullanır).
     """
     utc_dt = _coerce_dt(v)
     if utc_dt is None:
         return None
-    # UTC naive datetime'ı aware yap, sonra local'e çevir
-    from datetime import timezone
+    from datetime import timezone, timedelta
+    _TURKEY_TZ = timezone(timedelta(hours=3))
     aware_utc = utc_dt.replace(tzinfo=timezone.utc)
-    local_dt = aware_utc.astimezone()  # Server'ın local timezone'una çevir
-    return local_dt.replace(tzinfo=None)  # Naive local datetime döndür
+    local_dt = aware_utc.astimezone(_TURKEY_TZ)
+    return local_dt.replace(tzinfo=None)  # Naive Türkiye datetime döndür
+
+
+def _from_local_dt(v: Any) -> Optional[datetime]:
+    """
+    Frontend'den gelen Türkiye saatindeki (UTC+3) naive datetime'ı UTC'ye çevirir.
+    Yazma (kaydetme) işlemleri için kullanılır.
+    Frontend timezone bilgisi göndermez — saat her zaman kullanıcının yerel saatidir (Türkiye).
+    """
+    dt = _coerce_dt(v)
+    if dt is None:
+        return None
+    from datetime import timezone, timedelta
+    _TURKEY_TZ = timezone(timedelta(hours=3))
+    # Naive datetime'ı Türkiye saati olarak işaretle, sonra UTC'ye çevir
+    aware_local = dt.replace(tzinfo=_TURKEY_TZ)
+    utc_dt = aware_local.astimezone(timezone.utc)
+    return utc_dt.replace(tzinfo=None)  # Naive UTC döndür
 
 
 # --- Admin Push Notification Helper -------------------------------------------
@@ -160,8 +178,8 @@ def request_appointment(
     """
     Randevu talep formu (form-data).
     """
-    # Giriş tarihini normalize et
-    start_norm = _coerce_dt(start)
+    # Giriş tarihini normalize et — frontend Türkiye saati gönderir, UTC'ye çevir
+    start_norm = _from_local_dt(start)
     if not start_norm:
         raise HTTPException(status_code=400, detail="Invalid start datetime format")
     end_time = start_norm + timedelta(hours=1)
@@ -245,6 +263,26 @@ def request_appointment(
             logger.info("Admin notification created for appointment %s", ref.id)
 
             _send_admin_push_notification(notification_title, notification_body, ref.id)
+
+            # Kullanıcıya da kalıcı bildirim kaydet (randevu talebi alındı)
+            user_notification_ref = db.collection("user_notifications").document()
+            user_notification_ref.set({
+                "user_id": user_id,
+                "title": "Randevu Talebiniz Alındı 🗓️",
+                "body": f"{service_title} için {date_str} tarihinde saat {time_str}'de randevu talebiniz alındı. Onay bekleniyor.",
+                "type": "appointment_status",
+                "is_read": False,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "data": {
+                    "appointment_id": ref.id,
+                    "status": "pending",
+                    "service_id": service_id,
+                    "service_title": service_title,
+                    "start": start_norm.isoformat(),
+                },
+            })
+            logger.info("User notification saved for appointment request %s user=%s", ref.id, user_id)
+
         except Exception as e:
             logger.error("Background notification failed for appointment %s: %s", ref.id, e)
 
@@ -354,10 +392,10 @@ def create_appointment(
     """
     Admin paneli – elle randevu oluştur (form-data ile).
     """
-    start_norm = _coerce_dt(start)
+    start_norm = _from_local_dt(start)
     if not start_norm:
         raise HTTPException(status_code=400, detail="Invalid start datetime format")
-    end_norm = _coerce_dt(end) if end else (start_norm + timedelta(hours=1))
+    end_norm = _from_local_dt(end) if end else (start_norm + timedelta(hours=1))
 
     overlapping = db.collection("appointments").where("service_id", "==", service_id) \
                     .where("status", "in", ["pending", "approved"]).stream()
@@ -384,22 +422,89 @@ def create_appointment(
     return appt_data
 
 
+@admin_router.post("/block-day", response_model=Dict[str, Any])
+def block_entire_day(
+    service_id: str = Form(...),
+    date: str = Form(...),
+    notes: str = Form(None),
+):
+    """
+    Admin paneli – seçilen tarihteki tüm çalışma saatlerini (09:00-17:00) tek seferde bloklar.
+    Zaten dolu olan saatler atlanır.
+    """
+    try:
+        year, month, day = map(int, date.split("-"))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD")
+
+    # Çalışma saatleri: 09:00 - 17:00 (9 slot)
+    working_hours = list(range(9, 18))
+
+    # Mevcut randevuları çek (bu servis + bu tarih için)
+    existing = db.collection("appointments") \
+        .where("service_id", "==", service_id) \
+        .where("status", "in", ["pending", "approved"]) \
+        .stream()
+
+    busy_hours = set()
+    for appt in existing:
+        data = appt.to_dict() or {}
+        s = _coerce_dt(data.get("start"))
+        if not s:
+            continue
+        # UTC'den Turkey saatine çevir (karşılaştırma için)
+        local_s = _to_local_dt(s)
+        if local_s and local_s.year == year and local_s.month == month and local_s.day == day:
+            busy_hours.add(local_s.hour)
+
+    blocked = 0
+    skipped = 0
+    batch = db.batch()
+
+    for hour in working_hours:
+        if hour in busy_hours:
+            skipped += 1
+            continue
+
+        # Naive local time -> UTC via _from_local_dt
+        start_local = datetime(year, month, day, hour, 0)
+        start_utc = _from_local_dt(start_local)
+        end_utc = start_utc + timedelta(hours=1)
+
+        ref = db.collection("appointments").document()
+        appt_data = {
+            "service_id": service_id,
+            "user_id": None,
+            "start": start_utc,
+            "end": end_utc,
+            "status": "approved",
+        }
+        if notes:
+            appt_data["notes"] = notes
+
+        batch.set(ref, appt_data)
+        blocked += 1
+
+    if blocked > 0:
+        batch.commit()
+
+    message = f"{blocked} saat bloklandı"
+    if skipped > 0:
+        message += f", {skipped} saat zaten doluydu"
+
+    return {"blocked": blocked, "skipped": skipped, "message": message}
+
+
 def _notify_user_status_change(appointment_id: str, new_status: str, appt_data: dict):
     """
-    Randevu durumu değiştiğinde kullanıcıya FCM push bildirim gönderir.
+    Randevu durumu değiştiğinde kullanıcıya:
+    1. user_notifications koleksiyonuna kalıcı bildirim kaydeder
+    2. FCM push bildirim gönderir (device token ile)
     Background thread'de çalıştırılmak üzere tasarlanmıştır.
     """
     try:
         user_id = appt_data.get("user_id")
         if not user_id:
-            return
-
-        user_doc = db.collection("users").document(user_id).get()
-        if not user_doc.exists:
-            return
-        user_data = user_doc.to_dict() or {}
-        fcm_token = user_data.get("fcm_token")
-        if not fcm_token:
             return
 
         status_labels = {
@@ -414,6 +519,38 @@ def _notify_user_status_change(appointment_id: str, new_status: str, appt_data: 
 
         title = "Randevu Durumu Güncellendi"
         body = f"{date_str} tarihli randevunuz {status_text}."
+
+        # 1) Firestore'a kalıcı bildirim kaydet (user_notifications koleksiyonu)
+        try:
+            notification_ref = db.collection("user_notifications").document()
+            notification_ref.set({
+                "user_id": user_id,
+                "title": title,
+                "body": body,
+                "type": "appointment_status",
+                "is_read": False,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "data": {
+                    "appointment_id": appointment_id,
+                    "status": new_status,
+                    "service_id": appt_data.get("service_id"),
+                    "start": start_dt.isoformat() if start_dt else None,
+                },
+            })
+            logger.info("User notification saved to Firestore for appointment %s status=%s user=%s",
+                        appointment_id, new_status, user_id)
+        except Exception as e:
+            logger.error("Failed to save user notification to Firestore: %s", e)
+
+        # 2) FCM push bildirim gönder (device token ile)
+        user_doc = db.collection("users").document(user_id).get()
+        if not user_doc.exists:
+            return
+        user_data = user_doc.to_dict() or {}
+        fcm_token = user_data.get("fcm_token")
+        if not fcm_token:
+            logger.info("No FCM token for user %s, skipping push notification", user_id)
+            return
 
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
@@ -436,7 +573,7 @@ def _notify_user_status_change(appointment_id: str, new_status: str, appt_data: 
             ),
         )
         messaging.send(message)
-        logger.info("User notification sent for appointment %s status=%s", appointment_id, new_status)
+        logger.info("FCM push sent for appointment %s status=%s token=%s...", appointment_id, new_status, fcm_token[:20])
     except Exception as e:
         logger.error("Failed to send user status notification: %s", e)
 
