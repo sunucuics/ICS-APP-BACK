@@ -9,6 +9,7 @@ from typing import List, Optional, Any, Dict
 from datetime import timedelta, datetime
 import logging
 import threading
+from pydantic import BaseModel
 
 from backend.app.core.security import get_current_user, get_current_admin
 from backend.app.config import db
@@ -422,16 +423,23 @@ def create_appointment(
     return appt_data
 
 
+class BlockDayRequest(BaseModel):
+    service_id: str
+    date: str  # YYYY-MM-DD
+    notes: Optional[str] = None
+
+
 @admin_router.post("/block-day", response_model=Dict[str, Any])
-def block_entire_day(
-    service_id: str = Form(...),
-    date: str = Form(...),
-    notes: str = Form(None),
-):
+def block_entire_day(req: BlockDayRequest):
     """
     Admin paneli – seçilen tarihteki tüm çalışma saatlerini (09:00-17:00) tek seferde bloklar.
     Zaten dolu olan saatler atlanır.
+    JSON body kabul eder (FormData değil) — token refresh sonrası retry desteği için.
     """
+    service_id = req.service_id
+    date = req.date
+    notes = req.notes
+
     try:
         year, month, day = map(int, date.split("-"))
     except (ValueError, AttributeError):

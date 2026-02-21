@@ -24,7 +24,7 @@ RUN pip install --root-user-action=ignore -r requirements.txt
 COPY backend/ ./backend/
 COPY entrypoint.sh ./
 COPY .env .env
-COPY firebase_service_account.json ./backend/firebase_service_account.json
+COPY firebase_service_account.json ./firebase_service_account.json
 
 # Windows satır sonu düzelt + izinler
 RUN sed -i 's/\r$//' ./entrypoint.sh || true \

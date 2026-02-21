@@ -33,6 +33,8 @@ gcloud container images add-tag ${LATEST_TAG} ${IMAGE_TAG}
 
 # 2. Deploy (timestamp tag kullanarak - Cloud Run'ın yeni revision oluşturmasını garanti eder)
 echo "🚀 Yeni revision deploy ediliyor..."
+
+# Cloud Run deploy — mevcut env vars korunur, sadece image güncellenir
 gcloud run deploy ics-backend \
   --image ${IMAGE_TAG} \
   --region europe-west1 \
@@ -44,8 +46,7 @@ gcloud run deploy ics-backend \
   --max-instances 10 \
   --min-instances 0 \
   --timeout 300 \
-  --concurrency 80 \
-  --set-env-vars-from-file .env 2>/dev/null || echo "⚠️  .env dosyası bulunamadı, environment variables manuel ayarlanmalı"
+  --concurrency 80
 
 echo "🎉 Deploy tamamlandı!"
 echo "📱 Backend URL'ini almak için: gcloud run services describe ics-backend --region europe-west1 --format 'value(status.url)'"
