@@ -1,7 +1,7 @@
 # app/schemas/category.py
 from typing import Optional
 from fastapi import Form
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 class CategoryBase(BaseModel):
     """Kategori ortak alanları."""
@@ -33,10 +33,14 @@ class CategoryCreate(BaseModel):
 
 class CategoryUpdate(BaseModel):
     """Kategori güncelleme için opsiyonel alanlar."""
+    model_config = ConfigDict(populate_by_name=True)
+
     name: Optional[str] = Field(None, description="Yeni kategori adı")
     description: Optional[str] = Field(None, description="Yeni açıklama")
     parent_id: Optional[str] = Field(None, description="Yeni üst kategori ID")
-    is_fixed: Optional[bool] = Field(None, description="Sabitlik durumunu güncelle (True=pin, False=unpin)")
+    is_fixed: Optional[bool] = Field(None, alias="isFixed", description="Sabitlik durumunu güncelle (True=pin, False=unpin)")
+    is_deleted: Optional[bool] = Field(None, alias="isDeleted", description="Silinme durumu")
+    image: Optional[str] = Field(None, description="Görsel dosya yolu (frontend'den)")
 
 # ---------- output ----------
 class CategoryOut(BaseModel):

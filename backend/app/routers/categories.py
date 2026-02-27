@@ -5,7 +5,7 @@ Kategori Yönetimi
 - Admin : /admin/categories → oluşturma/güncelleme/silme, pin/unpin ve sabit kategori tekilliği
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Response
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Response
 from typing import List, Optional
 from uuid import uuid4
 
@@ -174,16 +174,11 @@ def create_category(
 @admin_router.put("/{category_id}", response_model=CategoryOut, summary="Update Category")
 def update_category(
     category_id: str,
-    name: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    parent_id: Optional[str] = Form(None),
-    is_fixed: Optional[bool] = Form(None, description="True=pin, False=unpin, boş=değiştirme"),
-    cover_image: Optional[UploadFile] = File(None, description="Yeni kapak (opsiyonel)"),
+    body: CategoryUpdate,
 ):
     """
     Var olan kategoriyi alan bazlı günceller.
-    - multipart/form-data (Form + File)
-    - cover_image gönderilirse Firebase Storage'a yüklenir.
+    - JSON body kabul eder.
     - is_fixed True ise sabitle (tekilleştirir), False ise sabiti kaldırır.
     """
     doc_ref = db.collection("categories").document(category_id)
@@ -192,33 +187,19 @@ def update_category(
         raise HTTPException(status_code=404, detail="Category not found")
 
     update_data = {}
-    if name is not None:
-        update_data["name"] = name.strip()
-    if description is not None:
-        update_data["description"] = description.strip()
-    if parent_id is not None:
-        update_data["parent_id"] = parent_id or None
-
-    if cover_image is not None:
-        filename = cover_image.filename or f"{uuid4()}.jpg"
-        blob = bucket.blob(f"categories/{category_id}/{filename}")
-        try:
-            blob.upload_from_file(cover_image.file, content_type=cover_image.content_type)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Image upload failed: {e}")
-        try:
-            blob.make_public()
-            image_url = blob.public_url
-        except Exception:
-            image_url = blob.generate_signed_url(expiration=3600 * 24 * 365 * 10)
-        update_data["cover_image"] = image_url
+    if body.name is not None:
+        update_data["name"] = body.name.strip()
+    if body.description is not None:
+        update_data["description"] = body.description.strip()
+    if body.parent_id is not None:
+        update_data["parent_id"] = body.parent_id or None
 
     # is_fixed yönetimi
-    if is_fixed is True:
+    if body.is_fixed is True:
         tx = db.transaction()
         _make_fixed(tx, doc_ref)
         update_data["is_fixed"] = True  # idempotent
-    elif is_fixed is False:
+    elif body.is_fixed is False:
         update_data["is_fixed"] = False
 
     if update_data:
