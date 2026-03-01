@@ -74,6 +74,7 @@ app.include_router(appointments_router.router)
 app.include_router(comments_router.router)
 app.include_router(auth_delete.router)
 app.include_router(user_notifications.router)
+app.include_router(featured.router)
 
 # Include admin routers (with prefix /admin)
 app.include_router(admin_dashboard.router, prefix="/admin")

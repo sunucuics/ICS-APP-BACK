@@ -6,6 +6,27 @@ from backend.app.schemas.featured import FeaturedExpandedDoc
 from backend.app.services.featured_service import feature, unfeature, list_items
 from backend.app.core.security import get_current_admin
 
+# ---------- PUBLIC ROUTER ----------
+router = APIRouter(
+    prefix="/featured",
+    tags=["Featured"],
+)
+
+@router.get(
+    "/products",
+    response_model=List[FeaturedExpandedDoc],
+)
+def public_list_featured_products():
+    return list_items("products", expand_detail=True)
+
+@router.get(
+    "/services",
+    response_model=List[FeaturedExpandedDoc],
+)
+def public_list_featured_services():
+    return list_items("services", expand_detail=True)
+
+# ---------- ADMIN ROUTER ----------
 admin_router = APIRouter(
     prefix="/featured",
     tags=["Admin: Featured"],

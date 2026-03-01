@@ -199,6 +199,12 @@ def list_items(kind: FeaturedKind, expand_detail: bool = False):
     result: List[Dict[str, Any]] = []
     for doc in q.stream():
         item_id = (doc.to_dict() or {}).get("id") or doc.id
-        detail = detail_of(kind, item_id) or {"id": item_id}
+        detail = detail_of(kind, item_id)
+        if detail is None:
+            # Kaynak doküman bulunamadı — featured referansı geçersiz, atla
+            continue
+        if detail.get("is_deleted"):
+            # Silinmiş öğeleri öne çıkanlarda gösterme
+            continue
         result.append(detail)
     return result
