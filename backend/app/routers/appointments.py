@@ -232,8 +232,9 @@ def request_appointment(
 
             user_name = user_data.get("name") or user_data.get("email") or "Bir müşteri"
 
-            date_str = start_norm.strftime("%d/%m/%Y")
-            time_str = start_norm.strftime("%H:%M")
+            start_local = _to_local_dt(start_norm)
+            date_str = start_local.strftime("%d/%m/%Y")
+            time_str = start_local.strftime("%H:%M")
 
             notification_title = "🗓️ Yeni Randevu Talebi"
             notification_body = (
@@ -522,7 +523,7 @@ def _notify_user_status_change(appointment_id: str, new_status: str, appt_data: 
         }
         status_text = status_labels.get(new_status, f"güncellendi ({new_status})")
 
-        start_dt = _coerce_dt(appt_data.get("start"))
+        start_dt = _to_local_dt(appt_data.get("start"))
         date_str = start_dt.strftime("%d/%m/%Y %H:%M") if start_dt else ""
 
         title = "Randevu Durumu Güncellendi"
